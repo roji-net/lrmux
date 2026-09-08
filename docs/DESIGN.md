@@ -183,22 +183,36 @@ All elements are configurable and the status bar can be disabled entirely.
 
 ### 2.17 Startup selector UX
 
-Running `lrmux` with no arguments shows an interactive selector:
+Running `lrmux` with no arguments:
+
+- **If exactly one server and one session exist**: auto-join it immediately (no selector shown). Fast path for the common case.
+- **Otherwise**: show the interactive selector.
+
+The interactive selector:
 
 - A **flat list** of `server / session` entries across all running servers (e.g. `default / lrmux`, `default / home`, `work / api`).
 - **Fuzzy filter**: typing filters the list by fuzzy match on the `server / session` string (fzf-style).
 - `j`/`k` or arrow keys to navigate, `Enter` to join the selected session.
-- `n` creates a new session (prompts for server + name), `N` creates a new server.
-- If no servers are running, the selector shows a single "create new server + session" prompt.
+- `n` creates a new session: prompts for a name with a **default derived from CWD** (per §2.13) pre-filled; user can accept or edit it. Session is created on the currently highlighted server (or `default` if none highlighted).
+- `N` creates a new server + session: prompts for a server name (default: `default` or `default-2` etc. on collision) and a session name (default: CWD-derived), then spawns both.
+- If no servers are running, the selector shows a single "create new server + session" prompt with defaults pre-filled.
 
-### 2.18 Configuration file
+### 2.18 In-session session manager
+
+From within an attached session, `Prefix M` opens the **session manager** — the same selector UI from §2.17, but overlaid on the current session. This lets the user switch sessions or servers without detaching first.
+
+- `Prefix M` opens the selector; selecting a session switches to it (the current session stays alive on the server).
+- `n` / `N` work as in the startup selector (new session / new server + session).
+- `Esc` or `q` closes the selector and returns to the current session.
+
+### 2.19 Configuration file
 
 - Location: `~/.config/lrmux/config.toml` (TOML format).
 - Sections: `[prefix]`, `[keys]`, `[fkeys]`, `[statusbar]`, `[colors]`, `[behavior]`.
 - All keybindings remappable; F-key shortcuts toggleable.
 - See §7 for format details and examples.
 
-### 2.19 AI-CLI friendliness (base scope)
+### 2.20 AI-CLI friendliness (base scope)
 
 The **base** requirement is the passthrough invariant from §1: only the prefix (and optionally F-keys) is intercepted. Mouse events are always passed through. This alone makes lrmux safe for AI CLIs.
 
@@ -461,6 +475,7 @@ These are the keybindings for the first working version — enough to use lrmux 
 | `?` | Show keybindings (help) |
 | `d` | Detach from session |
 | `x` | Kill active pane (with confirmation) |
+| `M` | Open session manager (switch/create session or server without detaching) |
 | Double prefix | Send literal prefix key to child |
 
 #### Later iterations (full set)
@@ -567,6 +582,7 @@ double_send = true       # double-prefix sends the prefix key literally to the c
 "?" = "show-keys"
 "d" = "detach"
 "x" = "kill-pane"
+"M" = "session-manager"
 # Later iterations add: %, ", o, ;, z, Space, F, ], ,, $, &, s, S, r, :, q
 
 # F-key shortcuts (disable entirely for full passthrough)
