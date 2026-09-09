@@ -34,6 +34,9 @@ pub struct Grid {
     wrap_pending: bool,
     /// Saved cursor position (for DECSC/DECRC).
     saved_cursor: Option<(usize, usize)>,
+    /// Rows modified since the last render. The renderer uses this to
+    /// skip unchanged rows instead of scanning the entire grid.
+    dirty: Vec<bool>,
 }
 
 impl Grid {
@@ -55,6 +58,7 @@ impl Grid {
             scroll_bottom: rows,
             wrap_pending: false,
             saved_cursor: None,
+            dirty: vec![true; rows],
         };
         grid.scroll_bottom = rows;
         grid
@@ -66,6 +70,34 @@ impl Grid {
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    /// Mark a row as dirty (modified since last render).
+    #[inline]
+    fn mark_dirty(&mut self, row: usize) {
+        if row < self.dirty.len() {
+            self.dirty[row] = true;
+        }
+    }
+
+    /// Mark all rows as dirty.
+    fn mark_all_dirty(&mut self) {
+        for d in &mut self.dirty {
+            *d = true;
+        }
+    }
+
+    /// Take the dirty row set, returning a vector of dirty row indices
+    /// and clearing the dirty flags. Called by the renderer after scanning.
+    pub fn take_dirty(&mut self) -> Vec<usize> {
+        let mut dirty_rows = Vec::new();
+        for (i, d) in self.dirty.iter_mut().enumerate() {
+            if *d {
+                dirty_rows.push(i);
+                *d = false;
+            }
+        }
+        dirty_rows
     }
 
     /// Resize the grid. Content is preserved where possible; new cells are blank.
@@ -98,6 +130,8 @@ impl Grid {
         self.cols = cols;
         self.scroll_top = 0;
         self.scroll_bottom = rows;
+        self.dirty.resize(rows, true);
+        self.mark_all_dirty();
         // Clamp cursor.
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
@@ -150,6 +184,7 @@ impl Grid {
                 attrs,
             };
         }
+        self.mark_dirty(crow);
 
         // Advance cursor.
         self.cursor_col += 1;
@@ -235,6 +270,10 @@ impl Grid {
                 }
             }
         }
+        // All rows in the scroll region changed.
+        for i in self.scroll_top..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
     }
 
     /// Scroll the scroll region down by n lines (e.g., for reverse line feed).
@@ -257,6 +296,9 @@ impl Grid {
                 }
             }
         }
+        for i in self.scroll_top..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
     }
 
     /// Erase from cursor to end of line.
@@ -267,6 +309,7 @@ impl Grid {
                 *cell = Cell::blank();
             }
         }
+        self.mark_dirty(crow);
     }
 
     /// Erase from start of line to cursor (inclusive).
@@ -278,15 +321,18 @@ impl Grid {
                 *cell = Cell::blank();
             }
         }
+        self.mark_dirty(crow);
     }
 
     /// Erase the entire current line.
     pub fn erase_line(&mut self) {
-        if let Some(row) = self.row_mut(self.cursor_row) {
+        let crow = self.cursor_row;
+        if let Some(row) = self.row_mut(crow) {
             for cell in row.iter_mut() {
                 *cell = Cell::blank();
             }
         }
+        self.mark_dirty(crow);
     }
 
     /// Erase from cursor to end of screen.
@@ -298,6 +344,7 @@ impl Grid {
                     *cell = Cell::blank();
                 }
             }
+            self.mark_dirty(i);
         }
     }
 
@@ -310,6 +357,7 @@ impl Grid {
                     *cell = Cell::blank();
                 }
             }
+            self.mark_dirty(i);
         }
     }
 
@@ -321,6 +369,7 @@ impl Grid {
                     *cell = Cell::blank();
                 }
             }
+            self.mark_dirty(i);
         }
     }
 

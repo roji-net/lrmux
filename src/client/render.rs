@@ -45,17 +45,32 @@ impl Renderer {
     }
 
     /// Render the grid to the given writer. Emits only changed cells.
-    pub fn render<W: Write>(&mut self, writer: &mut W, grid: &Grid) -> io::Result<()> {
+    pub fn render<W: Write>(&mut self, writer: &mut W, grid: &mut Grid) -> io::Result<()> {
         let mut buf = String::new();
         let mut current_sgr: Option<(Color, Color, Attr)> = None;
 
-        for row in 0..self.rows.min(grid.rows()) {
+        // Only scan rows that were modified since the last render.
+        let dirty_rows = grid.take_dirty();
+
+        for row in dirty_rows {
+            if row >= self.rows || row >= grid.rows() || row >= self.prev.len() {
+                continue;
+            }
             let grid_row = match grid.row(row) {
                 Some(r) => r,
                 None => continue,
             };
-            let prev_row = &self.prev[row];
-            let width = self.cols.min(grid.cols());
+            let prev_row = &mut self.prev[row];
+            let width = self
+                .cols
+                .min(grid.cols())
+                .min(prev_row.len())
+                .min(grid_row.len());
+            if width == 0 {
+                // Ensure prev_row is sized correctly for future renders.
+                prev_row.resize(self.cols.max(1), Cell::blank());
+                continue;
+            }
 
             let mut col = 0;
             while col < width {
@@ -90,7 +105,7 @@ impl Renderer {
             }
 
             // Update prev_row for this row.
-            self.prev[row][..width].clone_from_slice(&grid_row[..width]);
+            prev_row[..width].clone_from_slice(&grid_row[..width]);
         }
 
         // Handle cursor.
