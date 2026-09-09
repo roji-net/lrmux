@@ -305,7 +305,8 @@ impl Grid {
     pub fn erase_to_end_of_line(&mut self) {
         let (crow, ccol) = (self.cursor_row, self.cursor_col);
         if let Some(row) = self.rows.get_mut(crow) {
-            for cell in &mut row[ccol..] {
+            let start = ccol.min(row.len());
+            for cell in &mut row[start..] {
                 *cell = Cell::blank();
             }
         }
@@ -316,7 +317,10 @@ impl Grid {
     pub fn erase_to_cursor(&mut self) {
         let (crow, ccol) = (self.cursor_row, self.cursor_col);
         if let Some(row) = self.rows.get_mut(crow) {
-            let end = ccol.min(row.len().saturating_sub(1));
+            if row.is_empty() {
+                return;
+            }
+            let end = ccol.min(row.len() - 1);
             for cell in &mut row[..=end] {
                 *cell = Cell::blank();
             }

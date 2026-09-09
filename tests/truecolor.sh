@@ -1,12 +1,14 @@
 #!/bin/sh
-# Truecolor test for lrmux (compact: fits on one screen).
+# Truecolor test for lrmux.
+# Generates truecolor output via Python (fast) and emits it directly.
 # Exercises 24-bit RGB rendering: gradients, color blocks, and attributes.
+# Fits on a 24-row terminal.
 
 python3 -c '
 import sys
 out = []
 out.append("=== lrmux truecolor test ===")
-# 16 basic colors on one line
+# 16 basic colors
 row = "16: "
 for i in range(8):
     row += "\033[3%dm\xe2\x96\x88\033[0m" % i
@@ -14,12 +16,12 @@ row += " "
 for i in range(8):
     row += "\033[9%dm\xe2\x96\x88\033[0m" % i
 out.append(row)
-# 256-color (first 16) on one line
+# 256-color (first 32)
 row = "256: "
-for i in range(16):
+for i in range(32):
     row += "\033[38;5;%dm\xe2\x96\x88\033[0m" % i
 out.append(row)
-# Truecolor gradients on one line each
+# Truecolor gradients (step 16 = 16 bars each, fits on one line)
 for name, idx in [("R", 0), ("G", 1), ("B", 2)]:
     row = "TC%s: " % name
     for v in range(0, 256, 16):
@@ -27,7 +29,7 @@ for name, idx in [("R", 0), ("G", 1), ("B", 2)]:
         rgb[idx] = v
         row += "\033[38;2;%d;%d;%dm\xe2\x96\x88\033[0m" % tuple(rgb)
     out.append(row)
-# Rainbow on one line
+# Rainbow (3 segments of 16 bars = 48 bars, fits on one line)
 row = "RB: "
 for i in range(0, 256, 16):
     row += "\033[38;2;255;%d;0m\xe2\x96\x88\033[0m" % i
