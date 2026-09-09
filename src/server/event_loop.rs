@@ -1,7 +1,8 @@
-// Server event loop: poll over listener, PTY master, and all client sockets.
+// Server event loop: poll over listener, all window PTY fds, and all client sockets.
 //
-// Supports multiple concurrent clients sharing a single pane.
-// Grid updates are broadcast to all connected clients.
+// Supports multiple windows (each with one pane), multiple concurrent clients.
+// Grid updates are broadcast only for the active window.
+// A status bar (1 row) is reserved at the bottom of the client terminal.
 
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -9,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
-use crate::server::pane::Pane;
+use crate::server::window::Window;
 
 /// A connected client.
 struct ClientConn {
@@ -31,41 +32,31 @@ impl ClientConn {
 
 /// Run the server event loop.
 ///
-/// Phase 3: single session, single window, single pane, multiple clients.
-/// Waits for the first client to determine terminal size, then accepts
-/// additional clients concurrently. All clients share the same pane view.
-/// The server exits when the child process exits.
+/// Phase 4: multiple windows, multiple clients, prefix-key commands.
+/// The server persists until all windows are closed.
 pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<()> {
     // Wait for the first client to determine terminal size.
     let (first_stream, _) = listener.accept()?;
-    let (mut pane, mut clients) = handshake_first_client(first_stream)?;
-    let pty_fd = pane.pty_fd();
+    let (mut grid_rows, mut grid_cols, mut windows, mut clients) =
+        handshake_first_client(first_stream)?;
+    let mut active_window = 0usize;
 
     // Set listener to non-blocking so we can poll it alongside clients.
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
 
-    let mut child_alive = true;
-
     loop {
-        // Build pollfd array: listener + PTY + all clients.
-        let mut fds = Vec::with_capacity(2 + clients.len());
+        // Build pollfd array: listener + all window PTY fds + all client fds.
+        let mut fds = Vec::with_capacity(1 + windows.len() + clients.len());
         fds.push(libc::pollfd {
             fd: listener_fd,
             events: libc::POLLIN,
             revents: 0,
         });
-        if child_alive {
+        for w in &windows {
             fds.push(libc::pollfd {
-                fd: pty_fd,
+                fd: w.pty_fd(),
                 events: libc::POLLIN,
-                revents: 0,
-            });
-        } else {
-            // Dummy fd (negative) so indices stay aligned — we skip it.
-            fds.push(libc::pollfd {
-                fd: -1,
-                events: 0,
                 revents: 0,
             });
         }
@@ -86,48 +77,72 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             return Err(err);
         }
 
-        // Capture the number of clients that were polled, so we don't
-        // process newly-accepted clients in this iteration (their fds
-        // are not in the current pollfd array).
+        let num_windows = windows.len();
         let polled_clients = clients.len();
 
         // Listener readable → accept new client.
         if fds[0].revents & libc::POLLIN != 0 {
-            accept_new_client(&listener, &pane, &mut clients)?;
+            accept_new_client(
+                &listener,
+                &windows,
+                active_window,
+                grid_rows,
+                grid_cols,
+                &mut clients,
+            )?;
         }
 
-        // PTY output → grid → broadcast to all clients.
-        if child_alive && fds[1].revents & libc::POLLIN != 0 {
-            match pane.process_pty_output() {
-                Ok(true) => {
-                    broadcast_grid_update(&mut clients, &mut pane)?;
-                }
-                Ok(false) => {
-                    child_alive = false;
-                    broadcast_to_all(
-                        &mut clients,
-                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
-                    );
-                }
-                Err(e) => {
-                    child_alive = false;
-                    broadcast_to_all(
-                        &mut clients,
-                        &proto::encode_server(&ServerMsg::Error {
-                            msg: format!("pty read error: {e}"),
-                        }),
-                    );
+        // Window PTY output → grid → broadcast (only active window).
+        for wi in 0..num_windows {
+            let pf = &fds[1 + wi];
+            if pf.revents & libc::POLLIN != 0 {
+                let pane = &mut windows[wi].pane;
+                match pane.process_pty_output() {
+                    Ok(true) => {
+                        if wi == active_window {
+                            broadcast_grid_update(&mut clients, pane)?;
+                        }
+                    }
+                    Ok(false) => {
+                        // Child exited. Remove the window.
+                        windows.remove(wi);
+                        if windows.is_empty() {
+                            // Last window closed — shut down the server.
+                            broadcast_to_all(
+                                &mut clients,
+                                &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                            );
+                            ipc::cleanup(socket_path);
+                            return Ok(());
+                        }
+                        if wi <= active_window {
+                            active_window = active_window.saturating_sub(1);
+                        }
+                        // Switch to the new active window: send snapshot + status bar.
+                        send_window_snapshot(&mut clients, &windows, active_window)?;
+                        broadcast_status_bar(&mut clients, &windows, active_window);
+                    }
+                    Err(e) => {
+                        if wi == active_window {
+                            broadcast_to_all(
+                                &mut clients,
+                                &proto::encode_server(&ServerMsg::Error {
+                                    msg: format!("pty read error: {e}"),
+                                }),
+                            );
+                        }
+                    }
                 }
             }
         }
 
-        // Client input → parse frames → PTY.
-        // Only process clients that were in the pollfd array.
+        // Client input → parse frames → dispatch.
         let mut to_remove: Vec<usize> = Vec::new();
-        let mut need_resize_broadcast = false;
+        let mut window_changed = false;
+        let mut need_resize = false;
 
         for client_idx in 0..polled_clients {
-            let pf = &fds[2 + client_idx];
+            let pf = &fds[1 + num_windows + client_idx];
             if pf.revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 8192];
                 let n = unsafe {
@@ -141,24 +156,79 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                     clients[client_idx]
                         .buf
                         .extend_from_slice(&buf[..n as usize]);
-                    // Parse all complete frames.
                     loop {
                         match try_parse_frame(&mut clients[client_idx].buf) {
-                            Ok(Some(msg)) => match msg {
-                                ClientMsg::PaneInput { data } => {
-                                    pane.write_input(&data)?;
+                            Ok(Some(msg)) => {
+                                match msg {
+                                    ClientMsg::PaneInput { data } => {
+                                        windows[active_window].pane.write_input(&data)?;
+                                    }
+                                    ClientMsg::Resize { rows, cols } => {
+                                        // Resize all windows. Account for status bar (1 row).
+                                        grid_rows = rows.saturating_sub(1);
+                                        grid_cols = cols;
+                                        for w in &mut windows {
+                                            w.pane.resize(grid_rows, grid_cols);
+                                        }
+                                        need_resize = true;
+                                    }
+                                    ClientMsg::Detach => {
+                                        to_remove.push(client_idx);
+                                        break;
+                                    }
+                                    ClientMsg::NewWindow => {
+                                        windows.push(Window::new(
+                                            grid_rows,
+                                            grid_cols,
+                                            default_window_name(),
+                                        ));
+                                        active_window = windows.len() - 1;
+                                        window_changed = true;
+                                    }
+                                    ClientMsg::NextWindow => {
+                                        if !windows.is_empty() {
+                                            active_window = (active_window + 1) % windows.len();
+                                            window_changed = true;
+                                        }
+                                    }
+                                    ClientMsg::PrevWindow => {
+                                        if !windows.is_empty() {
+                                            active_window = if active_window == 0 {
+                                                windows.len() - 1
+                                            } else {
+                                                active_window - 1
+                                            };
+                                            window_changed = true;
+                                        }
+                                    }
+                                    ClientMsg::SelectWindow { index } => {
+                                        if (index as usize) < windows.len() {
+                                            active_window = index as usize;
+                                            window_changed = true;
+                                        }
+                                    }
+                                    ClientMsg::KillPane => {
+                                        if windows.len() > 1 {
+                                            windows.remove(active_window);
+                                            if active_window >= windows.len() {
+                                                active_window = windows.len() - 1;
+                                            }
+                                            window_changed = true;
+                                        } else {
+                                            // Last window — shut down the server.
+                                            broadcast_to_all(
+                                                &mut clients,
+                                                &proto::encode_server(&ServerMsg::PaneExit {
+                                                    code: 0,
+                                                }),
+                                            );
+                                            ipc::cleanup(socket_path);
+                                            return Ok(());
+                                        }
+                                    }
+                                    ClientMsg::Identify { .. } => {}
                                 }
-                                ClientMsg::Resize { rows, cols } => {
-                                    pane.resize(rows, cols);
-                                    pane.grid.mark_all_dirty();
-                                    need_resize_broadcast = true;
-                                }
-                                ClientMsg::Detach => {
-                                    to_remove.push(client_idx);
-                                    break;
-                                }
-                                ClientMsg::Identify { .. } => {}
-                            },
+                            }
                             Ok(None) => break,
                             Err(_) => {
                                 to_remove.push(client_idx);
@@ -175,16 +245,25 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                     }
                 }
             }
-            // Check for hangup/error on this client fd.
             if pf.revents & (libc::POLLHUP | libc::POLLERR) != 0 && !to_remove.contains(&client_idx)
             {
                 to_remove.push(client_idx);
             }
         }
 
-        // Broadcast resized grid to all clients if a resize happened.
-        if need_resize_broadcast {
-            broadcast_grid_update(&mut clients, &mut pane)?;
+        // Handle resize: mark all dirty, broadcast active window snapshot.
+        if need_resize {
+            for w in &mut windows {
+                w.pane.grid.mark_all_dirty();
+            }
+            send_window_snapshot(&mut clients, &windows, active_window)?;
+            broadcast_status_bar(&mut clients, &windows, active_window);
+        }
+
+        // Handle window switch: send snapshot of new active window + status bar.
+        if window_changed {
+            send_window_snapshot(&mut clients, &windows, active_window)?;
+            broadcast_status_bar(&mut clients, &windows, active_window);
         }
 
         // Remove disconnected clients (in reverse order to preserve indices).
@@ -194,13 +273,8 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             }
         }
 
-        // PTY hangup (child exited).
-        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 && !child_alive {
-            break;
-        }
-
-        // If child is dead and all clients are gone, exit.
-        if !child_alive && clients.is_empty() {
+        // If no windows and no clients, exit.
+        if windows.is_empty() && clients.is_empty() {
             break;
         }
     }
@@ -209,12 +283,65 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
     Ok(())
 }
 
-/// Handshake with the first client: read Identify, create pane, send ack + snapshot.
-fn handshake_first_client(stream: UnixStream) -> io::Result<(Pane, Vec<ClientConn>)> {
+/// Default name for a new window.
+fn default_window_name() -> String {
+    "shell".to_string()
+}
+
+/// Build the status bar text from the window list.
+fn status_bar_text(windows: &[&Window], active: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (i, w) in windows.iter().enumerate() {
+        if i == active {
+            parts.push(format!("{}:{}*", i, w.name));
+        } else {
+            parts.push(format!("{}:{}", i, w.name));
+        }
+    }
+    format!("lrmux | {}", parts.join("  "))
+}
+
+/// Broadcast status bar to all clients.
+fn broadcast_status_bar(clients: &mut Vec<ClientConn>, windows: &[Window], active: usize) {
+    let refs: Vec<&Window> = windows.iter().collect();
+    let text = status_bar_text(&refs, active);
+    let msg = proto::encode_server(&ServerMsg::StatusBarUpdate { text });
+    broadcast_to_all(clients, &msg);
+}
+
+/// Send a full grid snapshot of the active window to all clients.
+fn send_window_snapshot(
+    clients: &mut Vec<ClientConn>,
+    windows: &[Window],
+    active: usize,
+) -> io::Result<()> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let pane = &windows[active].pane;
+    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+        rows: pane.rows,
+        cols: pane.cols,
+        cells: pane.snapshot(),
+    });
+    let mut i = 0;
+    while i < clients.len() {
+        if proto::send(&mut clients[i].stream, &snapshot).is_err() {
+            clients.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Handshake with the first client: read Identify, create first window, send ack + snapshot.
+fn handshake_first_client(
+    stream: UnixStream,
+) -> io::Result<(u16, u16, Vec<Window>, Vec<ClientConn>)> {
     let mut client = stream;
 
-    // Read the Identify message (blocking).
-    let (rows, cols) = match proto::decode_client(&mut client) {
+    let (client_rows, client_cols) = match proto::decode_client(&mut client) {
         Ok(ClientMsg::Identify { rows, cols }) => (rows, cols),
         _ => {
             let _ = proto::send(
@@ -230,34 +357,50 @@ fn handshake_first_client(stream: UnixStream) -> io::Result<(Pane, Vec<ClientCon
         }
     };
 
-    // Spawn the pane.
-    let mut pane = Pane::new(rows, cols);
+    // Reserve 1 row for the status bar.
+    let grid_rows = client_rows.saturating_sub(1);
+    let grid_cols = client_cols;
 
-    // Send IdentifyAck.
-    let ack = proto::encode_server(&ServerMsg::IdentifyAck { rows, cols });
+    // Create the first window.
+    let mut window = Window::new(grid_rows, grid_cols, default_window_name());
+
+    // Send IdentifyAck with grid dimensions (not client dimensions).
+    let ack = proto::encode_server(&ServerMsg::IdentifyAck {
+        rows: grid_rows,
+        cols: grid_cols,
+    });
     proto::send(&mut client, &ack)?;
 
-    // Send full grid snapshot (mark all dirty).
-    pane.grid.mark_all_dirty();
-    send_grid_update(&mut client, &mut pane)?;
+    // Send full grid snapshot.
+    window.pane.grid.mark_all_dirty();
+    send_grid_update(&mut client, &mut window.pane)?;
 
-    let conn = ClientConn::new(client);
-    Ok((pane, vec![conn]))
+    // Send status bar.
+    let status_text = status_bar_text(&[&window], 0);
+    let status = proto::encode_server(&ServerMsg::StatusBarUpdate { text: status_text });
+    proto::send(&mut client, &status)?;
+
+    Ok((
+        grid_rows,
+        grid_cols,
+        vec![window],
+        vec![ClientConn::new(client)],
+    ))
 }
 
 /// Accept a new client, do the handshake, and add it to the clients list.
 fn accept_new_client(
     listener: &UnixListener,
-    pane: &Pane,
+    windows: &[Window],
+    active_window: usize,
+    grid_rows: u16,
+    grid_cols: u16,
     clients: &mut Vec<ClientConn>,
 ) -> io::Result<()> {
     match listener.accept() {
         Ok((mut stream, _)) => {
-            // The stream inherits the listener's non-blocking mode.
-            // Switch to blocking for the handshake.
             stream.set_nonblocking(false)?;
 
-            // Read Identify (blocking — data should be available immediately).
             match proto::decode_client(&mut stream) {
                 Ok(ClientMsg::Identify { .. }) => {}
                 _ => {
@@ -271,37 +414,48 @@ fn accept_new_client(
                 }
             }
 
-            // Send IdentifyAck with current pane dimensions.
+            // Send IdentifyAck with grid dimensions.
             let ack = proto::encode_server(&ServerMsg::IdentifyAck {
-                rows: pane.rows,
-                cols: pane.cols,
+                rows: grid_rows,
+                cols: grid_cols,
             });
             if proto::send(&mut stream, &ack).is_err() {
                 return Ok(());
             }
 
-            // Send full grid snapshot.
-            let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-                rows: pane.rows,
-                cols: pane.cols,
-                cells: pane.snapshot(),
-            });
-            if proto::send(&mut stream, &snapshot).is_err() {
-                return Ok(());
+            // Send full grid snapshot of the active window.
+            if !windows.is_empty() {
+                let pane = &windows[active_window].pane;
+                let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+                    rows: pane.rows,
+                    cols: pane.cols,
+                    cells: pane.snapshot(),
+                });
+                if proto::send(&mut stream, &snapshot).is_err() {
+                    return Ok(());
+                }
             }
+
+            // Send status bar.
+            let refs: Vec<&Window> = windows.iter().collect();
+            let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
+                text: status_bar_text(&refs, active_window),
+            });
+            let _ = proto::send(&mut stream, &status);
 
             clients.push(ClientConn::new(stream));
         }
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            // No pending connection — spurious wakeup.
-        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(e),
     }
     Ok(())
 }
 
 /// Broadcast dirty rows + cursor to all clients. Removes clients that fail to write.
-fn broadcast_grid_update(clients: &mut Vec<ClientConn>, pane: &mut Pane) -> io::Result<()> {
+fn broadcast_grid_update(
+    clients: &mut Vec<ClientConn>,
+    pane: &mut crate::server::pane::Pane,
+) -> io::Result<()> {
     let dirty = pane.take_dirty_rows();
     if dirty.is_empty() {
         return Ok(());
@@ -313,8 +467,6 @@ fn broadcast_grid_update(clients: &mut Vec<ClientConn>, pane: &mut Pane) -> io::
         cursor_col,
         cursor_visible,
     });
-
-    // Send to all clients. Remove any that fail.
     let mut i = 0;
     while i < clients.len() {
         if proto::send(&mut clients[i].stream, &msg).is_err() {
@@ -339,7 +491,10 @@ fn broadcast_to_all(clients: &mut Vec<ClientConn>, msg: &[u8]) {
 }
 
 /// Send a GridUpdate message to a single client (used during handshake).
-fn send_grid_update<W: Write>(writer: &mut W, pane: &mut Pane) -> io::Result<()> {
+fn send_grid_update<W: Write>(
+    writer: &mut W,
+    pane: &mut crate::server::pane::Pane,
+) -> io::Result<()> {
     let dirty = pane.take_dirty_rows();
     if dirty.is_empty() {
         return Ok(());
@@ -355,7 +510,6 @@ fn send_grid_update<W: Write>(writer: &mut W, pane: &mut Pane) -> io::Result<()>
 }
 
 /// Try to parse a complete frame from the buffer.
-/// Returns None if the buffer doesn't contain a complete message yet.
 fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
     if buf.len() < 4 {
         return Ok(None);
@@ -401,6 +555,19 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::Resize { rows, cols }
         }
         0x04 => ClientMsg::Detach,
+        0x05 => ClientMsg::NewWindow,
+        0x06 => ClientMsg::NextWindow,
+        0x07 => ClientMsg::PrevWindow,
+        0x08 => {
+            if data.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SelectWindow needs 1 byte",
+                ));
+            }
+            ClientMsg::SelectWindow { index: data[0] }
+        }
+        0x09 => ClientMsg::KillPane,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

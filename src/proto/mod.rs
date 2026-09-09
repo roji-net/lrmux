@@ -20,6 +20,16 @@ pub enum ClientMsg {
     Resize { rows: u16, cols: u16 },
     /// Client disconnecting.
     Detach,
+    /// Create a new window.
+    NewWindow,
+    /// Switch to next window.
+    NextWindow,
+    /// Switch to previous window.
+    PrevWindow,
+    /// Select window by index.
+    SelectWindow { index: u8 },
+    /// Kill the active pane/window.
+    KillPane,
 }
 
 /// Server → Client messages.
@@ -27,7 +37,7 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     /// Acknowledge identify, send initial grid dimensions.
     IdentifyAck { rows: u16, cols: u16 },
-    /// Full grid snapshot (sent on first connect or after resize).
+    /// Full grid snapshot (sent on first connect, window switch, or after resize).
     GridSnapshot {
         rows: u16,
         cols: u16,
@@ -44,6 +54,8 @@ pub enum ServerMsg {
     PaneExit { code: u8 },
     /// Error message.
     Error { msg: String },
+    /// Status bar content (window list, session info).
+    StatusBarUpdate { text: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -52,12 +64,18 @@ const C_IDENTIFY: u8 = 0x01;
 const C_PANE_INPUT: u8 = 0x02;
 const C_RESIZE: u8 = 0x03;
 const C_DETACH: u8 = 0x04;
+const C_NEW_WINDOW: u8 = 0x05;
+const C_NEXT_WINDOW: u8 = 0x06;
+const C_PREV_WINDOW: u8 = 0x07;
+const C_SELECT_WINDOW: u8 = 0x08;
+const C_KILL_PANE: u8 = 0x09;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
 const S_GRID_UPDATE: u8 = 0x12;
 const S_PANE_EXIT: u8 = 0x13;
 const S_ERROR: u8 = 0x14;
+const S_STATUS_BAR: u8 = 0x15;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -81,6 +99,22 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::Detach => {
             payload.push(C_DETACH);
+        }
+        ClientMsg::NewWindow => {
+            payload.push(C_NEW_WINDOW);
+        }
+        ClientMsg::NextWindow => {
+            payload.push(C_NEXT_WINDOW);
+        }
+        ClientMsg::PrevWindow => {
+            payload.push(C_PREV_WINDOW);
+        }
+        ClientMsg::SelectWindow { index } => {
+            payload.push(C_SELECT_WINDOW);
+            payload.push(*index);
+        }
+        ClientMsg::KillPane => {
+            payload.push(C_KILL_PANE);
         }
     }
     frame(payload)
@@ -131,6 +165,11 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(S_ERROR);
             payload.extend_from_slice(&(msg.len() as u32).to_le_bytes());
             payload.extend_from_slice(msg.as_bytes());
+        }
+        ServerMsg::StatusBarUpdate { text } => {
+            payload.push(S_STATUS_BAR);
+            payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            payload.extend_from_slice(text.as_bytes());
         }
     }
     frame(payload)
@@ -221,6 +260,14 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::Resize { rows, cols })
         }
         C_DETACH => Ok(ClientMsg::Detach),
+        C_NEW_WINDOW => Ok(ClientMsg::NewWindow),
+        C_NEXT_WINDOW => Ok(ClientMsg::NextWindow),
+        C_PREV_WINDOW => Ok(ClientMsg::PrevWindow),
+        C_SELECT_WINDOW => {
+            let index = read_u8(&mut r)?;
+            Ok(ClientMsg::SelectWindow { index })
+        }
+        C_KILL_PANE => Ok(ClientMsg::KillPane),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -279,6 +326,12 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let bytes = r[..len].to_vec();
             let msg = String::from_utf8_lossy(&bytes).into_owned();
             Ok(ServerMsg::Error { msg })
+        }
+        S_STATUS_BAR => {
+            let len = read_u32(&mut r)? as usize;
+            let bytes = r[..len].to_vec();
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            Ok(ServerMsg::StatusBarUpdate { text })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
