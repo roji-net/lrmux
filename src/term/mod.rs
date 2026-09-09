@@ -40,7 +40,9 @@ pub fn get_size(fd: std::os::fd::RawFd) -> (u16, u16) {
             return (24, 80);
         }
     }
-    (ws.ws_row, ws.ws_col)
+    let rows = if ws.ws_row == 0 { 24 } else { ws.ws_row };
+    let cols = if ws.ws_col == 0 { 80 } else { ws.ws_col };
+    (rows, cols)
 }
 
 /// Write helpers for escape sequences to stdout.
