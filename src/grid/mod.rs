@@ -74,14 +74,14 @@ impl Grid {
 
     /// Mark a row as dirty (modified since last render).
     #[inline]
-    fn mark_dirty(&mut self, row: usize) {
+    pub fn mark_dirty(&mut self, row: usize) {
         if row < self.dirty.len() {
             self.dirty[row] = true;
         }
     }
 
     /// Mark all rows as dirty.
-    fn mark_all_dirty(&mut self) {
+    pub fn mark_all_dirty(&mut self) {
         for d in &mut self.dirty {
             *d = true;
         }
@@ -144,7 +144,7 @@ impl Grid {
     }
 
     /// Get a mutable reference to a row. Returns None if out of bounds.
-    fn row_mut(&mut self, row: usize) -> Option<&mut Vec<Cell>> {
+    pub fn row_mut(&mut self, row: usize) -> Option<&mut Vec<Cell>> {
         self.rows.get_mut(row)
     }
 
