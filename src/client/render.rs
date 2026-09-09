@@ -108,6 +108,13 @@ impl Renderer {
             prev_row[..width].clone_from_slice(&grid_row[..width]);
         }
 
+        // If we wrote anything, hide the cursor before writing and show it
+        // after, to prevent the user from seeing the cursor jump around
+        // as cells are written sequentially.
+        if !buf.is_empty() {
+            buf.insert_str(0, "\x1b[?25l");
+        }
+
         // Handle cursor.
         let cursor = (grid.cursor_row, grid.cursor_col);
         if grid.cursor_visible {
@@ -116,10 +123,9 @@ impl Renderer {
                     (cursor.0 + 1) as u16,
                     (cursor.1 + 1) as u16,
                 ));
-                if !self.prev_cursor_visible {
-                    buf.push_str("\x1b[?25h");
-                }
             }
+            // Always show cursor at the end if it should be visible.
+            buf.push_str("\x1b[?25h");
         } else if self.prev_cursor_visible {
             buf.push_str("\x1b[?25l");
         }

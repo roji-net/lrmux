@@ -248,28 +248,21 @@ impl Grid {
             return;
         }
 
-        // Push scrolled-off rows to scrollback.
+        // Save scrolled-off rows to scrollback, replacing with blank rows
+        // of the correct width so the Vec never becomes empty.
+        let blank_row = vec![Cell::blank(); self.cols];
         for i in 0..n {
             let row_idx = self.scroll_top + i;
             if row_idx < self.rows.len() {
-                let row = std::mem::take(&mut self.rows[row_idx]);
+                let row = std::mem::replace(&mut self.rows[row_idx], blank_row.clone());
                 self.scrollback.push(row);
             }
         }
 
-        // Shift rows up within the scroll region.
-        for i in self.scroll_top..(self.scroll_bottom - n) {
-            self.rows.swap(i, i + n);
-        }
+        // Shift rows up: rotate the scroll region left by n.
+        // The blank rows we inserted at the top end up at the bottom.
+        self.rows[self.scroll_top..self.scroll_bottom].rotate_left(n);
 
-        // Fill the freed rows at the bottom of the scroll region with blanks.
-        for i in (self.scroll_bottom - n)..self.scroll_bottom {
-            if i < self.rows.len() {
-                for cell in &mut self.rows[i] {
-                    *cell = Cell::blank();
-                }
-            }
-        }
         // All rows in the scroll region changed.
         for i in self.scroll_top..self.scroll_bottom {
             self.mark_dirty(i);
@@ -283,19 +276,19 @@ impl Grid {
             return;
         }
 
-        // Shift rows down within the scroll region.
-        for i in (self.scroll_top + n..self.scroll_bottom).rev() {
-            self.rows.swap(i, i - n);
-        }
-
-        // Fill the freed rows at the top of the scroll region with blanks.
-        for i in self.scroll_top..(self.scroll_top + n) {
-            if i < self.rows.len() {
-                for cell in &mut self.rows[i] {
-                    *cell = Cell::blank();
-                }
+        // Insert blank rows at the top, then rotate right by n.
+        let blank_row = vec![Cell::blank(); self.cols];
+        for i in 0..n {
+            let row_idx = self.scroll_top + i;
+            if row_idx < self.rows.len() {
+                self.rows[row_idx] = blank_row.clone();
             }
         }
+
+        // Shift rows down: rotate the scroll region right by n.
+        // The blank rows we inserted at the top push existing content down.
+        self.rows[self.scroll_top..self.scroll_bottom].rotate_right(n);
+
         for i in self.scroll_top..self.scroll_bottom {
             self.mark_dirty(i);
         }
