@@ -42,6 +42,9 @@ pub enum ServerMsg {
         rows: u16,
         cols: u16,
         cells: Vec<Cell>,
+        cursor_row: u16,
+        cursor_col: u16,
+        cursor_visible: bool,
     },
     /// Dirty rows update (sent after PTY output is parsed into the grid).
     GridUpdate {
@@ -129,7 +132,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
         }
-        ServerMsg::GridSnapshot { rows, cols, cells } => {
+        ServerMsg::GridSnapshot {
+            rows,
+            cols,
+            cells,
+            cursor_row,
+            cursor_col,
+            cursor_visible,
+        } => {
             payload.push(S_GRID_SNAPSHOT);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
@@ -137,6 +147,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             for cell in cells {
                 encode_cell(&mut payload, cell);
             }
+            payload.extend_from_slice(&cursor_row.to_le_bytes());
+            payload.extend_from_slice(&cursor_col.to_le_bytes());
+            payload.push(*cursor_visible as u8);
         }
         ServerMsg::GridUpdate {
             dirty,
@@ -293,7 +306,17 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             for _ in 0..count {
                 cells.push(decode_cell(&mut r)?);
             }
-            Ok(ServerMsg::GridSnapshot { rows, cols, cells })
+            let cursor_row = read_u16(&mut r)?;
+            let cursor_col = read_u16(&mut r)?;
+            let cursor_visible = read_u8(&mut r)? != 0;
+            Ok(ServerMsg::GridSnapshot {
+                rows,
+                cols,
+                cells,
+                cursor_row,
+                cursor_col,
+                cursor_visible,
+            })
         }
         S_GRID_UPDATE => {
             let dirty_count = read_u32(&mut r)? as usize;

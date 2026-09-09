@@ -178,7 +178,14 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                             renderer.render(&mut stdout, &mut grid)?;
                             render_status_bar(&mut stdout, &status_text, grid.rows())?;
                         }
-                        ServerMsg::GridSnapshot { rows, cols, cells } => {
+                        ServerMsg::GridSnapshot {
+                            rows,
+                            cols,
+                            cells,
+                            cursor_row,
+                            cursor_col,
+                            cursor_visible,
+                        } => {
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
                             renderer.resize(rows as usize, cols as usize);
@@ -194,6 +201,9 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                                     r[col] = cell.clone();
                                 }
                             }
+                            grid.cursor_row = cursor_row as usize;
+                            grid.cursor_col = cursor_col as usize;
+                            grid.cursor_visible = cursor_visible;
                             let mut stdout = io::stdout();
                             stdout.write_all(b"\x1b[2J\x1b[H")?;
                             renderer.render(&mut stdout, &mut grid)?;
