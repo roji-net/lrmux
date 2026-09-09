@@ -58,7 +58,7 @@ pub enum ServerMsg {
     /// Error message.
     Error { msg: String },
     /// Status bar content (window list, session info).
-    StatusBarUpdate { text: String },
+    StatusBarUpdate { windows: Vec<String>, active: u16 },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -179,10 +179,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&(msg.len() as u32).to_le_bytes());
             payload.extend_from_slice(msg.as_bytes());
         }
-        ServerMsg::StatusBarUpdate { text } => {
+        ServerMsg::StatusBarUpdate { windows, active } => {
             payload.push(S_STATUS_BAR);
-            payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
-            payload.extend_from_slice(text.as_bytes());
+            payload.extend_from_slice(&(windows.len() as u32).to_le_bytes());
+            for name in windows {
+                payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
+            }
+            payload.extend_from_slice(&active.to_le_bytes());
         }
     }
     frame(payload)
@@ -351,10 +355,16 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             Ok(ServerMsg::Error { msg })
         }
         S_STATUS_BAR => {
-            let len = read_u32(&mut r)? as usize;
-            let bytes = r[..len].to_vec();
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            Ok(ServerMsg::StatusBarUpdate { text })
+            let count = read_u32(&mut r)? as usize;
+            let mut windows = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = read_u32(&mut r)? as usize;
+                let bytes = r[..len].to_vec();
+                r = &r[len..];
+                windows.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            let active = read_u16(&mut r)?;
+            Ok(ServerMsg::StatusBarUpdate { windows, active })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

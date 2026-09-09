@@ -176,7 +176,7 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                             grid.cursor_visible = cursor_visible;
                             let mut stdout = io::stdout();
                             renderer.render(&mut stdout, &mut grid)?;
-                            render_status_bar(&mut stdout, &status_text, grid.rows())?;
+                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
                         }
                         ServerMsg::GridSnapshot {
                             rows,
@@ -207,12 +207,12 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                             let mut stdout = io::stdout();
                             stdout.write_all(b"\x1b[2J\x1b[H")?;
                             renderer.render(&mut stdout, &mut grid)?;
-                            render_status_bar(&mut stdout, &status_text, grid.rows())?;
+                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
                         }
-                        ServerMsg::StatusBarUpdate { text } => {
-                            status_text = text;
+                        ServerMsg::StatusBarUpdate { windows, active } => {
+                            status_text = format_status_bar(&windows, active as usize);
                             let mut stdout = io::stdout();
-                            render_status_bar(&mut stdout, &status_text, grid.rows())?;
+                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
                         }
                         ServerMsg::PaneExit { .. } => {
                             break;
@@ -312,18 +312,55 @@ fn send_cmd(stream: &mut std::os::unix::net::UnixStream, msg: &ClientMsg) -> io:
     proto::send(stream, &encoded)
 }
 
+/// Format the status bar text with colors.
+/// The bar uses a blue background; the active window is highlighted in bold yellow.
+fn format_status_bar(windows: &[String], active: usize) -> String {
+    // Blue background + white text for inactive windows.
+    const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
+    // Active window: bold bright yellow on blue.
+    const ACTIVE: &str = "\x1b[1;44;93m"; // bold, bg blue, bright yellow
+    const RESET: &str = "\x1b[0m";
+
+    let mut parts: Vec<String> = Vec::new();
+    for (i, name) in windows.iter().enumerate() {
+        if i == active {
+            parts.push(format!("{}{}:{}*{}", ACTIVE, i, name, BAR));
+        } else {
+            parts.push(format!("{}:{}", i, name));
+        }
+    }
+    format!("{}lrmux | {}{}", BAR, parts.join("  "), RESET)
+}
+
 /// Render the status bar at the bottom of the screen.
 /// The status bar occupies the row immediately after the grid.
-fn render_status_bar(stdout: &mut io::Stdout, text: &str, grid_rows: usize) -> io::Result<()> {
+/// After rendering, the cursor is repositioned to the grid cursor location.
+fn render_status_bar(
+    stdout: &mut io::Stdout,
+    text: &str,
+    grid_rows: usize,
+    grid: &Grid,
+) -> io::Result<()> {
     // Position cursor at the row after the grid (1-based).
     let row = grid_rows + 1;
-    write!(stdout, "\x1b[{};1H\x1b[7m", row)?;
+    // Clear the line first, then write the colored status bar.
+    write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
     // Truncate text to terminal width (use grid cols as approximation).
     let max_cols = 200; // generous upper bound; terminal will clip
     let display: String = text.chars().take(max_cols).collect();
     stdout.write_all(display.as_bytes())?;
-    // Clear rest of line and reset attributes.
-    stdout.write_all(b"\x1b[0K\x1b[0m")?;
+    // Reset attributes.
+    stdout.write_all(b"\x1b[0m")?;
+    // Reposition cursor to the grid cursor location so the user sees
+    // the cursor in the pane, not on the status bar.
+    if grid.cursor_visible {
+        write!(
+            stdout,
+            "\x1b[{};{}H",
+            grid.cursor_row + 1,
+            grid.cursor_col + 1
+        )?;
+    }
     stdout.flush()?;
     Ok(())
 }

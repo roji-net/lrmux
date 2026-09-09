@@ -49,10 +49,12 @@ fn run() -> io::Result<()> {
     }
 
     // Fork a server process.
+    eprintln!("lrmux: starting server on {}...", sock.display());
     fork_server(&sock)?;
 
     // Wait for the server to bind the socket.
     wait_for_server(&sock)?;
+    eprintln!("lrmux: server ready.");
 
     // Connect as client.
     client::run(&sock)

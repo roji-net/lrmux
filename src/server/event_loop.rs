@@ -101,11 +101,13 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                         windows.remove(wi);
                         if windows.is_empty() {
                             // Last window closed — shut down the server.
+                            eprintln!("lrmux: last window closed, shutting down server.");
                             broadcast_to_all(
                                 &mut clients,
                                 &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
                             );
                             ipc::cleanup(socket_path);
+                            eprintln!("lrmux: server stopped.");
                             return Ok(());
                         }
                         // Fix up all clients' active_window indices.
@@ -243,6 +245,9 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         } else {
                                             // Last window — shut down the server.
+                                            eprintln!(
+                                                "lrmux: last window killed, shutting down server."
+                                            );
                                             broadcast_to_all(
                                                 &mut clients,
                                                 &proto::encode_server(&ServerMsg::PaneExit {
@@ -250,6 +255,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                                 }),
                                             );
                                             ipc::cleanup(socket_path);
+                                            eprintln!("lrmux: server stopped.");
                                             return Ok(());
                                         }
                                     }
@@ -303,7 +309,9 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         }
     }
 
+    eprintln!("lrmux: no windows and no clients remaining, server exiting.");
     ipc::cleanup(socket_path);
+    eprintln!("lrmux: server stopped.");
     Ok(())
 }
 
@@ -312,26 +320,20 @@ fn default_window_name() -> String {
     "shell".to_string()
 }
 
-/// Build the status bar text from the window list.
-fn status_bar_text(windows: &[&Window], active: usize) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for (i, w) in windows.iter().enumerate() {
-        if i == active {
-            parts.push(format!("{}:{}*", i, w.name));
-        } else {
-            parts.push(format!("{}:{}", i, w.name));
-        }
-    }
-    format!("lrmux | {}", parts.join("  "))
+/// Collect window names for the status bar.
+fn window_names(windows: &[Window]) -> Vec<String> {
+    windows.iter().map(|w| w.name.clone()).collect()
 }
 
 /// Broadcast status bar to all clients (per-client, using each client's active window).
 fn broadcast_status_bar(clients: &mut Vec<ClientConn>, windows: &[Window]) {
-    let refs: Vec<&Window> = windows.iter().collect();
+    let names = window_names(windows);
     let mut i = 0;
     while i < clients.len() {
-        let text = status_bar_text(&refs, clients[i].active_window);
-        let msg = proto::encode_server(&ServerMsg::StatusBarUpdate { text });
+        let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
+            windows: names.clone(),
+            active: clients[i].active_window as u16,
+        });
         if proto::send(&mut clients[i].stream, &msg).is_err() {
             clients.remove(i);
         } else {
@@ -413,8 +415,10 @@ fn handshake_first_client(
     send_grid_update(&mut client, &mut window.pane)?;
 
     // Send status bar.
-    let status_text = status_bar_text(&[&window], 0);
-    let status = proto::encode_server(&ServerMsg::StatusBarUpdate { text: status_text });
+    let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
+        windows: vec![window.name.clone()],
+        active: 0,
+    });
     proto::send(&mut client, &status)?;
 
     Ok((
@@ -479,9 +483,9 @@ fn accept_new_client(
             }
 
             // Send status bar.
-            let refs: Vec<&Window> = windows.iter().collect();
             let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
-                text: status_bar_text(&refs, active),
+                windows: window_names(windows),
+                active: active as u16,
             });
             let _ = proto::send(&mut stream, &status);
 
