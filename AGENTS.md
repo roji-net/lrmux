@@ -39,3 +39,10 @@ Module layout (per §5.7 of the design doc):
 - Passthrough invariant: lrmux intercepts only the prefix key (default Ctrl-A) and optionally F-key shortcuts. Everything else — keyboard and mouse — passes through to the child process untouched.
 - Rust edition 2024.
 - Target platforms: macOS + Linux (v1).
+
+## Known issues (Phase 2)
+
+- **Cursor jump on Enter (cosmetic)**: When pressing Enter in zsh, the cursor briefly appears to jump to the end of the line before settling at the new prompt position. This is because the diff renderer writes changed cells sequentially (cursor follows along) and then repositions. The cursor-hide/show around render helps but doesn't fully eliminate the effect. Potential fixes to explore later: (a) batch all cursor movements and only emit one final positioning, (b) track the grid cursor more aggressively so the renderer knows the final position before writing, (c) skip repositioning when the cursor is already at the right spot after sequential writes.
+- **No unit tests yet**: `cargo test` reports 0 tests. Need tests for grid printing/wrapping, scrollback ring, SGR parsing, renderer output.
+- **CSI private mode handling**: The VT parser checks `intermediates.contains(b'?')` but in `vte` the private marker may be in the parameter structure, not intermediates. Needs validation.
+- **No SIGWINCH handling**: Terminal resize is not propagated to the PTY or grid at runtime.
