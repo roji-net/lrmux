@@ -1,7 +1,8 @@
 // Server event loop: poll over listener, all window PTY fds, and all client sockets.
 //
-// Supports multiple windows (each with one pane), multiple concurrent clients.
-// Grid updates are broadcast only for the active window.
+// Supports multiple sessions, multiple windows per session, multiple concurrent clients.
+// Each client has its own active session and active window within that session.
+// Grid updates are sent only to clients viewing the relevant window.
 // A status bar (1 row) is reserved at the bottom of the client terminal.
 
 use std::io::{self, Write};
@@ -10,6 +11,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
+use crate::server::session::Session;
 use crate::server::window::Window;
 
 /// A connected client.
@@ -17,7 +19,9 @@ struct ClientConn {
     stream: UnixStream,
     fd: i32,
     buf: Vec<u8>,
-    /// This client's active window index (per-client, not shared).
+    /// Which session this client is attached to.
+    session_idx: usize,
+    /// This client's active window index within its session (per-client, not shared).
     active_window: usize,
 }
 
@@ -28,6 +32,7 @@ impl ClientConn {
             stream,
             fd,
             buf: Vec::new(),
+            session_idx: 0,
             active_window: 0,
         }
     }
@@ -35,12 +40,13 @@ impl ClientConn {
 
 /// Run the server event loop.
 ///
-/// Phase 4: multiple windows, multiple clients, prefix-key commands.
-/// Each client has its own active window. The server persists until all windows are closed.
+/// Phase 4: multiple sessions, multiple windows, multiple clients, prefix-key commands.
+/// Each client has its own active session and active window. The server persists until
+/// all sessions are closed.
 pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<()> {
     // Wait for the first client to determine terminal size.
     let (first_stream, _) = listener.accept()?;
-    let (mut grid_rows, mut grid_cols, mut windows, mut clients) =
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) =
         handshake_first_client(first_stream)?;
 
     // Set listener to non-blocking so we can poll it alongside clients.
@@ -48,20 +54,26 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
     let listener_fd = listener.as_raw_fd();
 
     loop {
-        // Build pollfd array: listener + all window PTY fds + all client fds.
-        let mut fds = Vec::with_capacity(1 + windows.len() + clients.len());
+        // Build pollfd array: listener + all window PTY fds (across all sessions) + all client fds.
+        // We need a mapping from pollfd index to (session_idx, window_idx).
+        let mut pty_map: Vec<(usize, usize)> = Vec::new();
+        let mut fds = Vec::with_capacity(1 + 64 + clients.len());
         fds.push(libc::pollfd {
             fd: listener_fd,
             events: libc::POLLIN,
             revents: 0,
         });
-        for w in &windows {
-            fds.push(libc::pollfd {
-                fd: w.pty_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
+        for (si, session) in sessions.iter().enumerate() {
+            for (wi, w) in session.windows.iter().enumerate() {
+                pty_map.push((si, wi));
+                fds.push(libc::pollfd {
+                    fd: w.pty_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
         }
+        let num_pty_fds = pty_map.len();
         for c in &clients {
             fds.push(libc::pollfd {
                 fd: c.fd,
@@ -79,48 +91,73 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             return Err(err);
         }
 
-        let num_windows = windows.len();
         let polled_clients = clients.len();
 
         // Listener readable → accept new client.
         if fds[0].revents & libc::POLLIN != 0 {
-            accept_new_client(&listener, &windows, grid_rows, grid_cols, &mut clients)?;
+            accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients)?;
         }
 
         // Window PTY output → grid → send only to clients viewing that window.
-        for wi in 0..num_windows {
-            let pf = &fds[1 + wi];
+        for pty_i in 0..num_pty_fds {
+            let pf = &fds[1 + pty_i];
             if pf.revents & libc::POLLIN != 0 {
-                let pane = &mut windows[wi].pane;
+                let (si, wi) = pty_map[pty_i];
+                let session = &mut sessions[si];
+                let pane = &mut session.windows[wi].pane;
                 match pane.process_pty_output() {
                     Ok(true) => {
-                        send_grid_update_to_window_viewers(&mut clients, wi, pane)?;
+                        send_grid_update_to_window_viewers(&mut clients, si, wi, pane)?;
                     }
                     Ok(false) => {
                         // Child exited. Remove the window.
-                        windows.remove(wi);
-                        if windows.is_empty() {
-                            // Last window closed — shut down the server.
-                            eprintln!("lrmux: last window closed, shutting down server.");
-                            broadcast_to_all(
-                                &mut clients,
-                                &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        session.windows.remove(wi);
+                        if session.windows.is_empty() {
+                            // Last window in this session closed — remove the session.
+                            eprintln!(
+                                "lrmux: last window in session '{}' closed, removing session.",
+                                session.name
                             );
-                            ipc::cleanup(socket_path);
-                            eprintln!("lrmux: server stopped.");
-                            return Ok(());
-                        }
-                        // Fix up all clients' active_window indices.
-                        for c in &mut clients {
-                            if c.active_window == wi {
-                                c.active_window = wi.min(windows.len() - 1);
-                            } else if c.active_window > wi {
-                                c.active_window -= 1;
+                            sessions.remove(si);
+                            if sessions.is_empty() {
+                                // Last session closed — shut down the server.
+                                eprintln!("lrmux: last session closed, shutting down server.");
+                                broadcast_to_all(
+                                    &mut clients,
+                                    &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                                );
+                                ipc::cleanup(socket_path);
+                                eprintln!("lrmux: server stopped.");
+                                return Ok(());
                             }
+                            // Fix up all clients' session indices.
+                            for c in &mut clients {
+                                if c.session_idx == si {
+                                    // Client was in the removed session — move to session 0.
+                                    c.session_idx = 0;
+                                    c.active_window = 0;
+                                } else if c.session_idx > si {
+                                    c.session_idx -= 1;
+                                }
+                            }
+                            // All clients need a snapshot + status bar (their view changed).
+                            send_all_snapshots(&mut clients, &sessions)?;
+                            broadcast_status_bar(&mut clients, &sessions);
+                        } else {
+                            // Fix up all clients' active_window indices in this session.
+                            for c in &mut clients {
+                                if c.session_idx == si {
+                                    if c.active_window == wi {
+                                        c.active_window = wi.min(session.windows.len() - 1);
+                                    } else if c.active_window > wi {
+                                        c.active_window -= 1;
+                                    }
+                                }
+                            }
+                            // Send snapshots to affected clients + status bar to all.
+                            send_all_snapshots(&mut clients, &sessions)?;
+                            broadcast_status_bar(&mut clients, &sessions);
                         }
-                        // Send snapshots to all affected clients + status bar to all.
-                        send_all_snapshots(&mut clients, &windows)?;
-                        broadcast_status_bar(&mut clients, &windows);
                     }
                     Err(e) => {
                         broadcast_to_all(
@@ -140,7 +177,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         let mut need_status_bar_all = false;
 
         for client_idx in 0..polled_clients {
-            let pf = &fds[1 + num_windows + client_idx];
+            let pf = &fds[1 + num_pty_fds + client_idx];
             if pf.revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 8192];
                 let n = unsafe {
@@ -159,19 +196,21 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                             Ok(Some(msg)) => {
                                 match msg {
                                     ClientMsg::PaneInput { data } => {
+                                        let si = clients[client_idx].session_idx;
                                         let aw = clients[client_idx].active_window;
-                                        if aw < windows.len() {
-                                            windows[aw].pane.write_input(&data)?;
+                                        if si < sessions.len() && aw < sessions[si].windows.len() {
+                                            sessions[si].windows[aw].pane.write_input(&data)?;
                                         }
                                     }
                                     ClientMsg::Resize { rows, cols } => {
-                                        // Resize all windows. Account for status bar (1 row).
+                                        // Resize all windows in all sessions.
                                         grid_rows = rows.saturating_sub(1);
                                         grid_cols = cols;
-                                        for w in &mut windows {
-                                            w.pane.resize(grid_rows, grid_cols);
+                                        for session in &mut sessions {
+                                            for w in &mut session.windows {
+                                                w.pane.resize(grid_rows, grid_cols);
+                                            }
                                         }
-                                        // All clients need a snapshot of their active window.
                                         for ci in 0..clients.len() {
                                             if !need_snapshot.contains(&ci) {
                                                 need_snapshot.push(ci);
@@ -184,40 +223,49 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         break;
                                     }
                                     ClientMsg::NewWindow => {
-                                        windows.push(Window::new(
-                                            grid_rows,
-                                            grid_cols,
-                                            default_window_name(),
-                                        ));
-                                        clients[client_idx].active_window = windows.len() - 1;
-                                        if !need_snapshot.contains(&client_idx) {
-                                            need_snapshot.push(client_idx);
+                                        let si = clients[client_idx].session_idx;
+                                        if si < sessions.len() {
+                                            sessions[si].windows.push(Window::new(
+                                                grid_rows,
+                                                grid_cols,
+                                                default_window_name(),
+                                            ));
+                                            clients[client_idx].active_window =
+                                                sessions[si].windows.len() - 1;
+                                            if !need_snapshot.contains(&client_idx) {
+                                                need_snapshot.push(client_idx);
+                                            }
+                                            need_status_bar_all = true;
                                         }
-                                        // Window list changed — all clients need status bar.
-                                        need_status_bar_all = true;
                                     }
                                     ClientMsg::NextWindow => {
-                                        if !windows.is_empty() {
+                                        let si = clients[client_idx].session_idx;
+                                        if si < sessions.len() && !sessions[si].windows.is_empty() {
                                             let aw = clients[client_idx].active_window;
                                             clients[client_idx].active_window =
-                                                (aw + 1) % windows.len();
+                                                (aw + 1) % sessions[si].windows.len();
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
                                         }
                                     }
                                     ClientMsg::PrevWindow => {
-                                        if !windows.is_empty() {
+                                        let si = clients[client_idx].session_idx;
+                                        if si < sessions.len() && !sessions[si].windows.is_empty() {
                                             let aw = clients[client_idx].active_window;
+                                            let len = sessions[si].windows.len();
                                             clients[client_idx].active_window =
-                                                if aw == 0 { windows.len() - 1 } else { aw - 1 };
+                                                if aw == 0 { len - 1 } else { aw - 1 };
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
                                         }
                                     }
                                     ClientMsg::SelectWindow { index } => {
-                                        if (index as usize) < windows.len() {
+                                        let si = clients[client_idx].session_idx;
+                                        if si < sessions.len()
+                                            && (index as usize) < sessions[si].windows.len()
+                                        {
                                             clients[client_idx].active_window = index as usize;
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
@@ -225,18 +273,25 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         }
                                     }
                                     ClientMsg::KillPane => {
+                                        let si = clients[client_idx].session_idx;
                                         let wi = clients[client_idx].active_window;
-                                        if windows.len() > 1 {
-                                            windows.remove(wi);
-                                            // Fix up all clients' active_window indices.
+                                        if si >= sessions.len() {
+                                            continue;
+                                        }
+                                        let session = &mut sessions[si];
+                                        if session.windows.len() > 1 {
+                                            session.windows.remove(wi);
+                                            // Fix up all clients' active_window in this session.
                                             for c in &mut clients {
-                                                if c.active_window == wi {
-                                                    c.active_window = wi.min(windows.len() - 1);
-                                                } else if c.active_window > wi {
-                                                    c.active_window -= 1;
+                                                if c.session_idx == si {
+                                                    if c.active_window == wi {
+                                                        c.active_window =
+                                                            wi.min(session.windows.len() - 1);
+                                                    } else if c.active_window > wi {
+                                                        c.active_window -= 1;
+                                                    }
                                                 }
                                             }
-                                            // All clients may be affected.
                                             for ci in 0..clients.len() {
                                                 if !need_snapshot.contains(&ci) {
                                                     need_snapshot.push(ci);
@@ -244,19 +299,76 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             }
                                             need_status_bar_all = true;
                                         } else {
-                                            // Last window — shut down the server.
+                                            // Last window in this session — remove the session.
                                             eprintln!(
-                                                "lrmux: last window killed, shutting down server."
+                                                "lrmux: last window in session '{}' killed, removing session.",
+                                                session.name
                                             );
-                                            broadcast_to_all(
-                                                &mut clients,
-                                                &proto::encode_server(&ServerMsg::PaneExit {
-                                                    code: 0,
-                                                }),
-                                            );
-                                            ipc::cleanup(socket_path);
-                                            eprintln!("lrmux: server stopped.");
-                                            return Ok(());
+                                            sessions.remove(si);
+                                            if sessions.is_empty() {
+                                                eprintln!(
+                                                    "lrmux: last session closed, shutting down server."
+                                                );
+                                                broadcast_to_all(
+                                                    &mut clients,
+                                                    &proto::encode_server(&ServerMsg::PaneExit {
+                                                        code: 0,
+                                                    }),
+                                                );
+                                                ipc::cleanup(socket_path);
+                                                eprintln!("lrmux: server stopped.");
+                                                return Ok(());
+                                            }
+                                            // Fix up all clients' session indices.
+                                            for c in &mut clients {
+                                                if c.session_idx == si {
+                                                    c.session_idx = 0;
+                                                    c.active_window = 0;
+                                                } else if c.session_idx > si {
+                                                    c.session_idx -= 1;
+                                                }
+                                            }
+                                            for ci in 0..clients.len() {
+                                                if !need_snapshot.contains(&ci) {
+                                                    need_snapshot.push(ci);
+                                                }
+                                            }
+                                            need_status_bar_all = true;
+                                        }
+                                    }
+                                    ClientMsg::NewSession => {
+                                        let name = default_session_name(&sessions);
+                                        sessions.push(Session::new(name, grid_rows, grid_cols));
+                                        let new_si = sessions.len() - 1;
+                                        clients[client_idx].session_idx = new_si;
+                                        clients[client_idx].active_window = 0;
+                                        if !need_snapshot.contains(&client_idx) {
+                                            need_snapshot.push(client_idx);
+                                        }
+                                        need_status_bar_all = true;
+                                    }
+                                    ClientMsg::NextSession => {
+                                        if sessions.len() > 1 {
+                                            let si = clients[client_idx].session_idx;
+                                            clients[client_idx].session_idx =
+                                                (si + 1) % sessions.len();
+                                            clients[client_idx].active_window = 0;
+                                            if !need_snapshot.contains(&client_idx) {
+                                                need_snapshot.push(client_idx);
+                                            }
+                                            need_status_bar_all = true;
+                                        }
+                                    }
+                                    ClientMsg::PrevSession => {
+                                        if sessions.len() > 1 {
+                                            let si = clients[client_idx].session_idx;
+                                            clients[client_idx].session_idx =
+                                                if si == 0 { sessions.len() - 1 } else { si - 1 };
+                                            clients[client_idx].active_window = 0;
+                                            if !need_snapshot.contains(&client_idx) {
+                                                need_snapshot.push(client_idx);
+                                            }
+                                            need_status_bar_all = true;
                                         }
                                     }
                                     ClientMsg::Identify { .. } => {}
@@ -287,14 +399,14 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         // Send snapshots + status bar to clients that need them.
         for &ci in &need_snapshot {
             if ci < clients.len() {
-                send_snapshot_to_client(&mut clients[ci], &windows)?;
-                send_status_bar_to_client(&mut clients[ci], &windows);
+                send_snapshot_to_client(&mut clients[ci], &sessions)?;
+                send_status_bar_to_client(&mut clients[ci], &sessions);
             }
         }
 
-        // Broadcast status bar to all clients if window list changed.
+        // Broadcast status bar to all clients if session/window list changed.
         if need_status_bar_all {
-            broadcast_status_bar(&mut clients, &windows);
+            broadcast_status_bar(&mut clients, &sessions);
         }
 
         // Remove disconnected clients (in reverse order to preserve indices).
@@ -304,13 +416,13 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             }
         }
 
-        // If no windows and no clients, exit.
-        if windows.is_empty() && clients.is_empty() {
+        // If no sessions and no clients, exit.
+        if sessions.is_empty() && clients.is_empty() {
             break;
         }
     }
 
-    eprintln!("lrmux: no windows and no clients remaining, server exiting.");
+    eprintln!("lrmux: no sessions and no clients remaining, server exiting.");
     ipc::cleanup(socket_path);
     eprintln!("lrmux: server stopped.");
     Ok(())
@@ -321,18 +433,39 @@ fn default_window_name() -> String {
     "shell".to_string()
 }
 
-/// Collect window names for the status bar.
-fn window_names(windows: &[Window]) -> Vec<String> {
-    windows.iter().map(|w| w.name.clone()).collect()
+/// Generate a default session name: "session", "session-2", "session-3", etc.
+fn default_session_name(sessions: &[Session]) -> String {
+    let base = "session";
+    if sessions.iter().all(|s| s.name != base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if sessions.iter().all(|s| s.name != candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
-/// Broadcast status bar to all clients (per-client, using each client's active window).
-fn broadcast_status_bar(clients: &mut Vec<ClientConn>, windows: &[Window]) {
-    let names = window_names(windows);
+/// Collect window names for the status bar from a client's session.
+fn window_names(session: &Session) -> Vec<String> {
+    session.windows.iter().map(|w| w.name.clone()).collect()
+}
+
+/// Broadcast status bar to all clients (per-client, using each client's session + active window).
+fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
     let mut i = 0;
     while i < clients.len() {
+        let si = clients[i].session_idx;
+        if si >= sessions.len() {
+            i += 1;
+            continue;
+        }
         let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
-            windows: names.clone(),
+            session: sessions[si].name.clone(),
+            windows: window_names(&sessions[si]),
             active: clients[i].active_window as u16,
         });
         if proto::send(&mut clients[i].stream, &msg).is_err() {
@@ -343,23 +476,28 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, windows: &[Window]) {
     }
 }
 
-/// Send a status bar update to a single client (using its active window).
-fn send_status_bar_to_client(client: &mut ClientConn, windows: &[Window]) {
-    let names = window_names(windows);
+/// Send a status bar update to a single client (using its session + active window).
+fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
+    let si = client.session_idx;
+    if si >= sessions.len() {
+        return;
+    }
     let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
-        windows: names,
+        session: sessions[si].name.clone(),
+        windows: window_names(&sessions[si]),
         active: client.active_window as u16,
     });
     let _ = proto::send(&mut client.stream, &msg);
 }
 
 /// Send a full grid snapshot of a client's active window to that client.
-fn send_snapshot_to_client(client: &mut ClientConn, windows: &[Window]) -> io::Result<()> {
+fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io::Result<()> {
+    let si = client.session_idx;
     let aw = client.active_window;
-    if aw >= windows.len() {
+    if si >= sessions.len() || aw >= sessions[si].windows.len() {
         return Ok(());
     }
-    let pane = &windows[aw].pane;
+    let pane = &sessions[si].windows[aw].pane;
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
     let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
         rows: pane.rows,
@@ -373,10 +511,10 @@ fn send_snapshot_to_client(client: &mut ClientConn, windows: &[Window]) -> io::R
 }
 
 /// Send each client a snapshot of its own active window.
-fn send_all_snapshots(clients: &mut Vec<ClientConn>, windows: &[Window]) -> io::Result<()> {
+fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io::Result<()> {
     let mut i = 0;
     while i < clients.len() {
-        if send_snapshot_to_client(&mut clients[i], windows).is_err() {
+        if send_snapshot_to_client(&mut clients[i], sessions).is_err() {
             clients.remove(i);
         } else {
             i += 1;
@@ -385,10 +523,10 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, windows: &[Window]) -> io::
     Ok(())
 }
 
-/// Handshake with the first client: read Identify, create first window, send ack + snapshot.
+/// Handshake with the first client: read Identify, create first session, send ack + snapshot.
 fn handshake_first_client(
     stream: UnixStream,
-) -> io::Result<(u16, u16, Vec<Window>, Vec<ClientConn>)> {
+) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = stream;
 
     let (client_rows, client_cols) = match proto::decode_client(&mut client) {
@@ -411,8 +549,9 @@ fn handshake_first_client(
     let grid_rows = client_rows.saturating_sub(1);
     let grid_cols = client_cols;
 
-    // Create the first window.
-    let mut window = Window::new(grid_rows, grid_cols, default_window_name());
+    // Create the first session with one window.
+    let mut session = Session::new("session".to_string(), grid_rows, grid_cols);
+    let window = &mut session.windows[0];
 
     // Send IdentifyAck with grid dimensions (not client dimensions).
     let ack = proto::encode_server(&ServerMsg::IdentifyAck {
@@ -427,24 +566,24 @@ fn handshake_first_client(
 
     // Send status bar.
     let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
+        session: session.name.clone(),
         windows: vec![window.name.clone()],
         active: 0,
     });
     proto::send(&mut client, &status)?;
 
-    Ok((
-        grid_rows,
-        grid_cols,
-        vec![window],
-        vec![ClientConn::new(client)],
-    ))
+    let mut conn = ClientConn::new(client);
+    conn.session_idx = 0;
+    conn.active_window = 0;
+
+    Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
 
 /// Accept a new client, do the handshake, and add it to the clients list.
-/// New clients default to window 0.
+/// New clients default to session 0, window 0.
 fn accept_new_client(
     listener: &UnixListener,
-    windows: &[Window],
+    sessions: &[Session],
     grid_rows: u16,
     grid_cols: u16,
     clients: &mut Vec<ClientConn>,
@@ -475,10 +614,13 @@ fn accept_new_client(
                 return Ok(());
             }
 
-            // New client defaults to window 0.
+            // New client defaults to session 0, window 0.
+            let session_idx = 0usize;
             let active = 0usize;
-            if !windows.is_empty() {
-                let pane = &windows[active].pane;
+            if let Some(session) = sessions.get(session_idx)
+                && let Some(window) = session.windows.get(active)
+            {
+                let pane = &window.pane;
                 let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
                 let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
                     rows: pane.rows,
@@ -494,13 +636,17 @@ fn accept_new_client(
             }
 
             // Send status bar.
-            let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
-                windows: window_names(windows),
-                active: active as u16,
-            });
-            let _ = proto::send(&mut stream, &status);
+            if let Some(session) = sessions.get(session_idx) {
+                let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
+                    session: session.name.clone(),
+                    windows: window_names(session),
+                    active: active as u16,
+                });
+                let _ = proto::send(&mut stream, &status);
+            }
 
             let mut conn = ClientConn::new(stream);
+            conn.session_idx = session_idx;
             conn.active_window = active;
             clients.push(conn);
         }
@@ -510,9 +656,10 @@ fn accept_new_client(
     Ok(())
 }
 
-/// Send dirty rows + cursor to clients viewing a specific window.
+/// Send dirty rows + cursor to clients viewing a specific window in a specific session.
 fn send_grid_update_to_window_viewers(
     clients: &mut Vec<ClientConn>,
+    session_idx: usize,
     window_idx: usize,
     pane: &mut crate::server::pane::Pane,
 ) -> io::Result<()> {
@@ -529,7 +676,7 @@ fn send_grid_update_to_window_viewers(
     });
     let mut i = 0;
     while i < clients.len() {
-        if clients[i].active_window == window_idx {
+        if clients[i].session_idx == session_idx && clients[i].active_window == window_idx {
             if proto::send(&mut clients[i].stream, &msg).is_err() {
                 clients.remove(i);
             } else {
@@ -632,6 +779,9 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::SelectWindow { index: data[0] }
         }
         0x09 => ClientMsg::KillPane,
+        0x0a => ClientMsg::NewSession,
+        0x0b => ClientMsg::NextSession,
+        0x0c => ClientMsg::PrevSession,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

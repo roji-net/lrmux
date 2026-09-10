@@ -30,6 +30,12 @@ pub enum ClientMsg {
     SelectWindow { index: u8 },
     /// Kill the active pane/window.
     KillPane,
+    /// Create a new session and switch to it.
+    NewSession,
+    /// Switch to next session.
+    NextSession,
+    /// Switch to previous session.
+    PrevSession,
 }
 
 /// Server → Client messages.
@@ -57,8 +63,12 @@ pub enum ServerMsg {
     PaneExit { code: u8 },
     /// Error message.
     Error { msg: String },
-    /// Status bar content (window list, session info).
-    StatusBarUpdate { windows: Vec<String>, active: u16 },
+    /// Status bar content (session name, window list, active window).
+    StatusBarUpdate {
+        session: String,
+        windows: Vec<String>,
+        active: u16,
+    },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -72,6 +82,9 @@ const C_NEXT_WINDOW: u8 = 0x06;
 const C_PREV_WINDOW: u8 = 0x07;
 const C_SELECT_WINDOW: u8 = 0x08;
 const C_KILL_PANE: u8 = 0x09;
+const C_NEW_SESSION: u8 = 0x0a;
+const C_NEXT_SESSION: u8 = 0x0b;
+const C_PREV_SESSION: u8 = 0x0c;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -118,6 +131,15 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::KillPane => {
             payload.push(C_KILL_PANE);
+        }
+        ClientMsg::NewSession => {
+            payload.push(C_NEW_SESSION);
+        }
+        ClientMsg::NextSession => {
+            payload.push(C_NEXT_SESSION);
+        }
+        ClientMsg::PrevSession => {
+            payload.push(C_PREV_SESSION);
         }
     }
     frame(payload)
@@ -179,8 +201,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&(msg.len() as u32).to_le_bytes());
             payload.extend_from_slice(msg.as_bytes());
         }
-        ServerMsg::StatusBarUpdate { windows, active } => {
+        ServerMsg::StatusBarUpdate {
+            session,
+            windows,
+            active,
+        } => {
             payload.push(S_STATUS_BAR);
+            payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
+            payload.extend_from_slice(session.as_bytes());
             payload.extend_from_slice(&(windows.len() as u32).to_le_bytes());
             for name in windows {
                 payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -285,6 +313,9 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::SelectWindow { index })
         }
         C_KILL_PANE => Ok(ClientMsg::KillPane),
+        C_NEW_SESSION => Ok(ClientMsg::NewSession),
+        C_NEXT_SESSION => Ok(ClientMsg::NextSession),
+        C_PREV_SESSION => Ok(ClientMsg::PrevSession),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -355,6 +386,9 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             Ok(ServerMsg::Error { msg })
         }
         S_STATUS_BAR => {
+            let session_len = read_u32(&mut r)? as usize;
+            let session = String::from_utf8_lossy(&r[..session_len]).into_owned();
+            r = &r[session_len..];
             let count = read_u32(&mut r)? as usize;
             let mut windows = Vec::with_capacity(count);
             for _ in 0..count {
@@ -364,7 +398,11 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 windows.push(String::from_utf8_lossy(&bytes).into_owned());
             }
             let active = read_u16(&mut r)?;
-            Ok(ServerMsg::StatusBarUpdate { windows, active })
+            Ok(ServerMsg::StatusBarUpdate {
+                session,
+                windows,
+                active,
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

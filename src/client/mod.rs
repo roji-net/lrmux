@@ -209,8 +209,12 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                             renderer.render(&mut stdout, &mut grid)?;
                             render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
                         }
-                        ServerMsg::StatusBarUpdate { windows, active } => {
-                            status_text = format_status_bar(&windows, active as usize);
+                        ServerMsg::StatusBarUpdate {
+                            session,
+                            windows,
+                            active,
+                        } => {
+                            status_text = format_status_bar(&session, &windows, active as usize);
                             let mut stdout = io::stdout();
                             render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
                         }
@@ -291,6 +295,18 @@ fn process_prefix(
                     b'x' => {
                         send_cmd(stream, &ClientMsg::KillPane)?;
                     }
+                    // 'S' → new session.
+                    b'S' => {
+                        send_cmd(stream, &ClientMsg::NewSession)?;
+                    }
+                    // 'N' → next session.
+                    b'N' => {
+                        send_cmd(stream, &ClientMsg::NextSession)?;
+                    }
+                    // 'P' → previous session.
+                    b'P' => {
+                        send_cmd(stream, &ClientMsg::PrevSession)?;
+                    }
                     // '0'–'9' → select window by index.
                     b'0'..=b'9' => {
                         send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
@@ -314,11 +330,14 @@ fn send_cmd(stream: &mut std::os::unix::net::UnixStream, msg: &ClientMsg) -> io:
 
 /// Format the status bar text with colors.
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
-fn format_status_bar(windows: &[String], active: usize) -> String {
+/// The session name is shown first, then the window list.
+fn format_status_bar(session: &str, windows: &[String], active: usize) -> String {
     // Blue background + white text for inactive windows.
     const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
     // Active window: bold bright yellow on blue.
     const ACTIVE: &str = "\x1b[1;44;93m"; // bold, bg blue, bright yellow
+    // Session name: bold bright cyan on blue.
+    const SESSION: &str = "\x1b[1;44;96m"; // bold, bg blue, bright cyan
     const RESET: &str = "\x1b[0m";
 
     let mut parts: Vec<String> = Vec::new();
@@ -329,7 +348,14 @@ fn format_status_bar(windows: &[String], active: usize) -> String {
             parts.push(format!("{}:{}", i, name));
         }
     }
-    format!("{}lrmux | {}{}", BAR, parts.join("  "), RESET)
+    format!(
+        "{}lrmux | {}{} | {}{}",
+        BAR,
+        SESSION,
+        session,
+        parts.join("  "),
+        RESET
+    )
 }
 
 /// Render the status bar at the bottom of the screen.
