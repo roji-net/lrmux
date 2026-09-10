@@ -284,10 +284,11 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             }
         }
 
-        // Send snapshots to clients that need them.
+        // Send snapshots + status bar to clients that need them.
         for &ci in &need_snapshot {
             if ci < clients.len() {
                 send_snapshot_to_client(&mut clients[ci], &windows)?;
+                send_status_bar_to_client(&mut clients[ci], &windows);
             }
         }
 
@@ -340,6 +341,16 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, windows: &[Window]) {
             i += 1;
         }
     }
+}
+
+/// Send a status bar update to a single client (using its active window).
+fn send_status_bar_to_client(client: &mut ClientConn, windows: &[Window]) {
+    let names = window_names(windows);
+    let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
+        windows: names,
+        active: client.active_window as u16,
+    });
+    let _ = proto::send(&mut client.stream, &msg);
 }
 
 /// Send a full grid snapshot of a client's active window to that client.
