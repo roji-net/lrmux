@@ -41,7 +41,8 @@ enum PrefixState {
 }
 
 /// Run the client: connect to server, relay stdin → server, render grid updates.
-pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
+/// If `new_session` is provided, a NewSession command is sent right after the handshake.
+pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -> io::Result<()> {
     // Connect to the server.
     let mut stream = ipc::connect(socket_path)?;
     let stream_fd = stream.as_raw_fd();
@@ -87,6 +88,12 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
 
     // Status bar text (updated by the server).
     let mut status_text = String::new();
+
+    // If requested, create a new session on the server right after handshake.
+    if let Some(name) = new_session {
+        let msg = proto::encode_client(&ClientMsg::NewSession { name });
+        proto::send(&mut stream, &msg)?;
+    }
 
     // Clear screen and do initial render.
     {
@@ -295,9 +302,9 @@ fn process_prefix(
                     b'x' => {
                         send_cmd(stream, &ClientMsg::KillPane)?;
                     }
-                    // 'S' → new session.
-                    b'S' => {
-                        send_cmd(stream, &ClientMsg::NewSession)?;
+                    // 'C' → new session (uppercase, like lowercase 'c' for new window).
+                    b'C' => {
+                        send_cmd(stream, &ClientMsg::NewSession { name: None })?;
                     }
                     // 'N' → next session.
                     b'N' => {

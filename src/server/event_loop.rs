@@ -336,9 +336,14 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::NewSession => {
-                                        let name = default_session_name(&sessions);
-                                        sessions.push(Session::new(name, grid_rows, grid_cols));
+                                    ClientMsg::NewSession { name } => {
+                                        let session_name =
+                                            name.unwrap_or_else(|| default_session_name(&sessions));
+                                        sessions.push(Session::new(
+                                            session_name,
+                                            grid_rows,
+                                            grid_cols,
+                                        ));
                                         let new_si = sessions.len() - 1;
                                         clients[client_idx].session_idx = new_si;
                                         clients[client_idx].active_window = 0;
@@ -779,7 +784,35 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::SelectWindow { index: data[0] }
         }
         0x09 => ClientMsg::KillPane,
-        0x0a => ClientMsg::NewSession,
+        0x0a => {
+            // NewSession: 1 byte flag (0 = no name, 1 = has name) + optional name
+            if data.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "NewSession needs at least 1 byte",
+                ));
+            }
+            let has_name = data[0];
+            if has_name != 0 {
+                if data.len() < 5 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession name needs 4-byte length",
+                    ));
+                }
+                let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if data.len() < 5 + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession name truncated",
+                    ));
+                }
+                let name = String::from_utf8_lossy(&data[5..5 + len]).into_owned();
+                ClientMsg::NewSession { name: Some(name) }
+            } else {
+                ClientMsg::NewSession { name: None }
+            }
+        }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
         _ => {

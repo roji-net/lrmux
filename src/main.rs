@@ -31,33 +31,98 @@ fn main() {
     }
 }
 
-/// Entry point: try to connect to an existing server, or fork a new one.
-fn run() -> io::Result<()> {
-    let sock = socket_path("default");
+/// CLI arguments.
+enum CliAction {
+    /// Default: connect to the "default" server (or start one).
+    Default,
+    /// `new-session [name]`: connect to default server, create a new session, attach to it.
+    NewSession(Option<String>),
+    /// `new-server [name]`: start a new server with the given name (or "default").
+    NewServer(String),
+}
 
-    // Try to connect to an existing server.
-    match client::run(&sock) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            // Socket file doesn't exist — fork a new server.
+/// Parse CLI arguments into an action.
+fn parse_args() -> CliAction {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("new-session") => CliAction::NewSession(args.get(2).cloned()),
+        Some("new-server") => {
+            let name = args.get(2).map(|s| s.as_str()).unwrap_or("default");
+            CliAction::NewServer(name.to_string())
         }
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            // Stale socket — clean up and fork a new server.
-            ipc::cleanup(&sock);
-        }
-        Err(e) => return Err(e),
+        _ => CliAction::Default,
     }
+}
 
-    // Fork a server process.
-    eprintln!("lrmux: starting server on {}...", sock.display());
-    fork_server(&sock)?;
+/// Entry point: parse args, connect to or fork a server, run the client.
+fn run() -> io::Result<()> {
+    let action = parse_args();
 
-    // Wait for the server to bind the socket.
-    wait_for_server(&sock)?;
-    eprintln!("lrmux: server ready.");
+    match action {
+        CliAction::NewSession(name) => {
+            // Connect to the default server (must already be running).
+            let sock = socket_path("default");
+            match client::run(&sock, Some(name)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no server running; start one with `lrmux` first",
+                )),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "server socket is stale; start a new one with `lrmux`",
+                )),
+                Err(e) => Err(e),
+            }
+        }
+        CliAction::NewServer(name) => {
+            // Start a new server with the given name.
+            let sock = socket_path(&name);
 
-    // Connect as client.
-    client::run(&sock)
+            // Check if a server with this name already exists.
+            if ipc::server_exists(&sock) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("server '{name}' is already running"),
+                ));
+            }
+
+            eprintln!("lrmux: starting server '{name}' on {}...", sock.display());
+            fork_server(&sock)?;
+            wait_for_server(&sock)?;
+            eprintln!("lrmux: server '{name}' ready.");
+
+            // Connect as client (no new session — the server starts with one).
+            client::run(&sock, None)
+        }
+        CliAction::Default => {
+            let sock = socket_path("default");
+
+            // Try to connect to an existing server.
+            match client::run(&sock, None) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // Socket file doesn't exist — fork a new server.
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    // Stale socket — clean up and fork a new server.
+                    ipc::cleanup(&sock);
+                }
+                Err(e) => return Err(e),
+            }
+
+            // Fork a server process.
+            eprintln!("lrmux: starting server on {}...", sock.display());
+            fork_server(&sock)?;
+
+            // Wait for the server to bind the socket.
+            wait_for_server(&sock)?;
+            eprintln!("lrmux: server ready.");
+
+            // Connect as client.
+            client::run(&sock, None)
+        }
+    }
 }
 
 /// Fork a server process. The child binds the socket and runs the event loop.

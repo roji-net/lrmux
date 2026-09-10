@@ -30,8 +30,8 @@ pub enum ClientMsg {
     SelectWindow { index: u8 },
     /// Kill the active pane/window.
     KillPane,
-    /// Create a new session and switch to it.
-    NewSession,
+    /// Create a new session and switch to it. Optional name.
+    NewSession { name: Option<String> },
     /// Switch to next session.
     NextSession,
     /// Switch to previous session.
@@ -132,8 +132,16 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::KillPane => {
             payload.push(C_KILL_PANE);
         }
-        ClientMsg::NewSession => {
+        ClientMsg::NewSession { name } => {
             payload.push(C_NEW_SESSION);
+            match name {
+                Some(n) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(n.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(n.as_bytes());
+                }
+                None => payload.push(0),
+            }
         }
         ClientMsg::NextSession => {
             payload.push(C_NEXT_SESSION);
@@ -313,7 +321,16 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::SelectWindow { index })
         }
         C_KILL_PANE => Ok(ClientMsg::KillPane),
-        C_NEW_SESSION => Ok(ClientMsg::NewSession),
+        C_NEW_SESSION => {
+            let has_name = read_u8(&mut r)?;
+            if has_name != 0 {
+                let len = read_u32(&mut r)? as usize;
+                let name = String::from_utf8_lossy(&r[..len]).into_owned();
+                Ok(ClientMsg::NewSession { name: Some(name) })
+            } else {
+                Ok(ClientMsg::NewSession { name: None })
+            }
+        }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
         _ => Err(io::Error::new(
