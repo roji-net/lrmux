@@ -36,6 +36,8 @@ pub enum ClientMsg {
     NextSession,
     /// Switch to previous session.
     PrevSession,
+    /// Request list of sessions on this server (for the selector).
+    ListSessions,
 }
 
 /// Server → Client messages.
@@ -69,6 +71,8 @@ pub enum ServerMsg {
         windows: Vec<String>,
         active: u16,
     },
+    /// List of session names on this server (response to ListSessions).
+    SessionList { sessions: Vec<String> },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -85,6 +89,7 @@ const C_KILL_PANE: u8 = 0x09;
 const C_NEW_SESSION: u8 = 0x0a;
 const C_NEXT_SESSION: u8 = 0x0b;
 const C_PREV_SESSION: u8 = 0x0c;
+const C_LIST_SESSIONS: u8 = 0x0d;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -92,6 +97,7 @@ const S_GRID_UPDATE: u8 = 0x12;
 const S_PANE_EXIT: u8 = 0x13;
 const S_ERROR: u8 = 0x14;
 const S_STATUS_BAR: u8 = 0x15;
+const S_SESSION_LIST: u8 = 0x16;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -148,6 +154,9 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::PrevSession => {
             payload.push(C_PREV_SESSION);
+        }
+        ClientMsg::ListSessions => {
+            payload.push(C_LIST_SESSIONS);
         }
     }
     frame(payload)
@@ -223,6 +232,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(name.as_bytes());
             }
             payload.extend_from_slice(&active.to_le_bytes());
+        }
+        ServerMsg::SessionList { sessions } => {
+            payload.push(S_SESSION_LIST);
+            payload.extend_from_slice(&(sessions.len() as u32).to_le_bytes());
+            for name in sessions {
+                payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
+            }
         }
     }
     frame(payload)
@@ -333,6 +350,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
+        C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -420,6 +438,17 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 windows,
                 active,
             })
+        }
+        S_SESSION_LIST => {
+            let count = read_u32(&mut r)? as usize;
+            let mut sessions = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = read_u32(&mut r)? as usize;
+                let bytes = r[..len].to_vec();
+                r = &r[len..];
+                sessions.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            Ok(ServerMsg::SessionList { sessions })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

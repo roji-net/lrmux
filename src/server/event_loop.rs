@@ -95,7 +95,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
 
         // Listener readable → accept new client.
         if fds[0].revents & libc::POLLIN != 0 {
-            accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients)?;
+            let _ = accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients);
         }
 
         // Window PTY output → grid → send only to clients viewing that window.
@@ -107,7 +107,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                 let pane = &mut session.windows[wi].pane;
                 match pane.process_pty_output() {
                     Ok(true) => {
-                        send_grid_update_to_window_viewers(&mut clients, si, wi, pane)?;
+                        let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                     }
                     Ok(false) => {
                         // Child exited. Remove the window.
@@ -141,7 +141,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                 }
                             }
                             // All clients need a snapshot + status bar (their view changed).
-                            send_all_snapshots(&mut clients, &sessions)?;
+                            let _ = send_all_snapshots(&mut clients, &sessions);
                             broadcast_status_bar(&mut clients, &sessions);
                         } else {
                             // Fix up all clients' active_window indices in this session.
@@ -155,7 +155,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                 }
                             }
                             // Send snapshots to affected clients + status bar to all.
-                            send_all_snapshots(&mut clients, &sessions)?;
+                            let _ = send_all_snapshots(&mut clients, &sessions);
                             broadcast_status_bar(&mut clients, &sessions);
                         }
                     }
@@ -199,7 +199,8 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         let si = clients[client_idx].session_idx;
                                         let aw = clients[client_idx].active_window;
                                         if si < sessions.len() && aw < sessions[si].windows.len() {
-                                            sessions[si].windows[aw].pane.write_input(&data)?;
+                                            let _ =
+                                                sessions[si].windows[aw].pane.write_input(&data);
                                         }
                                     }
                                     ClientMsg::Resize { rows, cols } => {
@@ -377,6 +378,14 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         }
                                     }
                                     ClientMsg::Identify { .. } => {}
+                                    ClientMsg::ListSessions => {
+                                        let names: Vec<String> =
+                                            sessions.iter().map(|s| s.name.clone()).collect();
+                                        let msg = proto::encode_server(&ServerMsg::SessionList {
+                                            sessions: names,
+                                        });
+                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
+                                    }
                                 }
                             }
                             Ok(None) => break,
@@ -402,10 +411,21 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         }
 
         // Send snapshots + status bar to clients that need them.
+        // Handle send failures gracefully — remove the client instead of killing the server.
+        let mut snapshot_failures: Vec<usize> = Vec::new();
         for &ci in &need_snapshot {
             if ci < clients.len() {
-                send_snapshot_to_client(&mut clients[ci], &sessions)?;
-                send_status_bar_to_client(&mut clients[ci], &sessions);
+                if send_snapshot_to_client(&mut clients[ci], &sessions).is_err() {
+                    snapshot_failures.push(ci);
+                } else {
+                    send_status_bar_to_client(&mut clients[ci], &sessions);
+                }
+            }
+        }
+        // Mark failed clients for removal.
+        for ci in snapshot_failures {
+            if !to_remove.contains(&ci) {
+                to_remove.push(ci);
             }
         }
 
@@ -599,11 +619,18 @@ fn accept_new_client(
 
             match proto::decode_client(&mut stream) {
                 Ok(ClientMsg::Identify { .. }) => {}
+                Ok(ClientMsg::ListSessions) => {
+                    // Lightweight query: respond with session list and close.
+                    let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+                    let msg = proto::encode_server(&ServerMsg::SessionList { sessions: names });
+                    let _ = proto::send(&mut stream, &msg);
+                    return Ok(());
+                }
                 _ => {
                     let _ = proto::send(
                         &mut stream,
                         &proto::encode_server(&ServerMsg::Error {
-                            msg: "expected Identify".into(),
+                            msg: "expected Identify or ListSessions".into(),
                         }),
                     );
                     return Ok(());
@@ -815,6 +842,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
+        0x0d => ClientMsg::ListSessions,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

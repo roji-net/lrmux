@@ -1,6 +1,7 @@
 // Client process: raw mode, input relay, prefix detection, output render.
 
 pub mod render;
+pub mod selector;
 pub mod terminal;
 
 use std::io::{self, Write};
@@ -229,6 +230,7 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
+                        ServerMsg::SessionList { .. } => {}
                         ServerMsg::Error { msg } => {
                             eprintln!("\r\nlrmux: server error: {msg}\r");
                             break;
