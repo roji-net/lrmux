@@ -36,6 +36,8 @@ pub enum ClientMsg {
     NextSession,
     /// Switch to previous session.
     PrevSession,
+    /// Kill the current session (and all its windows).
+    KillSession,
     /// Request list of sessions on this server (for the selector).
     ListSessions,
 }
@@ -89,6 +91,7 @@ const C_KILL_PANE: u8 = 0x09;
 const C_NEW_SESSION: u8 = 0x0a;
 const C_NEXT_SESSION: u8 = 0x0b;
 const C_PREV_SESSION: u8 = 0x0c;
+const C_KILL_SESSION: u8 = 0x0e;
 const C_LIST_SESSIONS: u8 = 0x0d;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
@@ -154,6 +157,9 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::PrevSession => {
             payload.push(C_PREV_SESSION);
+        }
+        ClientMsg::KillSession => {
+            payload.push(C_KILL_SESSION);
         }
         ClientMsg::ListSessions => {
             payload.push(C_LIST_SESSIONS);
@@ -350,6 +356,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
+        C_KILL_SESSION => Ok(ClientMsg::KillSession),
         C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

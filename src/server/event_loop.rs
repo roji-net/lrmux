@@ -377,6 +377,47 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
+                                    ClientMsg::KillSession => {
+                                        let si = clients[client_idx].session_idx;
+                                        if si >= sessions.len() {
+                                            continue;
+                                        }
+                                        let name = sessions[si].name.clone();
+                                        eprintln!(
+                                            "lrmux: session '{}' killed by client, removing.",
+                                            name
+                                        );
+                                        sessions.remove(si);
+                                        if sessions.is_empty() {
+                                            eprintln!(
+                                                "lrmux: last session closed, shutting down server."
+                                            );
+                                            broadcast_to_all(
+                                                &mut clients,
+                                                &proto::encode_server(&ServerMsg::PaneExit {
+                                                    code: 0,
+                                                }),
+                                            );
+                                            ipc::cleanup(socket_path);
+                                            eprintln!("lrmux: server stopped.");
+                                            return Ok(());
+                                        }
+                                        // Fix up all clients' session indices.
+                                        for c in &mut clients {
+                                            if c.session_idx == si {
+                                                c.session_idx = 0;
+                                                c.active_window = 0;
+                                            } else if c.session_idx > si {
+                                                c.session_idx -= 1;
+                                            }
+                                        }
+                                        for ci in 0..clients.len() {
+                                            if !need_snapshot.contains(&ci) {
+                                                need_snapshot.push(ci);
+                                            }
+                                        }
+                                        need_status_bar_all = true;
+                                    }
                                     ClientMsg::Identify { .. } => {}
                                     ClientMsg::ListSessions => {
                                         let names: Vec<String> =
@@ -842,6 +883,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
+        0x0e => ClientMsg::KillSession,
         0x0d => ClientMsg::ListSessions,
         _ => {
             return Err(io::Error::new(

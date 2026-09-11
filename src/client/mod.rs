@@ -41,6 +41,16 @@ enum PrefixState {
     Command,
 }
 
+/// State of the confirmation dialog (for destructive actions).
+enum ConfirmState {
+    /// No confirmation active.
+    None,
+    /// "Kill current window? (y/n)" — waiting for a single keypress.
+    KillWindow,
+    /// "Type session name to confirm kill:" — waiting for text input + Enter.
+    KillSession { input: String, target: String },
+}
+
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
 pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -> io::Result<()> {
@@ -89,6 +99,8 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
 
     // Status bar text (updated by the server).
     let mut status_text = String::new();
+    // Current session name (from StatusBarUpdate, used for kill-session confirmation).
+    let mut current_session = String::new();
 
     // If requested, create a new session on the server right after handshake.
     if let Some(name) = new_session {
@@ -107,6 +119,7 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
     let stdin_fd = io::stdin().as_raw_fd();
     let mut server_buf: Vec<u8> = Vec::new();
     let mut prefix_state = PrefixState::Normal;
+    let mut confirm_state = ConfirmState::None;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -147,15 +160,65 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n > 0 {
                 let input = &buf[..n as usize];
-                let (passthrough, detach) = process_prefix(input, &mut prefix_state, &mut stream)?;
-                if !passthrough.is_empty() {
-                    let msg = proto::encode_client(&ClientMsg::PaneInput { data: passthrough });
-                    proto::send(&mut stream, &msg)?;
-                }
-                if detach {
-                    let msg = proto::encode_client(&ClientMsg::Detach);
-                    proto::send(&mut stream, &msg)?;
-                    break;
+                if matches!(confirm_state, ConfirmState::None) {
+                    let (passthrough, detach, confirm, remaining) =
+                        process_prefix(input, &mut prefix_state, &mut stream)?;
+                    if !passthrough.is_empty() {
+                        let msg = proto::encode_client(&ClientMsg::PaneInput { data: passthrough });
+                        proto::send(&mut stream, &msg)?;
+                    }
+                    if detach {
+                        let msg = proto::encode_client(&ClientMsg::Detach);
+                        proto::send(&mut stream, &msg)?;
+                        break;
+                    }
+                    if let Some(mut c) = confirm {
+                        // Fill in the session name for kill-session confirmation.
+                        if let ConfirmState::KillSession { target, .. } = &mut c {
+                            target.clone_from(&current_session);
+                        }
+                        confirm_state = c;
+                        render_confirm_prompt(&confirm_state, grid.rows());
+                        // Process any remaining bytes that arrived after the
+                        // confirm trigger in the same read buffer.
+                        if !remaining.is_empty() {
+                            let action =
+                                process_confirm(&remaining, &mut confirm_state, &mut stream)?;
+                            match action {
+                                ConfirmAction::Confirmed | ConfirmAction::Cancelled => {
+                                    confirm_state = ConfirmState::None;
+                                    let mut stdout = io::stdout();
+                                    render_status_bar(
+                                        &mut stdout,
+                                        &status_text,
+                                        grid.rows(),
+                                        &grid,
+                                    )?;
+                                }
+                                ConfirmAction::Continue => {
+                                    render_confirm_prompt(&confirm_state, grid.rows());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // In confirm mode: all input goes to the confirm handler.
+                    let action = process_confirm(input, &mut confirm_state, &mut stream)?;
+                    match action {
+                        ConfirmAction::Confirmed => {
+                            confirm_state = ConfirmState::None;
+                            let mut stdout = io::stdout();
+                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                        }
+                        ConfirmAction::Cancelled => {
+                            confirm_state = ConfirmState::None;
+                            let mut stdout = io::stdout();
+                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                        }
+                        ConfirmAction::Continue => {
+                            render_confirm_prompt(&confirm_state, grid.rows());
+                        }
+                    }
                 }
             } else if n == 0 {
                 break;
@@ -222,6 +285,7 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
                             windows,
                             active,
                         } => {
+                            current_session = session.clone();
                             status_text = format_status_bar(&session, &windows, active as usize);
                             let mut stdout = io::stdout();
                             render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
@@ -260,16 +324,24 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
 }
 
 /// Process input bytes through the prefix-key state machine.
-/// Returns (passthrough bytes, should_detach).
+/// Returns (passthrough bytes, should_detach, optional confirm dialog, remaining unprocessed bytes).
+/// When a confirm dialog is triggered, remaining bytes after the trigger are returned
+/// so the caller can process them with process_confirm.
+#[allow(clippy::type_complexity)]
 fn process_prefix(
     input: &[u8],
     state: &mut PrefixState,
     stream: &mut std::os::unix::net::UnixStream,
-) -> io::Result<(Vec<u8>, bool)> {
+) -> io::Result<(Vec<u8>, bool, Option<ConfirmState>, Vec<u8>)> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
+    let mut confirm: Option<ConfirmState> = None;
 
-    for &byte in input {
+    for (i, &byte) in input.iter().enumerate() {
+        if confirm.is_some() {
+            // Stop processing — return remaining bytes for the confirm handler.
+            return Ok((passthrough, detach, confirm, input[i..].to_vec()));
+        }
         match state {
             PrefixState::Normal => {
                 if byte == PREFIX {
@@ -300,9 +372,20 @@ fn process_prefix(
                     b'd' => {
                         detach = true;
                     }
-                    // 'x' → kill pane.
+                    // 'x' → kill pane (no confirmation, immediate).
                     b'x' => {
                         send_cmd(stream, &ClientMsg::KillPane)?;
+                    }
+                    // 'k' → kill current window (with y/n confirmation).
+                    b'k' => {
+                        confirm = Some(ConfirmState::KillWindow);
+                    }
+                    // 'K' → kill current session (type name to confirm).
+                    b'K' => {
+                        confirm = Some(ConfirmState::KillSession {
+                            input: String::new(),
+                            target: String::new(),
+                        });
                     }
                     // 'C' → new session (uppercase, like lowercase 'c' for new window).
                     b'C' => {
@@ -328,13 +411,95 @@ fn process_prefix(
         }
     }
 
-    Ok((passthrough, detach))
+    Ok((passthrough, detach, confirm, Vec::new()))
 }
 
 /// Send a command message to the server.
 fn send_cmd(stream: &mut std::os::unix::net::UnixStream, msg: &ClientMsg) -> io::Result<()> {
     let encoded = proto::encode_client(msg);
     proto::send(stream, &encoded)
+}
+
+/// Result of processing input in a confirm dialog.
+enum ConfirmAction {
+    /// User confirmed the action (command already sent).
+    Confirmed,
+    /// User cancelled (n, Esc, Ctrl-C).
+    Cancelled,
+    /// Still typing — need more input.
+    Continue,
+}
+
+/// Process input bytes during a confirmation dialog.
+fn process_confirm(
+    input: &[u8],
+    state: &mut ConfirmState,
+    stream: &mut std::os::unix::net::UnixStream,
+) -> io::Result<ConfirmAction> {
+    match state {
+        ConfirmState::None => Ok(ConfirmAction::Cancelled),
+        ConfirmState::KillWindow => {
+            // Single-key confirmation: y = kill, anything else = cancel.
+            match input.first() {
+                Some(b'y' | b'Y') => {
+                    send_cmd(stream, &ClientMsg::KillPane)?;
+                    Ok(ConfirmAction::Confirmed)
+                }
+                _ => Ok(ConfirmAction::Cancelled),
+            }
+        }
+        ConfirmState::KillSession { input: buf, target } => {
+            for &byte in input {
+                match byte {
+                    // Enter → check if typed name matches target.
+                    b'\r' | b'\n' => {
+                        if buf == target {
+                            send_cmd(stream, &ClientMsg::KillSession)?;
+                            return Ok(ConfirmAction::Confirmed);
+                        }
+                        return Ok(ConfirmAction::Cancelled);
+                    }
+                    // Esc or Ctrl-C → cancel.
+                    0x1b | 0x03 => {
+                        return Ok(ConfirmAction::Cancelled);
+                    }
+                    // Backspace → remove last char.
+                    0x7f | 0x08 => {
+                        buf.pop();
+                    }
+                    // Printable ASCII → append.
+                    0x20..=0x7e => {
+                        buf.push(byte as char);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(ConfirmAction::Continue)
+        }
+    }
+}
+
+/// Render the confirmation prompt on the status bar line.
+fn render_confirm_prompt(state: &ConfirmState, grid_rows: usize) {
+    let mut stdout = io::stdout();
+    let row = grid_rows + 1;
+    // Clear the line and write the prompt.
+    write!(stdout, "\x1b[{};1H\x1b[2K", row).ok();
+    match state {
+        ConfirmState::None => {}
+        ConfirmState::KillWindow => {
+            write!(stdout, "\x1b[43;30m Kill current window? (y/n) \x1b[0m").ok();
+        }
+        ConfirmState::KillSession { input, target } => {
+            write!(
+                stdout,
+                "\x1b[41;97m Kill session '{}'? Type the name to confirm: {}\x1b[0m",
+                target, input
+            )
+            .ok();
+        }
+    }
+    stdout.flush().ok();
 }
 
 /// Format the status bar text with colors.
