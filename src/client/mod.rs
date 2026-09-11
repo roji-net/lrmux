@@ -494,6 +494,12 @@ pub fn run(
                                 let mut stdout = io::stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
+                                // The terminal shifted all content up by n lines.
+                                // Mark all rows dirty so the renderer rewrites them
+                                // at their correct positions (the GridUpdate that
+                                // follows will render them).
+                                grid.mark_all_dirty();
+                                renderer.invalidate();
                             }
                         }
                         ServerMsg::GridUpdate {
