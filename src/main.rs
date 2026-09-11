@@ -55,8 +55,12 @@ fn parse_args() -> CliAction {
     match args.get(1).map(|s| s.as_str()) {
         Some("new-session") => CliAction::NewSession(args.get(2).cloned()),
         Some("new-server") => {
-            let name = args.get(2).map(|s| s.as_str()).unwrap_or("default");
-            CliAction::NewServer(name.to_string())
+            // Auto-generate a name if none provided (server-2, server-3, ...).
+            let name = args
+                .get(2)
+                .map(|s| s.to_string())
+                .unwrap_or_else(ipc::auto_server_name);
+            CliAction::NewServer(name)
         }
         Some("ls-servers") => CliAction::LsServers,
         Some("ls-sessions") => {
@@ -79,7 +83,7 @@ fn run() -> io::Result<()> {
         CliAction::NewSession(name) => {
             // Connect to the default server (must already be running).
             let sock = socket_path("default");
-            match client::run(&sock, Some(name)) {
+            match client::run(&sock, Some(name), None) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -103,11 +107,10 @@ fn run() -> io::Result<()> {
 /// Default action: show the selector, then act on the user's choice.
 fn run_default() -> io::Result<()> {
     match client::selector::run_selector() {
-        Ok(SelectorResult::Attach { server, session: _ }) => {
-            // Attach to the selected server (session 0 for now; full session
-            // selection will be added when the protocol supports it).
+        Ok(SelectorResult::Attach { server, session }) => {
+            // Attach to the selected server and switch to the selected session.
             let sock = socket_path(&server);
-            client::run(&sock, None)
+            client::run(&sock, None, Some(session))
         }
         Ok(SelectorResult::NewSession { server, name }) => {
             let sock = socket_path(&server);
@@ -115,7 +118,7 @@ fn run_default() -> io::Result<()> {
                 // Server doesn't exist — start it first.
                 start_new_server(&server, None)?;
             }
-            client::run(&sock, Some(name))
+            client::run(&sock, Some(name), None)
         }
         Ok(SelectorResult::NewServer { name }) => start_new_server(&name, None),
         Ok(SelectorResult::Quit) => Ok(()),
@@ -128,7 +131,7 @@ fn run_default() -> io::Result<()> {
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
-            client::run(&sock, None)
+            client::run(&sock, None, None)
         }
     }
 }
@@ -150,7 +153,7 @@ fn start_new_server(name: &str, new_session: Option<Option<String>>) -> io::Resu
     wait_for_server(&sock)?;
     eprintln!("lrmux: server '{name}' ready.");
 
-    client::run(&sock, new_session)
+    client::run(&sock, new_session, None)
 }
 
 /// List all running servers.

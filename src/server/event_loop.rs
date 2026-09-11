@@ -377,6 +377,18 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
+                                    ClientMsg::SelectSession { name } => {
+                                        if let Some(idx) =
+                                            sessions.iter().position(|s| s.name == name)
+                                        {
+                                            clients[client_idx].session_idx = idx;
+                                            clients[client_idx].active_window = 0;
+                                            if !need_snapshot.contains(&client_idx) {
+                                                need_snapshot.push(client_idx);
+                                            }
+                                            need_status_bar_all = true;
+                                        }
+                                    }
                                     ClientMsg::KillSession => {
                                         let si = clients[client_idx].session_idx;
                                         if si >= sessions.len() {
@@ -499,11 +511,15 @@ fn default_window_name() -> String {
     "shell".to_string()
 }
 
-/// Generate a default session name: "session", "session-2", "session-3", etc.
+/// Generate a default session name based on the current directory.
+/// Uses the directory basename; if that's taken, appends -2, -3, etc.
 fn default_session_name(sessions: &[Session]) -> String {
-    let base = "session";
+    let base = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "session".to_string());
     if sessions.iter().all(|s| s.name != base) {
-        return base.to_string();
+        return base;
     }
     let mut n = 2;
     loop {
@@ -615,8 +631,12 @@ fn handshake_first_client(
     let grid_rows = client_rows.saturating_sub(1);
     let grid_cols = client_cols;
 
-    // Create the first session with one window.
-    let mut session = Session::new("session".to_string(), grid_rows, grid_cols);
+    // Create the first session, named after the current directory.
+    let session_name = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "session".to_string());
+    let mut session = Session::new(session_name, grid_rows, grid_cols);
     let window = &mut session.windows[0];
 
     // Send IdentifyAck with grid dimensions (not client dimensions).
@@ -883,6 +903,24 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
+        0x0f => {
+            // SelectSession: 4-byte length + name
+            if data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SelectSession needs 4-byte length",
+                ));
+            }
+            let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if data.len() < 4 + len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SelectSession name truncated",
+                ));
+            }
+            let name = String::from_utf8_lossy(&data[4..4 + len]).into_owned();
+            ClientMsg::SelectSession { name }
+        }
         0x0e => ClientMsg::KillSession,
         0x0d => ClientMsg::ListSessions,
         _ => {

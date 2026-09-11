@@ -107,7 +107,6 @@ fn query_sessions(server_name: &str) -> io::Result<Vec<String>> {
 /// Prompt when no servers are running.
 fn no_servers_prompt() -> io::Result<SelectorResult> {
     // Simple: just create a default server + session.
-    // A full implementation would show a prompt, but for now we auto-start.
     Ok(SelectorResult::NewServer {
         name: "default".to_string(),
     })
@@ -135,26 +134,26 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
     loop {
         let filt = filtered(&query);
 
-        // Render.
+        // Render. Use \r\n because raw mode doesn't translate \n to \r\n.
         write!(stdout, "\x1b[2J\x1b[H")?; // clear + home
-        writeln!(stdout, "lrmux — select a session")?;
-        writeln!(stdout, "\x1b[90m──────────────────────────────\x1b[0m")?;
+        write!(stdout, "lrmux — select a session\r\n")?;
+        write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n")?;
         if filt.is_empty() {
-            writeln!(stdout, "\x1b[90m  (no matches)\x1b[0m")?;
+            write!(stdout, "\x1b[90m  (no matches)\x1b[0m\r\n")?;
         } else {
             for (row, &idx) in filt.iter().enumerate() {
                 let e = &entries[idx];
                 if row == selected {
-                    writeln!(stdout, "\x1b[1;36m▶ {}/{}\x1b[0m", e.server, e.session)?;
+                    write!(stdout, "\x1b[1;36m▶ {}/{}\x1b[0m\r\n", e.server, e.session)?;
                 } else {
-                    writeln!(stdout, "  {}/{}", e.server, e.session)?;
+                    write!(stdout, "  {}/{}\r\n", e.server, e.session)?;
                 }
             }
         }
-        writeln!(stdout, "\x1b[90m──────────────────────────────\x1b[0m")?;
-        writeln!(
+        write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n")?;
+        write!(
             stdout,
-            "\x1b[90mEnter=join  n=new session  N=new server  q=quit\x1b[0m"
+            "\x1b[90mEnter=join  n=new session  N=new server  q=quit\x1b[0m\r\n"
         )?;
         write!(stdout, "filter> {}", query)?;
         stdout.flush()?;
@@ -223,7 +222,7 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             // N → new server + session.
             b'N' => {
                 return Ok(SelectorResult::NewServer {
-                    name: "default".to_string(),
+                    name: crate::ipc::auto_server_name(),
                 });
             }
             // Backspace → remove last char from query.

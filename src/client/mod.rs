@@ -53,7 +53,12 @@ enum ConfirmState {
 
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
-pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -> io::Result<()> {
+/// If `select_session` is provided, a SelectSession command is sent to switch to that session.
+pub fn run(
+    socket_path: &std::path::Path,
+    new_session: Option<Option<String>>,
+    select_session: Option<String>,
+) -> io::Result<()> {
     // Connect to the server.
     let mut stream = ipc::connect(socket_path)?;
     let stream_fd = stream.as_raw_fd();
@@ -105,6 +110,11 @@ pub fn run(socket_path: &std::path::Path, new_session: Option<Option<String>>) -
     // If requested, create a new session on the server right after handshake.
     if let Some(name) = new_session {
         let msg = proto::encode_client(&ClientMsg::NewSession { name });
+        proto::send(&mut stream, &msg)?;
+    }
+    // If requested, switch to an existing session by name.
+    if let Some(ref name) = select_session {
+        let msg = proto::encode_client(&ClientMsg::SelectSession { name: name.clone() });
         proto::send(&mut stream, &msg)?;
     }
 

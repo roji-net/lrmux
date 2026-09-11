@@ -36,6 +36,8 @@ pub enum ClientMsg {
     NextSession,
     /// Switch to previous session.
     PrevSession,
+    /// Select a session by name.
+    SelectSession { name: String },
     /// Kill the current session (and all its windows).
     KillSession,
     /// Request list of sessions on this server (for the selector).
@@ -91,6 +93,7 @@ const C_KILL_PANE: u8 = 0x09;
 const C_NEW_SESSION: u8 = 0x0a;
 const C_NEXT_SESSION: u8 = 0x0b;
 const C_PREV_SESSION: u8 = 0x0c;
+const C_SELECT_SESSION: u8 = 0x0f;
 const C_KILL_SESSION: u8 = 0x0e;
 const C_LIST_SESSIONS: u8 = 0x0d;
 
@@ -157,6 +160,11 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::PrevSession => {
             payload.push(C_PREV_SESSION);
+        }
+        ClientMsg::SelectSession { name } => {
+            payload.push(C_SELECT_SESSION);
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
         }
         ClientMsg::KillSession => {
             payload.push(C_KILL_SESSION);
@@ -356,6 +364,11 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
+        C_SELECT_SESSION => {
+            let len = read_u32(&mut r)? as usize;
+            let name = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ClientMsg::SelectSession { name })
+        }
         C_KILL_SESSION => Ok(ClientMsg::KillSession),
         C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
         _ => Err(io::Error::new(
