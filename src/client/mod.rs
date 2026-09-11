@@ -48,7 +48,11 @@ enum ConfirmState {
     /// "Kill current window? (y/n)" — waiting for a single keypress.
     KillWindow,
     /// "Type session name to confirm kill:" — waiting for text input + Enter.
-    KillSession { input: String, target: String },
+    KillSession {
+        input: String,
+        target: String,
+        window_count: usize,
+    },
 }
 
 /// Run the client: connect to server, relay stdin → server, render grid updates.
@@ -106,6 +110,8 @@ pub fn run(
     let mut status_text = String::new();
     // Current session name (from StatusBarUpdate, used for kill-session confirmation).
     let mut current_session = String::new();
+    // Number of windows in the current session (from StatusBarUpdate).
+    let mut current_window_count: usize = 0;
 
     // If requested, create a new session on the server right after handshake.
     if let Some(name) = new_session {
@@ -183,9 +189,15 @@ pub fn run(
                         break;
                     }
                     if let Some(mut c) = confirm {
-                        // Fill in the session name for kill-session confirmation.
-                        if let ConfirmState::KillSession { target, .. } = &mut c {
+                        // Fill in the session name and window count for kill-session confirmation.
+                        if let ConfirmState::KillSession {
+                            target,
+                            window_count,
+                            ..
+                        } = &mut c
+                        {
                             target.clone_from(&current_session);
+                            *window_count = current_window_count;
                         }
                         confirm_state = c;
                         render_confirm_prompt(&confirm_state, grid.rows());
@@ -296,6 +308,7 @@ pub fn run(
                             active,
                         } => {
                             current_session = session.clone();
+                            current_window_count = windows.len();
                             status_text = format_status_bar(&session, &windows, active as usize);
                             let mut stdout = io::stdout();
                             render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
@@ -395,6 +408,7 @@ fn process_prefix(
                         confirm = Some(ConfirmState::KillSession {
                             input: String::new(),
                             target: String::new(),
+                            window_count: 0,
                         });
                     }
                     // 'C' → new session (uppercase, like lowercase 'c' for new window).
@@ -458,7 +472,9 @@ fn process_confirm(
                 _ => Ok(ConfirmAction::Cancelled),
             }
         }
-        ConfirmState::KillSession { input: buf, target } => {
+        ConfirmState::KillSession {
+            input: buf, target, ..
+        } => {
             for &byte in input {
                 match byte {
                     // Enter → check if typed name matches target.
@@ -500,11 +516,18 @@ fn render_confirm_prompt(state: &ConfirmState, grid_rows: usize) {
         ConfirmState::KillWindow => {
             write!(stdout, "\x1b[43;30m Kill current window? (y/n) \x1b[0m").ok();
         }
-        ConfirmState::KillSession { input, target } => {
+        ConfirmState::KillSession {
+            input,
+            target,
+            window_count,
+        } => {
             write!(
                 stdout,
-                "\x1b[41;97m Kill session '{}'? Type the name to confirm: {}\x1b[0m",
-                target, input
+                "\x1b[41;97m Kill session '{}' ({} window{})? Type the name to confirm: {}\x1b[0m",
+                target,
+                window_count,
+                if *window_count == 1 { "" } else { "s" },
+                input
             )
             .ok();
         }
