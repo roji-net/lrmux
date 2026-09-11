@@ -356,7 +356,14 @@ impl CopyMode {
         // Reset SGR.
         emit_reset(stdout)?;
 
-        // Position the copy mode cursor.
+        // Render status bar with [copy] indicator.
+        let row = view_rows + 1;
+        write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
+        let copy_status = format!("\x1b[44;97m[copy] \x1b[1;44;93m{}\x1b[0m", status_text);
+        let display: String = copy_status.chars().take(term_cols).collect();
+        stdout.write_all(display.as_bytes())?;
+
+        // Position the copy mode cursor (after status bar so it stays in place).
         let cursor_screen_row = self.vrow.saturating_sub(self.viewport_top) + 1;
         let cursor_screen_col = self.vcol + 1;
         write!(
@@ -364,13 +371,6 @@ impl CopyMode {
             "\x1b[{};{}H\x1b[?25h",
             cursor_screen_row, cursor_screen_col
         )?;
-
-        // Render status bar with [copy] indicator.
-        let row = view_rows + 1;
-        write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
-        let copy_status = format!("\x1b[44;97m[copy] \x1b[1;44;93m{}\x1b[0m", status_text);
-        let display: String = copy_status.chars().take(term_cols).collect();
-        stdout.write_all(display.as_bytes())?;
 
         stdout.flush()?;
         Ok(())

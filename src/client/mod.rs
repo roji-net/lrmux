@@ -71,10 +71,12 @@ pub fn run(
     // Enter raw mode on the controlling terminal.
     let _raw_guard = terminal::enter_raw_mode()?;
 
-    // Enter alternate screen.
+    // Enter alternate screen + enable mouse wheel (SGR mode).
+    // Mouse wheel events are intercepted for scrollback scrolling;
+    // other mouse events are ignored to avoid interfering with child apps.
     {
         let mut stdout = io::stdout();
-        stdout.write_all(b"\x1b[?1049h")?;
+        stdout.write_all(b"\x1b[?1049h\x1b[?1006h\x1b[?1000h")?;
         stdout.flush()?;
     }
 
@@ -214,6 +216,59 @@ pub fn run(
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n > 0 {
                 let input = &buf[..n as usize];
+
+                // Check for SGR mouse wheel events (\x1b[<64;...M = wheel up,
+                // \x1b[<65;...M = wheel down). Intercept for scrollback scrolling.
+                if let Some((wheel_up, consumed)) = parse_sgr_mouse_wheel(input) {
+                    let scroll_amount = 3; // lines per wheel tick
+                    if wheel_up {
+                        // Wheel up: enter copy mode if needed, then scroll up.
+                        if copy_mode.is_none() {
+                            copy_mode = Some(copy_mode::CopyMode::new(
+                                grid.scrollback.len(),
+                                grid.cursor_row,
+                                grid.cursor_col,
+                            ));
+                        }
+                        if let Some(ref mut cm) = copy_mode {
+                            let view_rows = term_rows.saturating_sub(1);
+                            cm.move_cursor(-(scroll_amount as i32), 0, &grid);
+                            cm.ensure_cursor_visible(view_rows);
+                            let mut stdout = io::stdout();
+                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        }
+                    } else if let Some(ref mut cm) = copy_mode {
+                        // Wheel down: scroll down in copy mode.
+                        // Exit copy mode if we reach the bottom.
+                        let view_rows = term_rows.saturating_sub(1);
+                        let max_vrow = grid.scrollback.len() + grid.rows().saturating_sub(1);
+                        if cm.vrow + scroll_amount >= max_vrow {
+                            // At or past the bottom — exit copy mode.
+                            copy_mode = None;
+                            restore_normal_view(
+                                &mut renderer,
+                                &mut grid,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                            )?;
+                        } else {
+                            cm.move_cursor(scroll_amount as i32, 0, &grid);
+                            cm.ensure_cursor_visible(view_rows);
+                            let mut stdout = io::stdout();
+                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        }
+                    }
+                    // Process any remaining bytes after the mouse event.
+                    if consumed < input.len() {
+                        let remaining = &input[consumed..];
+                        let msg = proto::encode_client(&ClientMsg::PaneInput {
+                            data: remaining.to_vec(),
+                        });
+                        let _ = proto::send(&mut stream, &msg);
+                    }
+                    continue;
+                }
 
                 if copy_mode.is_some() {
                     // In copy mode: all input goes to copy mode key handling.
@@ -912,6 +967,8 @@ fn restore_normal_view(
     term_cols: usize,
 ) -> io::Result<()> {
     let mut stdout = io::stdout();
+    // Hide cursor (copy mode shows it; normal mode hides it).
+    stdout.write_all(b"\x1b[?25l")?;
     stdout.write_all(b"\x1b[2J\x1b[H")?;
     renderer.invalidate();
     grid.mark_all_dirty();
@@ -1030,8 +1087,35 @@ fn apply_row(grid: &mut Grid, row: usize, cells: &[Cell]) {
 /// Restore the terminal (exit alternate screen, show cursor).
 fn restore_terminal() {
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
+    let _ = stdout.write_all(b"\x1b[?25h\x1b[?1000l\x1b[?1006l\x1b[?1049l");
     let _ = stdout.flush();
+}
+
+/// Try to parse an SGR mouse wheel event from the beginning of the input.
+/// SGR format: `\x1b[<button;col;rowM` (press) or `\x1b[<button;col;rowm` (release).
+/// Button 64 = wheel up, 65 = wheel down.
+/// Returns (is_wheel_up, bytes_consumed) if a wheel event was found.
+fn parse_sgr_mouse_wheel(input: &[u8]) -> Option<(bool, usize)> {
+    // Need at least: \x1b [ < digit ; digits ; digits M/m
+    if input.len() < 8 || input[0] != 0x1b || input[1] != b'[' || input[2] != b'<' {
+        return None;
+    }
+    // Find the terminating M or m.
+    let rest = &input[3..];
+    let end = rest.iter().position(|&b| b == b'M' || b == b'm')?;
+    let params = std::str::from_utf8(&rest[..end]).ok()?;
+    let mut parts = params.splitn(3, ';');
+    let button: u32 = parts.next()?.parse().ok()?;
+    // col and row are present but we don't need them for wheel events.
+    let _col: u32 = parts.next()?.parse().ok()?;
+    let _row: u32 = parts.next()?.parse().ok()?;
+    let is_up = button == 64;
+    let is_down = button == 65;
+    if !is_up && !is_down {
+        return None;
+    }
+    // Total bytes: 3 (ESC [ <) + param bytes + 1 (M/m)
+    Some((is_up, 3 + end + 1))
 }
 
 /// Try to parse a complete server frame from the buffer.

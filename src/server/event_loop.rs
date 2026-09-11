@@ -147,7 +147,10 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                         // Child exited (PTY read returned 0 or EIO).
                         // Reap the child and get the exit code.
                         let exit_code = pane.reap_child().unwrap_or(0);
-                        if exit_code == 0 {
+                        // Treat 0 and 130 (128+SIGINT, common when exiting shells
+                        // with Ctrl-D after a Ctrl-C) and -2 (direct SIGINT signal)
+                        // as success — auto-close the window.
+                        if exit_code == 0 || exit_code == 130 || exit_code == -2 {
                             // Exit code 0: auto-close the window.
                             session.windows.remove(wi);
                             if session.windows.is_empty() {
