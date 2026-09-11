@@ -53,7 +53,7 @@ impl CopyMode {
     }
 
     /// Move the cursor by a delta. Adjusts the viewport to follow.
-    fn move_cursor(&mut self, dvrow: i32, dvcol: i32, grid: &Grid) {
+    pub fn move_cursor(&mut self, dvrow: i32, dvcol: i32, grid: &Grid) {
         let total = Self::total_rows(grid);
         let cols = grid.cols();
         self.vrow = (self.vrow as i32 + dvrow).max(0).min(total as i32 - 1) as usize;
@@ -67,7 +67,7 @@ impl CopyMode {
     }
 
     /// Scroll the viewport so the cursor is visible.
-    fn ensure_cursor_visible(&mut self, view_rows: usize) {
+    pub fn ensure_cursor_visible(&mut self, view_rows: usize) {
         if self.vrow < self.viewport_top {
             self.viewport_top = self.vrow;
         } else if self.vrow >= self.viewport_top + view_rows {
@@ -98,7 +98,7 @@ impl CopyMode {
     }
 
     /// Find the last non-blank column in a row (for `$`).
-    fn last_non_blank(&self, grid: &Grid, vrow: usize) -> usize {
+    pub fn last_non_blank(&self, grid: &Grid, vrow: usize) -> usize {
         let cols = grid.cols();
         if let Some(row) = self.get_vrow(grid, vrow) {
             for i in (0..row.len()).rev() {
@@ -116,7 +116,9 @@ impl CopyMode {
     pub fn process_key(&mut self, byte: u8, grid: &Grid, view_rows: usize) -> CopyAction {
         match byte {
             // Quit copy mode.
-            b'q' | 0x1b => CopyAction::Quit, // q or Esc
+            // Note: Esc (0x1b) is handled by the caller which checks for
+            // escape sequences (arrow keys) before calling process_key.
+            b'q' => CopyAction::Quit,
 
             // Movement: h/j/k/l (vi-style).
             b'h' => {

@@ -217,11 +217,96 @@ pub fn run(
 
                 if copy_mode.is_some() {
                     // In copy mode: all input goes to copy mode key handling.
+                    // Arrow keys send escape sequences (\x1b[A/B/C/D) which must
+                    // be distinguished from a standalone Esc (\x1b) that quits.
                     let view_rows = term_rows.saturating_sub(1);
                     let mut copy_action: Option<copy_mode::CopyAction> = None;
-                    for &byte in input {
+                    let mut i = 0;
+                    while i < input.len() {
                         if let Some(ref mut cm) = copy_mode {
-                            let action = cm.process_key(byte, &grid, view_rows);
+                            // Check for escape sequence (arrow keys, Home/End, Page Up/Down).
+                            if input[i] == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                                let handled = match input[i + 2] {
+                                    b'A' => {
+                                        cm.move_cursor(-1, 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    b'B' => {
+                                        cm.move_cursor(1, 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    b'C' => {
+                                        cm.move_cursor(0, 1, &grid);
+                                        true
+                                    }
+                                    b'D' => {
+                                        cm.move_cursor(0, -1, &grid);
+                                        true
+                                    }
+                                    b'H' => {
+                                        cm.vcol = 0;
+                                        true
+                                    } // Home
+                                    b'F' => {
+                                        cm.vcol = cm.last_non_blank(&grid, cm.vrow);
+                                        true
+                                    } // End
+                                    _ => false,
+                                };
+                                if handled {
+                                    i += 3;
+                                    let mut stdout = io::stdout();
+                                    cm.render(
+                                        &mut stdout,
+                                        &grid,
+                                        view_rows,
+                                        term_cols,
+                                        &status_text,
+                                    )?;
+                                    continue;
+                                }
+                            }
+                            // Check for Page Up/Down: \x1b[5~ or \x1b[6~
+                            if input[i] == 0x1b && i + 3 < input.len() && input[i + 1] == b'[' {
+                                let handled = match (input[i + 2], input[i + 3]) {
+                                    (b'5', b'~') => {
+                                        let page = view_rows.max(1);
+                                        cm.move_cursor(-(page as i32), 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    (b'6', b'~') => {
+                                        let page = view_rows.max(1);
+                                        cm.move_cursor(page as i32, 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if handled {
+                                    i += 4;
+                                    let mut stdout = io::stdout();
+                                    cm.render(
+                                        &mut stdout,
+                                        &grid,
+                                        view_rows,
+                                        term_cols,
+                                        &status_text,
+                                    )?;
+                                    continue;
+                                }
+                            }
+                            // Standalone Esc (not followed by [) → quit copy mode.
+                            // Esc at the end of buffer is also treated as quit.
+                            if input[i] == 0x1b && (i + 1 >= input.len() || input[i + 1] != b'[') {
+                                copy_action = Some(copy_mode::CopyAction::Quit);
+                                break;
+                            }
+                            // \x1b[ followed by unknown byte — skip the \x1b and let
+                            // the normal byte-by-byte handler deal with the rest.
+                            let action = cm.process_key(input[i], &grid, view_rows);
                             match action {
                                 copy_mode::CopyAction::Continue => {
                                     let mut stdout = io::stdout();
@@ -239,6 +324,7 @@ pub fn run(
                                 }
                             }
                         }
+                        i += 1;
                     }
                     // Handle copy mode exit (outside the borrow).
                     if let Some(action) = copy_action {
