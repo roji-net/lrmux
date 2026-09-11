@@ -740,15 +740,28 @@ fn render_filler(
 
     // 2. Fill rows below the grid (between grid and status bar).
     if has_bottom_filler {
-        // Horizontal border row: draw ─ across the grid width,
-        // then fill the rest with filler background.
+        // Horizontal border row: draw ─ across the grid width.
         write!(stdout, "\x1b[{};1H{}", grid_rows + 1, BORDER)?;
         let h_border_cols = grid_cols.min(content_cols);
         for _ in 0..h_border_cols {
             write!(stdout, "─")?;
         }
-        // Fill the right side of the border row with filler.
-        if content_cols > grid_cols {
+        // At the corner where horizontal and vertical borders meet, draw ┘.
+        // Then fill the rest of the border row with filler background.
+        if has_right_filler && grid_cols > 0 && grid_cols < content_cols {
+            write!(
+                stdout,
+                "\x1b[{};{}H{}┘{}",
+                grid_rows + 1,
+                grid_cols + 1,
+                BORDER,
+                FILLER_BG
+            )?;
+            for _ in (grid_cols + 1)..content_cols {
+                write!(stdout, " ")?;
+            }
+        } else if content_cols > grid_cols {
+            // No right filler border, just fill with filler background.
             write!(stdout, "{}", FILLER_BG)?;
             for _ in grid_cols..content_cols {
                 write!(stdout, " ")?;
@@ -756,24 +769,11 @@ fn render_filler(
         }
 
         // Filler rows below the border: fill full width with filler background.
+        // No vertical border here — the corner ┘ already closes the border.
         for row in (grid_rows + 2)..=content_rows {
             write!(stdout, "\x1b[{};1H\x1b[2K{}", row, FILLER_BG)?;
             for _ in 0..content_cols {
                 write!(stdout, " ")?;
-            }
-        }
-        // Draw vertical border in the filler rows below the grid too,
-        // so the border line continues all the way down.
-        if has_right_filler && grid_cols > 0 {
-            for row in (grid_rows + 2)..=content_rows {
-                write!(
-                    stdout,
-                    "\x1b[{};{}H{}│{}",
-                    row,
-                    grid_cols + 1,
-                    BORDER,
-                    RESET
-                )?;
             }
         }
     }
