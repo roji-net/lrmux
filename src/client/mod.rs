@@ -468,6 +468,11 @@ pub fn run(
                 server_buf.extend_from_slice(&buf[..n as usize]);
                 while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
                     match msg {
+                        ServerMsg::ScrollbackUpdate { rows } => {
+                            for row in rows {
+                                grid.scrollback.push(row);
+                            }
+                        }
                         ServerMsg::GridUpdate {
                             dirty,
                             cursor_row,

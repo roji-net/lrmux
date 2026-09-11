@@ -191,6 +191,32 @@ impl Pane {
             .collect()
     }
 
+    /// Take pending scrollback rows for client synchronization.
+    pub fn take_pending_scrollback(&mut self) -> Vec<Vec<Cell>> {
+        let cols = self.cols as usize;
+        self.grid
+            .take_pending_scrollback()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .take(cols)
+                    .map(|c| {
+                        if c.ch == '\0' {
+                            Cell {
+                                ch: ' ',
+                                fg: c.fg,
+                                bg: c.bg,
+                                attrs: c.attrs,
+                            }
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Get a full grid snapshot as a flat cell vector (row-major).
     pub fn snapshot(&self) -> Vec<Cell> {
         let mut cells = Vec::with_capacity((self.rows as usize) * (self.cols as usize));
@@ -224,5 +250,32 @@ impl Pane {
             self.grid.cursor_col as u16,
             self.grid.cursor_visible,
         )
+    }
+
+    /// Get the full scrollback as a vector of rows (oldest first).
+    /// Used when sending a snapshot to a client (window switch, initial connect).
+    pub fn scrollback_rows(&self) -> Vec<Vec<Cell>> {
+        let cols = self.cols as usize;
+        self.grid
+            .scrollback
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .take(cols)
+                    .map(|c| {
+                        if c.ch == '\0' {
+                            Cell {
+                                ch: ' ',
+                                fg: c.fg,
+                                bg: c.bg,
+                                attrs: c.attrs,
+                            }
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }

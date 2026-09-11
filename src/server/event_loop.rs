@@ -646,6 +646,8 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     }
     let pane = &sessions[si].windows[aw].pane;
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+
+    // Send the grid snapshot first (client creates a fresh grid).
     let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
         rows: pane.rows,
         cols: pane.cols,
@@ -654,7 +656,20 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
         cursor_col,
         cursor_visible,
     });
-    proto::send(&mut client.stream, &snapshot)
+    if proto::send(&mut client.stream, &snapshot).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "client gone",
+        ));
+    }
+
+    // Then send scrollback so the client can populate the fresh grid's history.
+    let sb_rows = pane.scrollback_rows();
+    if !sb_rows.is_empty() {
+        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate { rows: sb_rows });
+        let _ = proto::send(&mut client.stream, &sb_msg);
+    }
+    Ok(())
 }
 
 /// Send each client a snapshot of its own active window.
@@ -846,6 +861,23 @@ fn send_grid_update_to_window_viewers(
     window_idx: usize,
     pane: &mut crate::server::pane::Pane,
 ) -> io::Result<()> {
+    // Take pending scrollback rows and send them first.
+    let scrolled = pane.take_pending_scrollback();
+    if !scrolled.is_empty() {
+        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate { rows: scrolled });
+        let mut i = 0;
+        while i < clients.len() {
+            if clients[i].session_idx == session_idx
+                && clients[i].active_window == window_idx
+                && proto::send(&mut clients[i].stream, &sb_msg).is_err()
+            {
+                clients.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     let dirty = pane.take_dirty_rows();
     if dirty.is_empty() {
         return Ok(());
