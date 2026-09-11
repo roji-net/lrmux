@@ -65,6 +65,10 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         });
         for (si, session) in sessions.iter().enumerate() {
             for (wi, w) in session.windows.iter().enumerate() {
+                // Skip exited panes — their child is dead, no more PTY output.
+                if w.pane.is_exited() {
+                    continue;
+                }
                 pty_map.push((si, wi));
                 fds.push(libc::pollfd {
                     fd: w.pty_fd(),
@@ -110,53 +114,63 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                     }
                     Ok(false) => {
-                        // Child exited. Remove the window.
-                        session.windows.remove(wi);
-                        if session.windows.is_empty() {
-                            // Last window in this session closed — remove the session.
-                            eprintln!(
-                                "lrmux: last window in session '{}' closed, removing session.",
-                                session.name
-                            );
-                            sessions.remove(si);
-                            if sessions.is_empty() {
-                                // Last session closed — shut down the server.
-                                eprintln!("lrmux: last session closed, shutting down server.");
-                                broadcast_to_all(
-                                    &mut clients,
-                                    &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        // Child exited (PTY read returned 0 or EIO).
+                        // Reap the child and get the exit code.
+                        let exit_code = pane.reap_child().unwrap_or(0);
+                        if exit_code == 0 {
+                            // Exit code 0: auto-close the window.
+                            session.windows.remove(wi);
+                            if session.windows.is_empty() {
+                                // Last window in this session closed — remove the session.
+                                eprintln!(
+                                    "lrmux: last window in session '{}' closed, removing session.",
+                                    session.name
                                 );
-                                ipc::cleanup(socket_path);
-                                eprintln!("lrmux: server stopped.");
-                                return Ok(());
-                            }
-                            // Fix up all clients' session indices.
-                            for c in &mut clients {
-                                if c.session_idx == si {
-                                    // Client was in the removed session — move to session 0.
-                                    c.session_idx = 0;
-                                    c.active_window = 0;
-                                } else if c.session_idx > si {
-                                    c.session_idx -= 1;
+                                sessions.remove(si);
+                                if sessions.is_empty() {
+                                    // Last session closed — shut down the server.
+                                    eprintln!("lrmux: last session closed, shutting down server.");
+                                    broadcast_to_all(
+                                        &mut clients,
+                                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                                    );
+                                    ipc::cleanup(socket_path);
+                                    eprintln!("lrmux: server stopped.");
+                                    return Ok(());
                                 }
-                            }
-                            // All clients need a snapshot + status bar (their view changed).
-                            let _ = send_all_snapshots(&mut clients, &sessions);
-                            broadcast_status_bar(&mut clients, &sessions);
-                        } else {
-                            // Fix up all clients' active_window indices in this session.
-                            for c in &mut clients {
-                                if c.session_idx == si {
-                                    if c.active_window == wi {
-                                        c.active_window = wi.min(session.windows.len() - 1);
-                                    } else if c.active_window > wi {
-                                        c.active_window -= 1;
+                                // Fix up all clients' session indices.
+                                for c in &mut clients {
+                                    if c.session_idx == si {
+                                        // Client was in the removed session — move to session 0.
+                                        c.session_idx = 0;
+                                        c.active_window = 0;
+                                    } else if c.session_idx > si {
+                                        c.session_idx -= 1;
                                     }
                                 }
+                                // All clients need a snapshot + status bar (their view changed).
+                                let _ = send_all_snapshots(&mut clients, &sessions);
+                                broadcast_status_bar(&mut clients, &sessions);
+                            } else {
+                                // Fix up all clients' active_window indices in this session.
+                                for c in &mut clients {
+                                    if c.session_idx == si {
+                                        if c.active_window == wi {
+                                            c.active_window = wi.min(session.windows.len() - 1);
+                                        } else if c.active_window > wi {
+                                            c.active_window -= 1;
+                                        }
+                                    }
+                                }
+                                // Send snapshots to affected clients + status bar to all.
+                                let _ = send_all_snapshots(&mut clients, &sessions);
+                                broadcast_status_bar(&mut clients, &sessions);
                             }
-                            // Send snapshots to affected clients + status bar to all.
-                            let _ = send_all_snapshots(&mut clients, &sessions);
-                            broadcast_status_bar(&mut clients, &sessions);
+                        } else {
+                            // Exit code ≠ 0: keep the pane open with an exit message.
+                            // The user can read the output and close manually with Prefix x.
+                            pane.write_exit_message(exit_code);
+                            let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         }
                     }
                     Err(e) => {

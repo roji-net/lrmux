@@ -63,6 +63,7 @@ Module layout (per §5.7 of the design doc):
 - **Session commands**: `Ctrl-A C` (new session, uppercase), `Ctrl-A N` (next session), `Ctrl-A P` (previous session). Session names derived from CWD basename (e.g. `lrmux`), with `-2`, `-3` suffixes on collision.
 - **Multiple windows**: `Ctrl-A c` (new window), `Ctrl-A n`/`Space` (next), `Ctrl-A p` (prev), `Ctrl-A 0-9` (select), `Ctrl-A x` (kill), `Ctrl-A k` (kill with y/n confirmation).
 - **Kill session**: `Ctrl-A K` (kill current session with typed-name confirmation, shows window count).
+- **Child exit behavior**: Exit code 0 auto-closes the pane/window. Non-zero exit keeps the pane open with a red `[process exited, code N]` message so the user can read the output before closing with `Prefix x`. Signal exits show `[process exited, signal N]`.
 - **Per-client views**: Each client has its own active session and active window. Grid updates are routed only to clients viewing the relevant window.
 - **Status bar**: Blue background, session name in cyan, window list with active window highlighted in bold yellow. `*` marks the active window. Positioned at the bottom of the terminal.
 - **Viewport model**: Canonical grid size set by the first client. SIGWINCH does NOT resize panes — the client renders a viewport (crop if smaller, filler if larger). `Ctrl-A F` sends an explicit canonical resize to the server. Filler region uses dim background with thin border lines.
@@ -72,4 +73,4 @@ Module layout (per §5.7 of the design doc):
 - **Server discovery**: Scans `/tmp/lrmux-<UID>/` for socket files and probes each to find running servers.
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
 - **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.
-- **Not yet implemented**: Pane splits, layout engine, child exit behavior (auto-close on 0, keep on non-zero), window auto-renumber, copy/scrollback mode, clipboard, TOML config loading, F-key shortcuts.
+- **Not yet implemented**: Pane splits, layout engine, window auto-renumber, copy/scrollback mode, clipboard, TOML config loading, F-key shortcuts.
