@@ -42,6 +42,8 @@ pub enum ClientMsg {
     KillSession,
     /// Request list of sessions on this server (for the selector).
     ListSessions,
+    /// Kill the server entirely (used by `lrmux kill-server`).
+    KillServer,
 }
 
 /// Server → Client messages.
@@ -96,6 +98,7 @@ const C_PREV_SESSION: u8 = 0x0c;
 const C_SELECT_SESSION: u8 = 0x0f;
 const C_KILL_SESSION: u8 = 0x0e;
 const C_LIST_SESSIONS: u8 = 0x0d;
+const C_KILL_SERVER: u8 = 0x10;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -171,6 +174,9 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::ListSessions => {
             payload.push(C_LIST_SESSIONS);
+        }
+        ClientMsg::KillServer => {
+            payload.push(C_KILL_SERVER);
         }
     }
     frame(payload)
@@ -371,6 +377,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         }
         C_KILL_SESSION => Ok(ClientMsg::KillSession),
         C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
+        C_KILL_SERVER => Ok(ClientMsg::KillServer),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),

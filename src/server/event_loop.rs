@@ -45,9 +45,26 @@ impl ClientConn {
 /// all sessions are closed.
 pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<()> {
     // Wait for the first client to determine terminal size.
-    let (first_stream, _) = listener.accept()?;
-    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) =
-        handshake_first_client(first_stream)?;
+    // Retry on bad connections (e.g. ListSessions queries from the selector,
+    // or connections that send unexpected data).
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = loop {
+        let (stream, _) = listener.accept()?;
+        match handshake_first_client(stream) {
+            Ok(result) => break result,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                // KillServer received during initial handshake — shut down.
+                ipc::cleanup(socket_path);
+                eprintln!("lrmux: server stopped (killed before first client).");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "lrmux server: initial handshake failed ({e}), waiting for next client..."
+                );
+                continue;
+            }
+        }
+    };
 
     // Set listener to non-blocking so we can poll it alongside clients.
     listener.set_nonblocking(true)?;
@@ -99,7 +116,20 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
 
         // Listener readable → accept new client.
         if fds[0].revents & libc::POLLIN != 0 {
-            let _ = accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients);
+            match accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                    // KillServer received — shut down gracefully.
+                    broadcast_to_all(
+                        &mut clients,
+                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                    );
+                    ipc::cleanup(socket_path);
+                    eprintln!("lrmux: server stopped.");
+                    return Ok(());
+                }
+                Err(_) => {}
+            }
         }
 
         // Window PTY output → grid → send only to clients viewing that window.
@@ -464,6 +494,16 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         });
                                         let _ = proto::send(&mut clients[client_idx].stream, &msg);
                                     }
+                                    ClientMsg::KillServer => {
+                                        eprintln!("lrmux: KillServer received, shutting down.");
+                                        broadcast_to_all(
+                                            &mut clients,
+                                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                                        );
+                                        ipc::cleanup(socket_path);
+                                        eprintln!("lrmux: server stopped.");
+                                        return Ok(());
+                                    }
                                 }
                             }
                             Ok(None) => break,
@@ -631,6 +671,8 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io
 }
 
 /// Handshake with the first client: read Identify, create first session, send ack + snapshot.
+/// Returns Err if the connection is not an Identify (e.g. ListSessions query or bad data).
+/// The caller should retry by accepting the next connection.
 fn handshake_first_client(
     stream: UnixStream,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
@@ -638,6 +680,22 @@ fn handshake_first_client(
 
     let (client_rows, client_cols) = match proto::decode_client(&mut client) {
         Ok(ClientMsg::Identify { rows, cols }) => (rows, cols),
+        Ok(ClientMsg::ListSessions) => {
+            // Respond with empty session list (no sessions yet) and signal retry.
+            let msg = proto::encode_server(&ServerMsg::SessionList { sessions: vec![] });
+            let _ = proto::send(&mut client, &msg);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ListSessions query during initial handshake",
+            ));
+        }
+        Ok(ClientMsg::KillServer) => {
+            eprintln!("lrmux: KillServer received during initial handshake, shutting down.");
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "KillServer",
+            ));
+        }
         _ => {
             let _ = proto::send(
                 &mut client,
@@ -711,6 +769,13 @@ fn accept_new_client(
                     let msg = proto::encode_server(&ServerMsg::SessionList { sessions: names });
                     let _ = proto::send(&mut stream, &msg);
                     return Ok(());
+                }
+                Ok(ClientMsg::KillServer) => {
+                    eprintln!("lrmux: KillServer received, shutting down.");
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "KillServer",
+                    ));
                 }
                 _ => {
                     let _ = proto::send(
@@ -948,6 +1013,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x0e => ClientMsg::KillSession,
         0x0d => ClientMsg::ListSessions,
+        0x10 => ClientMsg::KillServer,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

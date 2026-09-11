@@ -127,6 +127,9 @@ fn run_default() -> io::Result<()> {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
+                if sock.exists() {
+                    let _ = std::fs::remove_file(&sock);
+                }
                 fork_server(&sock)?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
@@ -149,6 +152,11 @@ fn start_new_server(name: &str, new_session: Option<Option<String>>) -> io::Resu
     }
 
     eprintln!("lrmux: starting server '{name}' on {}...", sock.display());
+    // Remove any stale socket file before forking so wait_for_server()
+    // doesn't see the old socket and race ahead of the new server.
+    if sock.exists() {
+        let _ = std::fs::remove_file(&sock);
+    }
     fork_server(&sock)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: server '{name}' ready.");
@@ -209,7 +217,8 @@ fn list_sessions(server: &str) -> io::Result<()> {
     }
 }
 
-/// Kill a named server by removing its socket (the server will detect and exit).
+/// Kill a named server by sending a KillServer message.
+/// Falls back to removing the socket file if the server can't be reached.
 fn kill_server(name: &str) -> io::Result<()> {
     let sock = socket_path(name);
     if !sock.exists() {
@@ -218,12 +227,28 @@ fn kill_server(name: &str) -> io::Result<()> {
             format!("server '{name}' socket not found"),
         ));
     }
-    // Removing the socket file will cause the server's accept() to fail,
-    // and it will exit. A more graceful approach would send a KillServer
-    // message, but this works for now.
-    std::fs::remove_file(&sock)?;
-    eprintln!("lrmux: killed server '{name}'.");
-    Ok(())
+
+    // Try to connect and send KillServer message.
+    match ipc::connect(&sock) {
+        Ok(mut stream) => {
+            let msg = proto::encode_client(&ClientMsg::KillServer);
+            if proto::send(&mut stream, &msg).is_ok() {
+                eprintln!("lrmux: sent KillServer to '{name}'.");
+                // Give the server a moment to clean up.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // Also remove the socket file in case the server didn't clean up.
+            let _ = std::fs::remove_file(&sock);
+            eprintln!("lrmux: killed server '{name}'.");
+            Ok(())
+        }
+        Err(_) => {
+            // Server is not responding — just remove the stale socket file.
+            std::fs::remove_file(&sock)?;
+            eprintln!("lrmux: removed stale socket for '{name}'.");
+            Ok(())
+        }
+    }
 }
 
 /// Fork a server process. The child binds the socket and runs the event loop.
