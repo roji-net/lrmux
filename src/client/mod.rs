@@ -711,35 +711,20 @@ fn render_filler(
     const BORDER: &str = "\x1b[90m"; // bright black (gray)
     const RESET: &str = "\x1b[0m";
 
-    // Fill rows below the grid (between grid and status bar).
-    if grid_rows < content_rows {
-        // Draw a thin border line just below the grid.
-        write!(stdout, "\x1b[{};1H{}", grid_rows + 1, BORDER)?;
-        let border_cols = content_cols.min(grid_cols.max(1));
-        for _ in 0..border_cols {
-            write!(stdout, "─")?;
-        }
-        // Fill remaining rows with filler background.
-        for row in (grid_rows + 2)..=content_rows {
-            write!(stdout, "\x1b[{};1H\x1b[2K{}", row, FILLER_BG)?;
-            for _ in 0..content_cols {
-                write!(stdout, " ")?;
-            }
-        }
-        stdout.write_all(RESET.as_bytes())?;
-    }
+    let has_bottom_filler = grid_rows < content_rows;
+    let has_right_filler = grid_cols < content_cols;
 
-    // Fill columns to the right of the grid (in visible grid rows).
-    if grid_cols < content_cols {
+    // 1. Fill columns to the right of the grid (in visible grid rows).
+    if has_right_filler {
         for row in 1..=grid_rows.min(content_rows) {
-            let fill_start = grid_cols + 1;
-            write!(stdout, "\x1b[{};{}H{}", row, fill_start, FILLER_BG)?;
+            // Filler background for the right side.
+            write!(stdout, "\x1b[{};{}H{}", row, grid_cols + 1, FILLER_BG)?;
             for _ in grid_cols..content_cols {
                 write!(stdout, " ")?;
             }
         }
-        // Draw a vertical border between grid and filler columns.
-        if grid_cols > 0 && grid_rows > 0 {
+        // Vertical border between grid and filler columns.
+        if grid_cols > 0 {
             for row in 1..=grid_rows.min(content_rows) {
                 write!(
                     stdout,
@@ -751,9 +736,49 @@ fn render_filler(
                 )?;
             }
         }
-        stdout.write_all(RESET.as_bytes())?;
     }
 
+    // 2. Fill rows below the grid (between grid and status bar).
+    if has_bottom_filler {
+        // Horizontal border row: draw ─ across the grid width,
+        // then fill the rest with filler background.
+        write!(stdout, "\x1b[{};1H{}", grid_rows + 1, BORDER)?;
+        let h_border_cols = grid_cols.min(content_cols);
+        for _ in 0..h_border_cols {
+            write!(stdout, "─")?;
+        }
+        // Fill the right side of the border row with filler.
+        if content_cols > grid_cols {
+            write!(stdout, "{}", FILLER_BG)?;
+            for _ in grid_cols..content_cols {
+                write!(stdout, " ")?;
+            }
+        }
+
+        // Filler rows below the border: fill full width with filler background.
+        for row in (grid_rows + 2)..=content_rows {
+            write!(stdout, "\x1b[{};1H\x1b[2K{}", row, FILLER_BG)?;
+            for _ in 0..content_cols {
+                write!(stdout, " ")?;
+            }
+        }
+        // Draw vertical border in the filler rows below the grid too,
+        // so the border line continues all the way down.
+        if has_right_filler && grid_cols > 0 {
+            for row in (grid_rows + 2)..=content_rows {
+                write!(
+                    stdout,
+                    "\x1b[{};{}H{}│{}",
+                    row,
+                    grid_cols + 1,
+                    BORDER,
+                    RESET
+                )?;
+            }
+        }
+    }
+
+    stdout.write_all(RESET.as_bytes())?;
     stdout.flush()?;
     Ok(())
 }
