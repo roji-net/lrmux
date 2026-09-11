@@ -106,6 +106,14 @@ pub fn run(
     let mut grid = Grid::new(grid_rows, grid_cols, 10_000);
     let mut renderer = render::Renderer::new(grid_rows, grid_cols);
 
+    // Track the actual terminal size (including status bar row).
+    let (mut term_rows, mut term_cols) = {
+        let (r, c) = terminal::get_size();
+        (r as usize, c as usize)
+    };
+    // Set initial viewport from terminal size.
+    update_viewport(&mut renderer, term_rows, term_cols, grid_rows, grid_cols);
+
     // Status bar text (updated by the server).
     let mut status_text = String::new();
     // Current session name (from StatusBarUpdate, used for kill-session confirmation).
@@ -142,10 +150,28 @@ pub fn run(
 
     loop {
         // Check if the terminal was resized.
+        // With the viewport model, SIGWINCH does NOT send a resize to the server.
+        // The client just re-renders its viewport (crop or filler).
+        // Only Prefix F sends an explicit canonical resize to the server.
         if WINCH.swap(false, Ordering::Relaxed) {
-            let (rows, cols) = terminal::get_size();
-            let msg = proto::encode_client(&ClientMsg::Resize { rows, cols });
-            let _ = proto::send(&mut stream, &msg);
+            let (new_rows, new_cols) = terminal::get_size();
+            term_rows = new_rows as usize;
+            term_cols = new_cols as usize;
+            update_viewport(
+                &mut renderer,
+                term_rows,
+                term_cols,
+                grid.rows(),
+                grid.cols(),
+            );
+            // Clear screen and re-render everything.
+            let mut stdout = io::stdout();
+            stdout.write_all(b"\x1b[2J\x1b[H")?;
+            renderer.invalidate();
+            grid.mark_all_dirty();
+            renderer.render(&mut stdout, &mut grid)?;
+            render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
+            render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
         }
 
         let mut fds = [
@@ -200,7 +226,7 @@ pub fn run(
                             *window_count = current_window_count;
                         }
                         confirm_state = c;
-                        render_confirm_prompt(&confirm_state, grid.rows());
+                        render_confirm_prompt(&confirm_state, term_rows);
                         // Process any remaining bytes that arrived after the
                         // confirm trigger in the same read buffer.
                         if !remaining.is_empty() {
@@ -213,12 +239,13 @@ pub fn run(
                                     render_status_bar(
                                         &mut stdout,
                                         &status_text,
-                                        grid.rows(),
+                                        term_rows,
+                                        term_cols,
                                         &grid,
                                     )?;
                                 }
                                 ConfirmAction::Continue => {
-                                    render_confirm_prompt(&confirm_state, grid.rows());
+                                    render_confirm_prompt(&confirm_state, term_rows);
                                 }
                             }
                         }
@@ -230,15 +257,27 @@ pub fn run(
                         ConfirmAction::Confirmed => {
                             confirm_state = ConfirmState::None;
                             let mut stdout = io::stdout();
-                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid,
+                            )?;
                         }
                         ConfirmAction::Cancelled => {
                             confirm_state = ConfirmState::None;
                             let mut stdout = io::stdout();
-                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid,
+                            )?;
                         }
                         ConfirmAction::Continue => {
-                            render_confirm_prompt(&confirm_state, grid.rows());
+                            render_confirm_prompt(&confirm_state, term_rows);
                         }
                     }
                 }
@@ -269,7 +308,13 @@ pub fn run(
                             grid.cursor_visible = cursor_visible;
                             let mut stdout = io::stdout();
                             renderer.render(&mut stdout, &mut grid)?;
-                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid,
+                            )?;
                         }
                         ServerMsg::GridSnapshot {
                             rows,
@@ -282,6 +327,13 @@ pub fn run(
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
                             renderer.resize(rows as usize, cols as usize);
+                            update_viewport(
+                                &mut renderer,
+                                term_rows,
+                                term_cols,
+                                rows as usize,
+                                cols as usize,
+                            );
                             renderer.invalidate();
                             let cols = cols as usize;
                             for (i, cell) in cells.iter().enumerate() {
@@ -300,7 +352,20 @@ pub fn run(
                             let mut stdout = io::stdout();
                             stdout.write_all(b"\x1b[2J\x1b[H")?;
                             renderer.render(&mut stdout, &mut grid)?;
-                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                            render_filler(
+                                &mut stdout,
+                                grid.rows(),
+                                grid.cols(),
+                                term_rows,
+                                term_cols,
+                            )?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid,
+                            )?;
                         }
                         ServerMsg::StatusBarUpdate {
                             session,
@@ -311,7 +376,13 @@ pub fn run(
                             current_window_count = windows.len();
                             status_text = format_status_bar(&session, &windows, active as usize);
                             let mut stdout = io::stdout();
-                            render_status_bar(&mut stdout, &status_text, grid.rows(), &grid)?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid,
+                            )?;
                         }
                         ServerMsg::PaneExit { .. } => {
                             break;
@@ -423,6 +494,11 @@ fn process_prefix(
                     b'P' => {
                         send_cmd(stream, &ClientMsg::PrevSession)?;
                     }
+                    // 'F' → explicit canonical resize (resize panes to current terminal size).
+                    b'F' => {
+                        let (r, c) = terminal::get_size();
+                        send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
+                    }
                     // '0'–'9' → select window by index.
                     b'0'..=b'9' => {
                         send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
@@ -506,9 +582,9 @@ fn process_confirm(
 }
 
 /// Render the confirmation prompt on the status bar line.
-fn render_confirm_prompt(state: &ConfirmState, grid_rows: usize) {
+fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
     let mut stdout = io::stdout();
-    let row = grid_rows + 1;
+    let row = term_rows;
     // Clear the line and write the prompt.
     write!(stdout, "\x1b[{};1H\x1b[2K", row).ok();
     match state {
@@ -565,35 +641,119 @@ fn format_status_bar(session: &str, windows: &[String], active: usize) -> String
     )
 }
 
-/// Render the status bar at the bottom of the screen.
-/// The status bar occupies the row immediately after the grid.
+/// Render the status bar at the bottom of the terminal.
+/// The status bar always occupies the last row of the terminal (term_rows).
 /// After rendering, the cursor is repositioned to the grid cursor location.
 fn render_status_bar(
     stdout: &mut io::Stdout,
     text: &str,
-    grid_rows: usize,
+    term_rows: usize,
+    term_cols: usize,
     grid: &Grid,
 ) -> io::Result<()> {
-    // Position cursor at the row after the grid (1-based).
-    let row = grid_rows + 1;
+    // Position cursor at the last row of the terminal (1-based).
+    let row = term_rows;
     // Clear the line first, then write the colored status bar.
     write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
-    // Truncate text to terminal width (use grid cols as approximation).
-    let max_cols = 200; // generous upper bound; terminal will clip
+    // Truncate text to terminal width.
+    let max_cols = term_cols.min(200);
     let display: String = text.chars().take(max_cols).collect();
     stdout.write_all(display.as_bytes())?;
     // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
     // Reposition cursor to the grid cursor location so the user sees
     // the cursor in the pane, not on the status bar.
+    // Only reposition if the cursor is within the viewport.
     if grid.cursor_visible {
-        write!(
-            stdout,
-            "\x1b[{};{}H",
-            grid.cursor_row + 1,
-            grid.cursor_col + 1
-        )?;
+        let view_rows = grid.rows().min(term_rows.saturating_sub(1));
+        let view_cols = grid.cols().min(term_cols);
+        if grid.cursor_row < view_rows && grid.cursor_col < view_cols {
+            write!(
+                stdout,
+                "\x1b[{};{}H",
+                grid.cursor_row + 1,
+                grid.cursor_col + 1
+            )?;
+        }
     }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Update the renderer's viewport based on terminal and grid dimensions.
+fn update_viewport(
+    renderer: &mut render::Renderer,
+    term_rows: usize,
+    term_cols: usize,
+    grid_rows: usize,
+    grid_cols: usize,
+) {
+    let view_rows = grid_rows.min(term_rows.saturating_sub(1));
+    let view_cols = grid_cols.min(term_cols);
+    renderer.set_viewport(view_rows, view_cols);
+}
+
+/// Render the filler region: the area beyond the canonical grid when the
+/// terminal is larger than the grid. Uses a dim background with a thin
+/// border line separating content from filler (per §2.16 of the design doc).
+fn render_filler(
+    stdout: &mut io::Stdout,
+    grid_rows: usize,
+    grid_cols: usize,
+    term_rows: usize,
+    term_cols: usize,
+) -> io::Result<()> {
+    let content_rows = term_rows.saturating_sub(1); // minus status bar
+    let content_cols = term_cols;
+
+    // Filler color: dim dark gray background.
+    const FILLER_BG: &str = "\x1b[48;5;236m";
+    const BORDER: &str = "\x1b[90m"; // bright black (gray)
+    const RESET: &str = "\x1b[0m";
+
+    // Fill rows below the grid (between grid and status bar).
+    if grid_rows < content_rows {
+        // Draw a thin border line just below the grid.
+        write!(stdout, "\x1b[{};1H{}", grid_rows + 1, BORDER)?;
+        let border_cols = content_cols.min(grid_cols.max(1));
+        for _ in 0..border_cols {
+            write!(stdout, "─")?;
+        }
+        // Fill remaining rows with filler background.
+        for row in (grid_rows + 2)..=content_rows {
+            write!(stdout, "\x1b[{};1H\x1b[2K{}", row, FILLER_BG)?;
+            for _ in 0..content_cols {
+                write!(stdout, " ")?;
+            }
+        }
+        stdout.write_all(RESET.as_bytes())?;
+    }
+
+    // Fill columns to the right of the grid (in visible grid rows).
+    if grid_cols < content_cols {
+        for row in 1..=grid_rows.min(content_rows) {
+            let fill_start = grid_cols + 1;
+            write!(stdout, "\x1b[{};{}H{}", row, fill_start, FILLER_BG)?;
+            for _ in grid_cols..content_cols {
+                write!(stdout, " ")?;
+            }
+        }
+        // Draw a vertical border between grid and filler columns.
+        if grid_cols > 0 && grid_rows > 0 {
+            for row in 1..=grid_rows.min(content_rows) {
+                write!(
+                    stdout,
+                    "\x1b[{};{}H{}│{}",
+                    row,
+                    grid_cols + 1,
+                    BORDER,
+                    RESET
+                )?;
+            }
+        }
+        stdout.write_all(RESET.as_bytes())?;
+    }
+
     stdout.flush()?;
     Ok(())
 }
