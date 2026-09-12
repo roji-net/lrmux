@@ -2,6 +2,7 @@
 //
 // Shows a flat list of `server / session` entries with a fuzzy filter.
 // j/k or arrow keys to navigate, Enter to join, n for new session, N for new server.
+// When no servers exist, shows a name prompt to create one.
 
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -33,7 +34,17 @@ struct Entry {
 }
 
 /// Run the interactive selector. Returns the user's choice.
+/// Auto-joins if exactly one server/session exists.
 pub fn run_selector() -> io::Result<SelectorResult> {
+    run_selector_impl(false)
+}
+
+/// Run the interactive selector, forcing the TUI even if only one session exists.
+pub fn run_selector_forced() -> io::Result<SelectorResult> {
+    run_selector_impl(true)
+}
+
+fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
     // Discover all running servers and their sessions.
     let servers = discover_servers();
     let mut entries: Vec<Entry> = Vec::new();
@@ -49,16 +60,23 @@ pub fn run_selector() -> io::Result<SelectorResult> {
     }
 
     // Fast path: exactly one server with one session → auto-join.
-    if entries.len() == 1 {
+    if !force && entries.len() == 1 {
         return Ok(SelectorResult::Attach {
             server: entries[0].server.clone(),
             session: entries[0].session.clone(),
         });
     }
 
-    // No servers running → prompt to create one.
+    // No servers running:
+    // - Default (non-forced): auto-create "default" server (no prompt).
+    // - Forced: show interactive name prompt.
     if entries.is_empty() {
-        return no_servers_prompt();
+        if force {
+            return no_servers_prompt();
+        }
+        return Ok(SelectorResult::NewServer {
+            name: "default".to_string(),
+        });
     }
 
     // Interactive selector.
@@ -104,12 +122,112 @@ fn query_sessions(server_name: &str) -> io::Result<Vec<String>> {
     }
 }
 
+/// Default session name based on the current directory basename.
+fn default_session_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "session".to_string())
+}
+
 /// Prompt when no servers are running.
+/// Shows an editable name field for the new server.
 fn no_servers_prompt() -> io::Result<SelectorResult> {
-    // Simple: just create a default server + session.
-    Ok(SelectorResult::NewServer {
-        name: "default".to_string(),
-    })
+    let default_name = default_session_name();
+    match name_prompt(
+        "lrmux — no servers running",
+        "Server name",
+        "default",
+        &format!("Session name (default: {default_name})"),
+        Some(&default_name),
+    ) {
+        Some((server, _)) => Ok(SelectorResult::NewServer { name: server }),
+        None => Ok(SelectorResult::Quit),
+    }
+}
+
+/// Interactive name entry prompt.
+/// Shows a title, a label, a pre-filled editable field, and instructions.
+/// Returns Some((input, None)) for server-only, or Some((server, Some(session))) if
+/// a session name is also collected.
+fn name_prompt(
+    title: &str,
+    label1: &str,
+    default1: &str,
+    _label2: &str,
+    _default2: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let _raw_guard = terminal::enter_raw_mode().ok()?;
+    let mut stdout = io::stdout();
+    let mut input = default1.to_string();
+
+    loop {
+        // Render.
+        write!(stdout, "\x1b[2J\x1b[H").ok()?;
+        write!(stdout, "{title}\r\n").ok()?;
+        write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n").ok()?;
+        write!(stdout, "{label1}: \x1b[1;36m{input}\x1b[0m\r\n").ok()?;
+        write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n").ok()?;
+        write!(
+            stdout,
+            "\x1b[90mEnter=confirm  Esc=cancel  (type to edit)\x1b[0m"
+        )
+        .ok()?;
+        // Position cursor at end of input.
+        write!(
+            stdout,
+            "\x1b[{};{}H",
+            3,
+            label1.len() + 3 + input.chars().count()
+        )
+        .ok()?;
+        stdout.flush().ok()?;
+
+        // Read a key.
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(io::stdin().as_raw_fd(), buf.as_mut_ptr() as *mut _, 1) };
+        if n <= 0 {
+            return None;
+        }
+        let key = buf[0];
+
+        match key {
+            b'\r' | b'\n' => {
+                if input.is_empty() {
+                    input = default1.to_string();
+                }
+                return Some((input, None));
+            }
+            0x1b => {
+                // Check if it's an escape sequence (arrow keys).
+                let mut seq = [0u8; 2];
+                let n2 =
+                    unsafe { libc::read(io::stdin().as_raw_fd(), seq.as_mut_ptr() as *mut _, 2) };
+                if n2 == 2 && seq[0] == b'[' {
+                    // Arrow keys — ignore in name prompt (or use for cursor movement).
+                    match seq[1] {
+                        b'C' => { /* Right — could move cursor */ }
+                        b'D' => { /* Left — could move cursor */ }
+                        _ => {}
+                    }
+                } else {
+                    // Plain Esc → cancel.
+                    return None;
+                }
+            }
+            0x7f | 0x08 => {
+                input.pop();
+            }
+            0x03 => {
+                // Ctrl-C → cancel.
+                return None;
+            }
+            0x20..=0x7e => {
+                input.push(key as char);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The interactive selector TUI.
@@ -180,7 +298,7 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             b'q' | 0x03 => {
                 return Ok(SelectorResult::Quit);
             }
-            // Esc → quit.
+            // Esc → quit or arrow key.
             0x1b => {
                 // Check for arrow key escape sequence.
                 let mut seq = [0u8; 2];
@@ -211,19 +329,38 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             b'k' => {
                 selected = selected.saturating_sub(1);
             }
-            // n → new session on the highlighted server (or default).
+            // n → new session (with editable name prompt).
             b'n' => {
                 let server = filt
                     .get(selected)
                     .map(|&i| entries[i].server.clone())
                     .unwrap_or_else(|| "default".to_string());
-                return Ok(SelectorResult::NewSession { server, name: None });
+                let default_name = default_session_name();
+                match name_prompt(
+                    "lrmux — new session",
+                    "Session name",
+                    &default_name,
+                    "",
+                    None,
+                ) {
+                    Some((name, _)) => {
+                        return Ok(SelectorResult::NewSession {
+                            server,
+                            name: Some(name),
+                        });
+                    }
+                    None => { /* cancelled — stay in selector */ }
+                }
             }
-            // N → new server + session.
+            // N → new server (with editable name prompt).
             b'N' => {
-                return Ok(SelectorResult::NewServer {
-                    name: crate::ipc::auto_server_name(),
-                });
+                let default_name = ipc::auto_server_name();
+                match name_prompt("lrmux — new server", "Server name", &default_name, "", None) {
+                    Some((name, _)) => {
+                        return Ok(SelectorResult::NewServer { name });
+                    }
+                    None => { /* cancelled — stay in selector */ }
+                }
             }
             // Backspace → remove last char from query.
             0x7f | 0x08 => {

@@ -37,6 +37,8 @@ fn main() {
 enum CliAction {
     /// Default: show the selector (or auto-join if exactly one server/session).
     Default,
+    /// `session-selector` / `ss`: force the interactive selector (no auto-join).
+    SessionSelector,
     /// `new-session [name]`: connect to default server, create a new session, attach to it.
     NewSession(Option<String>),
     /// `new-server [name]`: start a new server with the given name (or "default").
@@ -61,6 +63,8 @@ fn print_help() {
          \n\
          COMMANDS:\n    \
          lrmux                  Attach to a session (selector if multiple exist)\n    \
+         lrmux session-selector  Force the interactive session selector\n    \
+         lrmux ss               Alias for session-selector\n    \
          lrmux new-session [N]   Create a new session on the default server\n    \
          lrmux new-server [N]    Start a new named server\n    \
          lrmux ls-servers        List running servers\n    \
@@ -90,6 +94,7 @@ fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("--help") | Some("-h") => CliAction::Help,
+        Some("session-selector") | Some("ss") => CliAction::SessionSelector,
         Some("new-session") => CliAction::NewSession(args.get(2).cloned()),
         Some("new-server") => {
             // Auto-generate a name if none provided (server-2, server-3, ...).
@@ -123,7 +128,10 @@ fn run() -> io::Result<()> {
     let nested = std::env::var("LRMUX").is_ok();
     let needs_tty = matches!(
         action,
-        CliAction::Default | CliAction::NewSession(_) | CliAction::NewServer(_)
+        CliAction::Default
+            | CliAction::SessionSelector
+            | CliAction::NewSession(_)
+            | CliAction::NewServer(_)
     );
     if nested && needs_tty {
         eprintln!(
@@ -167,6 +175,7 @@ fn run() -> io::Result<()> {
         }
         CliAction::NewServer(name) => start_new_server(&name, None),
         CliAction::Default => run_default(),
+        CliAction::SessionSelector => run_session_selector(),
         CliAction::LsServers => list_servers(),
         CliAction::LsSessions(server) => list_sessions(&server),
         CliAction::KillServer(name) => kill_server(&name),
@@ -193,6 +202,38 @@ fn run_default() -> io::Result<()> {
         Ok(SelectorResult::Quit) => Ok(()),
         Err(e) => {
             // Selector failed (e.g. no raw mode) — fall back to default server.
+            eprintln!("lrmux: selector unavailable ({e}), starting default server...");
+            let sock = socket_path("default");
+            if !ipc::server_exists(&sock) {
+                if sock.exists() {
+                    let _ = std::fs::remove_file(&sock);
+                }
+                fork_server(&sock)?;
+                wait_for_server(&sock)?;
+                eprintln!("lrmux: server ready.");
+            }
+            client::run(&sock, None, None)
+        }
+    }
+}
+
+/// Force the interactive session selector (no auto-join even if only one session exists).
+fn run_session_selector() -> io::Result<()> {
+    match client::selector::run_selector_forced() {
+        Ok(SelectorResult::Attach { server, session }) => {
+            let sock = socket_path(&server);
+            client::run(&sock, None, Some(session))
+        }
+        Ok(SelectorResult::NewSession { server, name }) => {
+            let sock = socket_path(&server);
+            if !ipc::server_exists(&sock) {
+                start_new_server(&server, None)?;
+            }
+            client::run(&sock, Some(name), None)
+        }
+        Ok(SelectorResult::NewServer { name }) => start_new_server(&name, None),
+        Ok(SelectorResult::Quit) => Ok(()),
+        Err(e) => {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
