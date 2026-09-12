@@ -85,9 +85,7 @@ impl Grid {
 
     /// Mark all rows as dirty.
     pub fn mark_all_dirty(&mut self) {
-        for d in &mut self.dirty {
-            *d = true;
-        }
+        self.dirty.fill(true);
     }
 
     /// Take the dirty row set, returning a vector of dirty row indices
