@@ -140,7 +140,8 @@ impl Renderer {
         // If we wrote anything, hide the cursor before writing and show it
         // after, to prevent the user from seeing the cursor jump around
         // as cells are written sequentially.
-        if !buf.is_empty() {
+        let cell_wrote = !buf.is_empty();
+        if cell_wrote {
             buf.insert_str(0, "\x1b[?25l");
         }
 
@@ -150,6 +151,11 @@ impl Renderer {
             grid.cursor_row < self.view_rows && grid.cursor_col < self.view_cols;
         if grid.cursor_visible && cursor_in_viewport {
             if cursor != self.prev_cursor || !self.prev_cursor_visible {
+                // Hide cursor before moving it (if not already hidden by cell writes)
+                // to avoid the cursor briefly appearing at old positions.
+                if !cell_wrote {
+                    buf.push_str("\x1b[?25l");
+                }
                 buf.push_str(&escapes::move_cursor(
                     (cursor.0 + 1) as u16,
                     (cursor.1 + 1) as u16,

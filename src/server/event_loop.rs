@@ -882,10 +882,12 @@ fn send_grid_update_to_window_viewers(
     }
 
     let dirty = pane.take_dirty_rows();
-    if dirty.is_empty() {
-        return Ok(());
-    }
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+    // Always send a GridUpdate when the PTY produced output, even if no
+    // rows are dirty. The cursor may have moved (e.g., shell echoing a space
+    // to an already-blank cell, or cursor-positioning escape sequences).
+    // Without this, the client's cursor would not update until the next
+    // dirty row — making it look like keypresses are ignored.
     let msg = proto::encode_server(&ServerMsg::GridUpdate {
         dirty,
         cursor_row,
