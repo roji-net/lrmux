@@ -74,11 +74,12 @@ pub enum ServerMsg {
     PaneExit { code: u8 },
     /// Error message.
     Error { msg: String },
-    /// Status bar content (session name, window list, active window).
+    /// Status bar content (session name, window list, active window, session count).
     StatusBarUpdate {
         session: String,
         windows: Vec<String>,
         active: u16,
+        session_count: u16,
     },
     /// List of session names on this server (response to ListSessions).
     SessionList { sessions: Vec<String> },
@@ -256,6 +257,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             session,
             windows,
             active,
+            session_count,
         } => {
             payload.push(S_STATUS_BAR);
             payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
@@ -266,6 +268,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(name.as_bytes());
             }
             payload.extend_from_slice(&active.to_le_bytes());
+            payload.extend_from_slice(&session_count.to_le_bytes());
         }
         ServerMsg::SessionList { sessions } => {
             payload.push(S_SESSION_LIST);
@@ -487,10 +490,12 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 windows.push(String::from_utf8_lossy(&bytes).into_owned());
             }
             let active = read_u16(&mut r)?;
+            let session_count = read_u16(&mut r)?;
             Ok(ServerMsg::StatusBarUpdate {
                 session,
                 windows,
                 active,
+                session_count,
             })
         }
         S_SESSION_LIST => {

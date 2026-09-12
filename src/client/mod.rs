@@ -127,6 +127,11 @@ pub fn run(
     let mut current_session = String::new();
     // Number of windows in the current session (from StatusBarUpdate).
     let mut current_window_count: usize = 0;
+    // Number of sessions on the server (from StatusBarUpdate).
+    let mut session_count: usize = 0;
+    // Temporary status bar message (shown for a few seconds, then cleared).
+    let mut flash_msg: Option<String> = None;
+    let mut flash_deadline: Option<std::time::Instant> = None;
 
     // If requested, create a new session on the server right after handshake.
     if let Some(name) = new_session {
@@ -217,13 +222,31 @@ pub fn run(
             },
         ];
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        // Use a 500ms poll timeout so we can expire flash messages.
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             return Err(err);
+        }
+
+        // Check if flash message expired.
+        if let Some(deadline) = flash_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            flash_msg = None;
+            flash_deadline = None;
+            // Re-render the normal status bar.
+            let mut stdout = io::stdout();
+            render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+        }
+
+        // If we have a flash message, render it on the status bar.
+        if let Some(ref msg) = flash_msg {
+            let mut stdout = io::stdout();
+            render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
         }
 
         // stdin → prefix detection → server (as PaneInput or commands)
@@ -373,8 +396,28 @@ pub fn run(
                         }
                     }
                 } else if matches!(confirm_state, ConfirmState::None) {
-                    let (passthrough, detach, confirm, remaining, enter_copy_mode, paste) =
-                        process_prefix(input, &mut prefix_state, &mut stream)?;
+                    let (passthrough, detach, confirm, remaining, enter_copy_mode, paste, flash) =
+                        process_prefix(
+                            input,
+                            &mut prefix_state,
+                            &mut stream,
+                            current_window_count,
+                            session_count,
+                        )?;
+                    if let Some(msg) = flash {
+                        flash_msg = Some(msg);
+                        flash_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        let mut stdout = io::stdout();
+                        render_flash_status_bar(
+                            &mut stdout,
+                            flash_msg.as_ref().unwrap(),
+                            &status_text,
+                            term_rows,
+                            term_cols,
+                            &grid,
+                        )?;
+                    }
                     if !passthrough.is_empty() {
                         let msg = proto::encode_client(&ClientMsg::PaneInput { data: passthrough });
                         proto::send(&mut stream, &msg)?;
@@ -608,18 +651,31 @@ pub fn run(
                             session,
                             windows,
                             active,
+                            session_count: sc,
                         } => {
                             current_session = session.clone();
                             current_window_count = windows.len();
+                            session_count = sc as usize;
                             status_text = format_status_bar(&session, &windows, active as usize);
                             let mut stdout = io::stdout();
-                            render_status_bar(
-                                &mut stdout,
-                                &status_text,
-                                term_rows,
-                                term_cols,
-                                &grid,
-                            )?;
+                            if let Some(ref msg) = flash_msg {
+                                render_flash_status_bar(
+                                    &mut stdout,
+                                    msg,
+                                    &status_text,
+                                    term_rows,
+                                    term_cols,
+                                    &grid,
+                                )?;
+                            } else {
+                                render_status_bar(
+                                    &mut stdout,
+                                    &status_text,
+                                    term_rows,
+                                    term_cols,
+                                    &grid,
+                                )?;
+                            }
                         }
                         ServerMsg::PaneExit { .. } => {
                             break;
@@ -663,12 +719,23 @@ fn process_prefix(
     input: &[u8],
     state: &mut PrefixState,
     stream: &mut std::os::unix::net::UnixStream,
-) -> io::Result<(Vec<u8>, bool, Option<ConfirmState>, Vec<u8>, bool, bool)> {
+    window_count: usize,
+    session_count: usize,
+) -> io::Result<(
+    Vec<u8>,
+    bool,
+    Option<ConfirmState>,
+    Vec<u8>,
+    bool,
+    bool,
+    Option<String>,
+)> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
     let mut confirm: Option<ConfirmState> = None;
     let mut enter_copy_mode = false;
     let mut paste = false;
+    let mut flash: Option<String> = None;
 
     for (i, &byte) in input.iter().enumerate() {
         if confirm.is_some() {
@@ -680,6 +747,7 @@ fn process_prefix(
                 input[i..].to_vec(),
                 enter_copy_mode,
                 paste,
+                flash,
             ));
         }
         match state {
@@ -702,11 +770,19 @@ fn process_prefix(
                     }
                     // 'n' or Space → next window.
                     b'n' | b' ' => {
-                        send_cmd(stream, &ClientMsg::NextWindow)?;
+                        if window_count <= 1 {
+                            flash = Some("No next window".to_string());
+                        } else {
+                            send_cmd(stream, &ClientMsg::NextWindow)?;
+                        }
                     }
                     // 'p' → previous window.
                     b'p' => {
-                        send_cmd(stream, &ClientMsg::PrevWindow)?;
+                        if window_count <= 1 {
+                            flash = Some("No previous window".to_string());
+                        } else {
+                            send_cmd(stream, &ClientMsg::PrevWindow)?;
+                        }
                     }
                     // 'd' → detach (handled by caller after passthrough is sent).
                     b'd' => {
@@ -734,11 +810,19 @@ fn process_prefix(
                     }
                     // 'N' → next session.
                     b'N' => {
-                        send_cmd(stream, &ClientMsg::NextSession)?;
+                        if session_count <= 1 {
+                            flash = Some("No next session".to_string());
+                        } else {
+                            send_cmd(stream, &ClientMsg::NextSession)?;
+                        }
                     }
                     // 'P' → previous session.
                     b'P' => {
-                        send_cmd(stream, &ClientMsg::PrevSession)?;
+                        if session_count <= 1 {
+                            flash = Some("No previous session".to_string());
+                        } else {
+                            send_cmd(stream, &ClientMsg::PrevSession)?;
+                        }
                     }
                     // 'F' → explicit canonical resize (resize panes to current terminal size).
                     b'F' => {
@@ -772,6 +856,7 @@ fn process_prefix(
         Vec::new(),
         enter_copy_mode,
         paste,
+        flash,
     ))
 }
 
@@ -946,6 +1031,88 @@ fn render_status_bar(
     }
     stdout.flush()?;
     Ok(())
+}
+
+/// Render the status bar with a flash message appended on the right.
+fn render_flash_status_bar(
+    stdout: &mut io::Stdout,
+    msg: &str,
+    normal_text: &str,
+    term_rows: usize,
+    term_cols: usize,
+    grid: &Grid,
+) -> io::Result<()> {
+    let row = term_rows;
+    write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
+    let max_cols = term_cols.min(200);
+
+    // Strip escape sequences from normal_text to measure visible width.
+    let normal_visible: String = strip_ansi(normal_text);
+    let normal_len = normal_visible.chars().count();
+
+    // Flash message in bold yellow on blue, with a separator.
+    const FLASH: &str = "\x1b[1;44;93m"; // bold, bg blue, bright yellow
+    const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
+    const RESET: &str = "\x1b[0m";
+
+    let flash_text = format!("{}  ⚠ {}{}", FLASH, msg, BAR);
+    let flash_visible: String = strip_ansi(&flash_text);
+    let flash_len = flash_visible.chars().count();
+
+    // If both fit, show normal on left + flash on right.
+    if normal_len + flash_len <= max_cols {
+        // Write normal status bar (it already has its own colors).
+        let normal_display: String = normal_text.chars().take(max_cols).collect();
+        stdout.write_all(normal_display.as_bytes())?;
+        // Write flash message.
+        stdout.write_all(flash_text.as_bytes())?;
+    } else {
+        // Not enough room — just show the flash message.
+        let display: String = flash_text.chars().take(max_cols).collect();
+        stdout.write_all(display.as_bytes())?;
+    }
+
+    // Pad the rest with blue background.
+    let total_visible = normal_len + flash_len;
+    if total_visible < max_cols {
+        write!(stdout, "\x1b[44m{}", " ".repeat(max_cols - total_visible))?;
+    }
+    stdout.write_all(b"\x1b[0m")?;
+
+    // Reposition cursor.
+    if grid.cursor_visible {
+        let view_rows = grid.rows().min(term_rows.saturating_sub(1));
+        let view_cols = grid.cols().min(term_cols);
+        if grid.cursor_row < view_rows && grid.cursor_col < view_cols {
+            write!(
+                stdout,
+                "\x1b[{};{}H",
+                grid.cursor_row + 1,
+                grid.cursor_col + 1
+            )?;
+        }
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Strip ANSI escape sequences from a string to measure visible width.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_esc = false;
+    for ch in s.chars() {
+        if in_esc {
+            // End of escape sequence: letter (e.g. 'm', 'H', 'K', 'r', 'S', 'J')
+            if ch.is_ascii_alphabetic() {
+                in_esc = false;
+            }
+        } else if ch == '\x1b' {
+            in_esc = true;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 /// Update the renderer's viewport based on terminal and grid dimensions.

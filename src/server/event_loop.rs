@@ -617,6 +617,7 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
             session: sessions[si].name.clone(),
             windows: window_names(&sessions[si]),
             active: clients[i].active_window as u16,
+            session_count: sessions.len() as u16,
         });
         if proto::send(&mut clients[i].stream, &msg).is_err() {
             clients.remove(i);
@@ -636,6 +637,7 @@ fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
         session: sessions[si].name.clone(),
         windows: window_names(&sessions[si]),
         active: client.active_window as u16,
+        session_count: sessions.len() as u16,
     });
     let _ = proto::send(&mut client.stream, &msg);
 }
@@ -756,6 +758,7 @@ fn handshake_first_client(
         session: session.name.clone(),
         windows: vec![window.name.clone()],
         active: 0,
+        session_count: 1,
     });
     proto::send(&mut client, &status)?;
 
@@ -842,6 +845,7 @@ fn accept_new_client(
                     session: session.name.clone(),
                     windows: window_names(session),
                     active: active as u16,
+                    session_count: sessions.len() as u16,
                 });
                 let _ = proto::send(&mut stream, &status);
             }
