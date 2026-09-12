@@ -11,6 +11,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
+use crate::pty;
 use crate::server::session::Session;
 use crate::server::window::Window;
 
@@ -396,8 +397,26 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         }
                                     }
                                     ClientMsg::NewSession { name } => {
-                                        let session_name =
-                                            name.unwrap_or_else(|| default_session_name(&sessions));
+                                        // Use the CWD of the active window's child process
+                                        // as the default session name.
+                                        let session_name = name.unwrap_or_else(|| {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                            {
+                                                let pane = &sessions[si].windows[wi].pane;
+                                                if !pane.exited
+                                                    && let Some(cwd) =
+                                                        pty::child_cwd(pane.pty.child_pid)
+                                                {
+                                                    return ensure_unique_session_name(
+                                                        &cwd, &sessions,
+                                                    );
+                                                }
+                                            }
+                                            default_session_name(&sessions)
+                                        });
                                         sessions.push(Session::new(
                                             session_name,
                                             grid_rows,
@@ -488,6 +507,13 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         }
                                         need_status_bar_all = true;
                                     }
+                                    ClientMsg::RenameSession { name } => {
+                                        let si = clients[client_idx].session_idx;
+                                        if si < sessions.len() {
+                                            sessions[si].name = name;
+                                            need_status_bar_all = true;
+                                        }
+                                    }
                                     ClientMsg::Identify { .. } => {}
                                     ClientMsg::ListSessions => {
                                         let names: Vec<String> =
@@ -506,6 +532,106 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         ipc::cleanup(socket_path);
                                         eprintln!("lrmux: server stopped.");
                                         return Ok(());
+                                    }
+                                    ClientMsg::NewWindowIn { session, command } => {
+                                        // Find the target session by name, or use the first.
+                                        let si = match session {
+                                            Some(ref name) => {
+                                                sessions.iter().position(|s| &s.name == name)
+                                            }
+                                            None => {
+                                                if sessions.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(0)
+                                                }
+                                            }
+                                        };
+                                        if let Some(si) = si {
+                                            let win = match command {
+                                                Some(ref cmd) => Window::new_with_command(
+                                                    grid_rows,
+                                                    grid_cols,
+                                                    default_window_name(),
+                                                    cmd,
+                                                ),
+                                                None => Window::new(
+                                                    grid_rows,
+                                                    grid_cols,
+                                                    default_window_name(),
+                                                ),
+                                            };
+                                            sessions[si].windows.push(win);
+                                            need_status_bar_all = true;
+                                        }
+                                    }
+                                    ClientMsg::CaptureWindow { session, window } => {
+                                        // Find the target session by name, or use the first.
+                                        let si = match session {
+                                            Some(ref name) => {
+                                                sessions.iter().position(|s| &s.name == name)
+                                            }
+                                            None => {
+                                                if sessions.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(0)
+                                                }
+                                            }
+                                        };
+                                        let content = if let Some(si) = si {
+                                            let wi = match window {
+                                                Some(w) => Some(w as usize),
+                                                None => Some(clients[client_idx].active_window),
+                                            };
+                                            if let Some(wi) = wi
+                                                && wi < sessions[si].windows.len()
+                                            {
+                                                Some(render_grid_text(
+                                                    &sessions[si].windows[wi].pane,
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        let msg = proto::encode_server(&ServerMsg::WindowCapture {
+                                            content: content.unwrap_or_default(),
+                                        });
+                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
+                                    }
+                                    ClientMsg::SendKeys {
+                                        session,
+                                        window,
+                                        keys,
+                                    } => {
+                                        // Find the target session by name, or use the first.
+                                        let si = match session {
+                                            Some(ref name) => {
+                                                sessions.iter().position(|s| &s.name == name)
+                                            }
+                                            None => {
+                                                if sessions.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(0)
+                                                }
+                                            }
+                                        };
+                                        if let Some(si) = si {
+                                            let wi = match window {
+                                                Some(w) => Some(w as usize),
+                                                None => Some(clients[client_idx].active_window),
+                                            };
+                                            if let Some(wi) = wi
+                                                && wi < sessions[si].windows.len()
+                                            {
+                                                let _ = sessions[si].windows[wi]
+                                                    .pane
+                                                    .write_input(&keys);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -586,8 +712,37 @@ fn default_session_name(sessions: &[Session]) -> String {
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "session".to_string());
+    ensure_unique_session_name(&base, sessions)
+}
+
+/// Render a pane's grid as plain text (for capture-window).
+/// Each row is trimmed of trailing whitespace and joined with newlines.
+fn render_grid_text(pane: &crate::server::pane::Pane) -> String {
+    let rows = pane.rows as usize;
+    let cols = pane.cols as usize;
+    let mut lines = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut line = String::with_capacity(cols);
+        if let Some(r) = pane.grid.row(row) {
+            for c in r.iter().take(cols) {
+                let ch = if c.ch == '\0' { ' ' } else { c.ch };
+                line.push(ch);
+            }
+        }
+        // Trim trailing whitespace.
+        lines.push(line.trim_end().to_string());
+    }
+    // Trim trailing empty lines.
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Ensure a session name is unique by appending -2, -3, etc. if needed.
+fn ensure_unique_session_name(base: &str, sessions: &[Session]) -> String {
     if sessions.iter().all(|s| s.name != base) {
-        return base;
+        return base.to_string();
     }
     let mut n = 2;
     loop {
@@ -1055,6 +1210,207 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         0x0e => ClientMsg::KillSession,
         0x0d => ClientMsg::ListSessions,
         0x10 => ClientMsg::KillServer,
+        0x11 => {
+            // RenameSession: 4-byte length + name
+            if data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "RenameSession needs 4-byte length",
+                ));
+            }
+            let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if data.len() < 4 + len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "RenameSession name truncated",
+                ));
+            }
+            let name = String::from_utf8_lossy(&data[4..4 + len]).into_owned();
+            ClientMsg::RenameSession { name }
+        }
+        0x12 => {
+            // NewWindowIn: session (1-byte flag + optional name) + command (1-byte flag + optional string)
+            if data.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "NewWindowIn needs at least 2 bytes",
+                ));
+            }
+            let mut off = 0;
+            let session = if data[off] != 0 {
+                off += 1;
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewWindowIn session name needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                off += 4;
+                if data.len() < off + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewWindowIn session name truncated",
+                    ));
+                }
+                let s = String::from_utf8_lossy(&data[off..off + len]).into_owned();
+                off += len;
+                Some(s)
+            } else {
+                off += 1;
+                None
+            };
+            let command = if data.len() > off && data[off] != 0 {
+                off += 1;
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewWindowIn command needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                off += 4;
+                if data.len() < off + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewWindowIn command truncated",
+                    ));
+                }
+                let c = String::from_utf8_lossy(&data[off..off + len]).into_owned();
+                Some(c)
+            } else {
+                None
+            };
+            ClientMsg::NewWindowIn { session, command }
+        }
+        0x13 => {
+            // CaptureWindow: session (1-byte flag + optional name) + window (1-byte flag + optional u8)
+            if data.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "CaptureWindow needs at least 2 bytes",
+                ));
+            }
+            let mut off = 0;
+            let session = if data[off] != 0 {
+                off += 1;
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "CaptureWindow session name needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                off += 4;
+                if data.len() < off + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "CaptureWindow session name truncated",
+                    ));
+                }
+                let s = String::from_utf8_lossy(&data[off..off + len]).into_owned();
+                off += len;
+                Some(s)
+            } else {
+                off += 1;
+                None
+            };
+            let window = if data.len() > off && data[off] != 0 {
+                off += 1;
+                if data.len() < off + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "CaptureWindow window index truncated",
+                    ));
+                }
+                Some(data[off])
+            } else {
+                None
+            };
+            ClientMsg::CaptureWindow { session, window }
+        }
+        0x14 => {
+            // SendKeys: session (1-byte flag + optional name) + window (1-byte flag + optional u8) + 4-byte length + keys
+            if data.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SendKeys needs at least 2 bytes",
+                ));
+            }
+            let mut off = 0;
+            let session = if data[off] != 0 {
+                off += 1;
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendKeys session name needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                off += 4;
+                if data.len() < off + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendKeys session name truncated",
+                    ));
+                }
+                let s = String::from_utf8_lossy(&data[off..off + len]).into_owned();
+                off += len;
+                Some(s)
+            } else {
+                off += 1;
+                None
+            };
+            let window = if data.len() > off && data[off] != 0 {
+                off += 1;
+                if data.len() < off + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendKeys window index truncated",
+                    ));
+                }
+                Some(data[off])
+            } else {
+                None
+            };
+            let keys = if let Some(start) = off.checked_add(1) {
+                if data.len() < start + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendKeys needs 4-byte key length",
+                    ));
+                }
+                let klen = u32::from_le_bytes([
+                    data[start],
+                    data[start + 1],
+                    data[start + 2],
+                    data[start + 3],
+                ]) as usize;
+                let kstart = start + 4;
+                if data.len() < kstart + klen {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendKeys keys truncated",
+                    ));
+                }
+                data[kstart..kstart + klen].to_vec()
+            } else {
+                Vec::new()
+            };
+            ClientMsg::SendKeys {
+                session,
+                window,
+                keys,
+            }
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

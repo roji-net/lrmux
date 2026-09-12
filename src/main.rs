@@ -49,6 +49,25 @@ enum CliAction {
     LsSessions(String),
     /// `kill-server [name]`: kill a named server (default: "default").
     KillServer(String),
+    /// `new-window [target] [command]`: create a new window in a session.
+    NewWindow {
+        server: String,
+        session: Option<String>,
+        command: Option<String>,
+    },
+    /// `capture-window [target]`: capture the content of a window.
+    CaptureWindow {
+        server: String,
+        session: Option<String>,
+        window: Option<u8>,
+    },
+    /// `send-keys [target] [keys]`: send keys to a window's PTY.
+    SendKeys {
+        server: String,
+        session: Option<String>,
+        window: Option<u8>,
+        keys: String,
+    },
     /// `--help` / `-h`: show usage.
     Help,
 }
@@ -70,6 +89,9 @@ fn print_help() {
          lrmux ls-servers        List running servers\n    \
          lrmux ls-sessions [S]   List sessions on a server (default: default)\n    \
          lrmux kill-server [N]   Kill a named server (default: default)\n    \
+         lrmux new-window [T] [CMD]  Create a new window (T = [server]:[session])\n    \
+         lrmux capture-window [T]    Capture window content (T = [server]:[session]:window)\n    \
+         lrmux send-keys [T] [KEYS]  Send keys to a window (T = [server]:[session]:window)\n    \
          lrmux --help, -h        Show this help message\n\
          \n\
          PREFIX KEY: Ctrl-A (default)\n\
@@ -80,6 +102,7 @@ fn print_help() {
          Ctrl-A 0-9  Select window\n    \
          Ctrl-A C    New session\n    \
          Ctrl-A N/P  Next/prev session\n    \
+         Ctrl-A $    Rename session\n    \
          Ctrl-A [    Enter copy mode\n    \
          Ctrl-A ]    Paste\n    \
          Ctrl-A d    Detach\n    \
@@ -113,7 +136,201 @@ fn parse_args() -> CliAction {
             let name = args.get(2).map(|s| s.as_str()).unwrap_or("default");
             CliAction::KillServer(name.to_string())
         }
+        Some("new-window") => parse_new_window(&args[2..]),
+        Some("capture-window") => parse_capture_window(&args[2..]),
+        Some("send-keys") => parse_send_keys(&args[2..]),
         _ => CliAction::Default,
+    }
+}
+
+/// Parsed target: [server]:[session]:window
+struct Target {
+    server: String,
+    session: Option<String>,
+    window: Option<u8>,
+}
+
+/// Parse a target string like "1", "luar:1", or "default:luar:1".
+/// - 1 part → window number (server=default, session=None)
+/// - 2 parts → session:window (server=default)
+/// - 3 parts → server:session:window
+fn parse_target(s: &str) -> Target {
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        1 => {
+            // Could be a window number or a session name (without window).
+            if let Ok(w) = parts[0].parse::<u8>() {
+                Target {
+                    server: "default".to_string(),
+                    session: None,
+                    window: Some(w),
+                }
+            } else {
+                Target {
+                    server: "default".to_string(),
+                    session: Some(parts[0].to_string()),
+                    window: None,
+                }
+            }
+        }
+        2 => {
+            let window = parts[1].parse::<u8>().ok();
+            Target {
+                server: "default".to_string(),
+                session: Some(parts[0].to_string()),
+                window,
+            }
+        }
+        3 => {
+            let window = parts[2].parse::<u8>().ok();
+            Target {
+                server: parts[0].to_string(),
+                session: Some(parts[1].to_string()),
+                window,
+            }
+        }
+        _ => Target {
+            server: "default".to_string(),
+            session: None,
+            window: None,
+        },
+    }
+}
+
+/// Parse `new-window` args: optional target + optional command.
+/// Supports --server and --session flags, or positional target.
+fn parse_new_window(args: &[String]) -> CliAction {
+    let mut server = "default".to_string();
+    let mut session: Option<String> = None;
+    let mut command_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--server" if i + 1 < args.len() => {
+                server = args[i + 1].clone();
+                i += 2;
+            }
+            "--session" if i + 1 < args.len() => {
+                session = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => {
+                // First positional arg could be a target (contains ':').
+                if command_parts.is_empty() && args[i].contains(':') {
+                    let t = parse_target(&args[i]);
+                    server = t.server;
+                    if t.session.is_some() {
+                        session = t.session;
+                    }
+                    i += 1;
+                } else {
+                    command_parts.push(args[i].clone());
+                    i += 1;
+                }
+            }
+        }
+    }
+    let command = if command_parts.is_empty() {
+        None
+    } else {
+        Some(command_parts.join(" "))
+    };
+    CliAction::NewWindow {
+        server,
+        session,
+        command,
+    }
+}
+
+/// Parse `capture-window` args: optional target.
+/// Supports --server, --session, --window flags, or positional target.
+fn parse_capture_window(args: &[String]) -> CliAction {
+    let mut server = "default".to_string();
+    let mut session: Option<String> = None;
+    let mut window: Option<u8> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--server" if i + 1 < args.len() => {
+                server = args[i + 1].clone();
+                i += 2;
+            }
+            "--session" if i + 1 < args.len() => {
+                session = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--window" if i + 1 < args.len() => {
+                window = args[i + 1].parse::<u8>().ok();
+                i += 2;
+            }
+            _ => {
+                // Positional target.
+                let t = parse_target(&args[i]);
+                server = t.server;
+                if t.session.is_some() {
+                    session = t.session;
+                }
+                if t.window.is_some() {
+                    window = t.window;
+                }
+                i += 1;
+            }
+        }
+    }
+    CliAction::CaptureWindow {
+        server,
+        session,
+        window,
+    }
+}
+
+/// Parse `send-keys` args: optional target + keys string.
+/// Supports --server, --session, --window flags, or positional target.
+fn parse_send_keys(args: &[String]) -> CliAction {
+    let mut server = "default".to_string();
+    let mut session: Option<String> = None;
+    let mut window: Option<u8> = None;
+    let mut key_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--server" if i + 1 < args.len() => {
+                server = args[i + 1].clone();
+                i += 2;
+            }
+            "--session" if i + 1 < args.len() => {
+                session = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--window" if i + 1 < args.len() => {
+                window = args[i + 1].parse::<u8>().ok();
+                i += 2;
+            }
+            _ => {
+                // First positional with ':' is a target.
+                if key_parts.is_empty() && args[i].contains(':') {
+                    let t = parse_target(&args[i]);
+                    server = t.server;
+                    if t.session.is_some() {
+                        session = t.session;
+                    }
+                    if t.window.is_some() {
+                        window = t.window;
+                    }
+                    i += 1;
+                } else {
+                    key_parts.push(args[i].clone());
+                    i += 1;
+                }
+            }
+        }
+    }
+    let keys = key_parts.join(" ");
+    CliAction::SendKeys {
+        server,
+        session,
+        window,
+        keys,
     }
 }
 
@@ -142,10 +359,14 @@ fn run() -> io::Result<()> {
              Ctrl-A C    New session\n  \
              Ctrl-A n/p  Next/prev window\n  \
              Ctrl-A N/P  Next/prev session\n  \
+             Ctrl-A $    Rename session\n  \
              Ctrl-A d    Detach\n\n\
              Non-interactive subcommands still work:\n  \
              lrmux ls-sessions\n  \
              lrmux ls-servers\n  \
+             lrmux new-window [target] [command]\n  \
+             lrmux capture-window [target]\n  \
+             lrmux send-keys [target] [keys]\n  \
              lrmux kill-server [name]\n  \
              lrmux --help"
         );
@@ -179,6 +400,22 @@ fn run() -> io::Result<()> {
         CliAction::LsServers => list_servers(),
         CliAction::LsSessions(server) => list_sessions(&server),
         CliAction::KillServer(name) => kill_server(&name),
+        CliAction::NewWindow {
+            server,
+            session,
+            command,
+        } => cli_new_window(&server, session, command),
+        CliAction::CaptureWindow {
+            server,
+            session,
+            window,
+        } => cli_capture_window(&server, session, window),
+        CliAction::SendKeys {
+            server,
+            session,
+            window,
+            keys,
+        } => cli_send_keys(&server, session, window, &keys),
     }
 }
 
@@ -359,6 +596,118 @@ fn kill_server(name: &str) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// CLI: create a new window in a session on a server.
+fn cli_new_window(
+    server: &str,
+    session: Option<String>,
+    command: Option<String>,
+) -> io::Result<()> {
+    let sock = socket_path(server);
+    if !ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("server '{server}' is not running"),
+        ));
+    }
+    let mut stream = ipc::connect(&sock)?;
+    // Send Identify first (required by the protocol).
+    let (rows, cols) = (24u16, 80u16);
+    let msg = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    proto::send(&mut stream, &msg)?;
+    // Wait for IdentifyAck.
+    match proto::decode_server(&mut stream) {
+        Ok(ServerMsg::IdentifyAck { .. }) => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    // Send NewWindowIn.
+    let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
+    proto::send(&mut stream, &msg)?;
+    Ok(())
+}
+
+/// CLI: capture the content of a window.
+fn cli_capture_window(server: &str, session: Option<String>, window: Option<u8>) -> io::Result<()> {
+    let sock = socket_path(server);
+    if !ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("server '{server}' is not running"),
+        ));
+    }
+    let mut stream = ipc::connect(&sock)?;
+    let (rows, cols) = (24u16, 80u16);
+    let msg = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    proto::send(&mut stream, &msg)?;
+    match proto::decode_server(&mut stream) {
+        Ok(ServerMsg::IdentifyAck { .. }) => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    let msg = proto::encode_client(&ClientMsg::CaptureWindow { session, window });
+    proto::send(&mut stream, &msg)?;
+    // Wait for WindowCapture response.
+    loop {
+        match proto::decode_server(&mut stream) {
+            Ok(ServerMsg::WindowCapture { content }) => {
+                print!("{content}");
+                return Ok(());
+            }
+            Ok(_) => {
+                // Ignore other messages (StatusBarUpdate, etc.) and keep waiting.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// CLI: send keys to a window's PTY.
+fn cli_send_keys(
+    server: &str,
+    session: Option<String>,
+    window: Option<u8>,
+    keys: &str,
+) -> io::Result<()> {
+    let sock = socket_path(server);
+    if !ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("server '{server}' is not running"),
+        ));
+    }
+    let mut stream = ipc::connect(&sock)?;
+    let (rows, cols) = (24u16, 80u16);
+    let msg = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    proto::send(&mut stream, &msg)?;
+    match proto::decode_server(&mut stream) {
+        Ok(ServerMsg::IdentifyAck { .. }) => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    let msg = proto::encode_client(&ClientMsg::SendKeys {
+        session,
+        window,
+        keys: keys.as_bytes().to_vec(),
+    });
+    proto::send(&mut stream, &msg)?;
+    Ok(())
 }
 
 /// Fork a server process. The child binds the socket and runs the event loop.

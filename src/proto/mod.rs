@@ -40,10 +40,34 @@ pub enum ClientMsg {
     SelectSession { name: String },
     /// Kill the current session (and all its windows).
     KillSession,
+    /// Rename the current session.
+    RenameSession { name: String },
     /// Request list of sessions on this server (for the selector).
     ListSessions,
     /// Kill the server entirely (used by `lrmux kill-server`).
     KillServer,
+    /// Create a new window in a specific session (CLI: new-window).
+    /// If session is None, uses the first session.
+    /// If command is None, spawns the default shell.
+    NewWindowIn {
+        session: Option<String>,
+        command: Option<String>,
+    },
+    /// Capture the content of a specific window (CLI: capture-window).
+    /// If session is None, uses the first session.
+    /// If window is None, uses the active window.
+    CaptureWindow {
+        session: Option<String>,
+        window: Option<u8>,
+    },
+    /// Send keys to a specific window's PTY (CLI: send-keys).
+    /// If session is None, uses the first session.
+    /// If window is None, uses the active window.
+    SendKeys {
+        session: Option<String>,
+        window: Option<u8>,
+        keys: Vec<u8>,
+    },
 }
 
 /// Server → Client messages.
@@ -83,6 +107,8 @@ pub enum ServerMsg {
     },
     /// List of session names on this server (response to ListSessions).
     SessionList { sessions: Vec<String> },
+    /// Captured window content (response to CaptureWindow).
+    WindowCapture { content: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -103,6 +129,10 @@ const C_SELECT_SESSION: u8 = 0x0f;
 const C_KILL_SESSION: u8 = 0x0e;
 const C_LIST_SESSIONS: u8 = 0x0d;
 const C_KILL_SERVER: u8 = 0x10;
+const C_RENAME_SESSION: u8 = 0x11;
+const C_NEW_WINDOW_IN: u8 = 0x12;
+const C_CAPTURE_WINDOW: u8 = 0x13;
+const C_SEND_KEYS: u8 = 0x14;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -112,6 +142,7 @@ const S_PANE_EXIT: u8 = 0x13;
 const S_ERROR: u8 = 0x14;
 const S_STATUS_BAR: u8 = 0x15;
 const S_SESSION_LIST: u8 = 0x16;
+const S_WINDOW_CAPTURE: u8 = 0x18;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -177,11 +208,77 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::KillSession => {
             payload.push(C_KILL_SESSION);
         }
+        ClientMsg::RenameSession { name } => {
+            payload.push(C_RENAME_SESSION);
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+        }
         ClientMsg::ListSessions => {
             payload.push(C_LIST_SESSIONS);
         }
         ClientMsg::KillServer => {
             payload.push(C_KILL_SERVER);
+        }
+        ClientMsg::NewWindowIn { session, command } => {
+            payload.push(C_NEW_WINDOW_IN);
+            match session {
+                Some(s) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(s.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match command {
+                Some(c) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(c.as_bytes());
+                }
+                None => payload.push(0),
+            }
+        }
+        ClientMsg::CaptureWindow { session, window } => {
+            payload.push(C_CAPTURE_WINDOW);
+            match session {
+                Some(s) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(s.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match window {
+                Some(w) => {
+                    payload.push(1);
+                    payload.push(*w);
+                }
+                None => payload.push(0),
+            }
+        }
+        ClientMsg::SendKeys {
+            session,
+            window,
+            keys,
+        } => {
+            payload.push(C_SEND_KEYS);
+            match session {
+                Some(s) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(s.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match window {
+                Some(w) => {
+                    payload.push(1);
+                    payload.push(*w);
+                }
+                None => payload.push(0),
+            }
+            payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+            payload.extend_from_slice(keys);
         }
     }
     frame(payload)
@@ -277,6 +374,11 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 payload.extend_from_slice(name.as_bytes());
             }
+        }
+        ServerMsg::WindowCapture { content } => {
+            payload.push(S_WINDOW_CAPTURE);
+            payload.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            payload.extend_from_slice(content.as_bytes());
         }
     }
     frame(payload)
@@ -393,8 +495,79 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::SelectSession { name })
         }
         C_KILL_SESSION => Ok(ClientMsg::KillSession),
+        C_RENAME_SESSION => {
+            let len = read_u32(&mut r)? as usize;
+            let name = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ClientMsg::RenameSession { name })
+        }
         C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
         C_KILL_SERVER => Ok(ClientMsg::KillServer),
+        C_NEW_WINDOW_IN => {
+            let session = if r.first() == Some(&1) {
+                r = &r[1..];
+                let len = read_u32(&mut r)? as usize;
+                let s = String::from_utf8_lossy(&r[..len]).into_owned();
+                r = &r[len..];
+                Some(s)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let command = if r.first() == Some(&1) {
+                r = &r[1..];
+                let len = read_u32(&mut r)? as usize;
+                let c = String::from_utf8_lossy(&r[..len]).into_owned();
+                Some(c)
+            } else {
+                None
+            };
+            Ok(ClientMsg::NewWindowIn { session, command })
+        }
+        C_CAPTURE_WINDOW => {
+            let session = if r.first() == Some(&1) {
+                r = &r[1..];
+                let len = read_u32(&mut r)? as usize;
+                let s = String::from_utf8_lossy(&r[..len]).into_owned();
+                r = &r[len..];
+                Some(s)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let window = if r.first() == Some(&1) {
+                Some(r[1])
+            } else {
+                None
+            };
+            Ok(ClientMsg::CaptureWindow { session, window })
+        }
+        C_SEND_KEYS => {
+            let session = if r.first() == Some(&1) {
+                r = &r[1..];
+                let len = read_u32(&mut r)? as usize;
+                let s = String::from_utf8_lossy(&r[..len]).into_owned();
+                r = &r[len..];
+                Some(s)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let window = if r.first() == Some(&1) {
+                let w = r[1];
+                r = &r[2..];
+                Some(w)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let klen = read_u32(&mut r)? as usize;
+            let keys = r[..klen].to_vec();
+            Ok(ClientMsg::SendKeys {
+                session,
+                window,
+                keys,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -508,6 +681,11 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 sessions.push(String::from_utf8_lossy(&bytes).into_owned());
             }
             Ok(ServerMsg::SessionList { sessions })
+        }
+        S_WINDOW_CAPTURE => {
+            let len = read_u32(&mut r)? as usize;
+            let content = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ServerMsg::WindowCapture { content })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

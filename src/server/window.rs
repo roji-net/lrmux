@@ -17,6 +17,13 @@ impl Window {
         }
     }
 
+    pub fn new_with_command(rows: u16, cols: u16, name: String, command: &str) -> Self {
+        Self {
+            pane: Pane::new_with_command(rows, cols, command),
+            name,
+        }
+    }
+
     pub fn pty_fd(&self) -> i32 {
         self.pane.pty_fd()
     }

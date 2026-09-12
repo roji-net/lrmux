@@ -54,6 +54,8 @@ enum ConfirmState {
         target: String,
         window_count: usize,
     },
+    /// "Rename session to:" — editable name prompt.
+    RenameSession { input: String },
 }
 
 /// Run the client: connect to server, relay stdin → server, render grid updates.
@@ -460,6 +462,10 @@ pub fn run(
                             target.clone_from(&current_session);
                             *window_count = current_window_count;
                         }
+                        // Pre-fill rename prompt with the current session name.
+                        if let ConfirmState::RenameSession { input } = &mut c {
+                            input.clone_from(&current_session);
+                        }
                         confirm_state = c;
                         render_confirm_prompt(&confirm_state, term_rows);
                         // Process any remaining bytes that arrived after the
@@ -682,6 +688,7 @@ pub fn run(
                         }
                         ServerMsg::IdentifyAck { .. } => {}
                         ServerMsg::SessionList { .. } => {}
+                        ServerMsg::WindowCapture { .. } => {}
                         ServerMsg::Error { msg } => {
                             eprintln!("\r\nlrmux: server error: {msg}\r");
                             break;
@@ -804,6 +811,12 @@ fn process_prefix(
                             window_count: 0,
                         });
                     }
+                    // '$' → rename current session (editable name prompt).
+                    b'$' => {
+                        confirm = Some(ConfirmState::RenameSession {
+                            input: String::new(),
+                        });
+                    }
                     // 'C' → new session (uppercase, like lowercase 'c' for new window).
                     b'C' => {
                         send_cmd(stream, &ClientMsg::NewSession { name: None })?;
@@ -924,6 +937,34 @@ fn process_confirm(
             }
             Ok(ConfirmAction::Continue)
         }
+        ConfirmState::RenameSession { input: buf } => {
+            for &byte in input {
+                match byte {
+                    // Enter → send rename command.
+                    b'\r' | b'\n' => {
+                        if !buf.is_empty() {
+                            send_cmd(stream, &ClientMsg::RenameSession { name: buf.clone() })?;
+                            return Ok(ConfirmAction::Confirmed);
+                        }
+                        return Ok(ConfirmAction::Cancelled);
+                    }
+                    // Esc or Ctrl-C → cancel.
+                    0x1b | 0x03 => {
+                        return Ok(ConfirmAction::Cancelled);
+                    }
+                    // Backspace → remove last char.
+                    0x7f | 0x08 => {
+                        buf.pop();
+                    }
+                    // Printable ASCII → append.
+                    0x20..=0x7e => {
+                        buf.push(byte as char);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(ConfirmAction::Continue)
+        }
     }
 }
 
@@ -949,6 +990,14 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
                 target,
                 window_count,
                 if *window_count == 1 { "" } else { "s" },
+                input
+            )
+            .ok();
+        }
+        ConfirmState::RenameSession { input } => {
+            write!(
+                stdout,
+                "\x1b[44;97m Rename session: {}\x1b[1;93m_\x1b[0m\x1b[44;97m  (Enter=confirm, Esc=cancel)\x1b[0m",
                 input
             )
             .ok();
@@ -1001,16 +1050,16 @@ fn render_status_bar(
     let row = term_rows;
     // Clear the line first, then write the colored status bar.
     write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
-    // Truncate text to terminal width.
-    let max_cols = term_cols.min(200);
-    let display: String = text.chars().take(max_cols).collect();
-    stdout.write_all(display.as_bytes())?;
-    // Pad the rest of the line with the bar background color so the
+    // Write the full status bar text (it includes its own ANSI colors).
+    stdout.write_all(text.as_bytes())?;
+    // Measure visible width (excluding ANSI escape sequences) and pad
+    // the rest of the line with the bar background color so the
     // blue background extends to the right edge of the terminal.
-    let display_len = display.chars().count();
-    if display_len < max_cols {
+    let max_cols = term_cols.min(500);
+    let visible_len = strip_ansi(text).chars().count();
+    if visible_len < max_cols {
         // Use the same blue background, no text attributes.
-        write!(stdout, "\x1b[44m{}", " ".repeat(max_cols - display_len))?;
+        write!(stdout, "\x1b[44m{}", " ".repeat(max_cols - visible_len))?;
     }
     // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
@@ -1044,7 +1093,7 @@ fn render_flash_status_bar(
 ) -> io::Result<()> {
     let row = term_rows;
     write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
-    let max_cols = term_cols.min(200);
+    let max_cols = term_cols.min(500);
 
     // Strip escape sequences from normal_text to measure visible width.
     let normal_visible: String = strip_ansi(normal_text);
