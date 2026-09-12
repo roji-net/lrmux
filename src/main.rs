@@ -47,12 +47,49 @@ enum CliAction {
     LsSessions(String),
     /// `kill-server [name]`: kill a named server (default: "default").
     KillServer(String),
+    /// `--help` / `-h`: show usage.
+    Help,
+}
+
+/// Print usage information.
+fn print_help() {
+    println!(
+        "lrmux — a modern, fast terminal multiplexer\n\
+         \n\
+         USAGE:\n    \
+         lrmux [COMMAND] [ARGS]\n\
+         \n\
+         COMMANDS:\n    \
+         lrmux                  Attach to a session (selector if multiple exist)\n    \
+         lrmux new-session [N]   Create a new session on the default server\n    \
+         lrmux new-server [N]    Start a new named server\n    \
+         lrmux ls-servers        List running servers\n    \
+         lrmux ls-sessions [S]   List sessions on a server (default: default)\n    \
+         lrmux kill-server [N]   Kill a named server (default: default)\n    \
+         lrmux --help, -h        Show this help message\n\
+         \n\
+         PREFIX KEY: Ctrl-A (default)\n\
+         \n\
+         COMMON PREFIX COMMANDS:\n    \
+         Ctrl-A c    New window\n    \
+         Ctrl-A n/p  Next/prev window\n    \
+         Ctrl-A 0-9  Select window\n    \
+         Ctrl-A C    New session\n    \
+         Ctrl-A N/P  Next/prev session\n    \
+         Ctrl-A [    Enter copy mode\n    \
+         Ctrl-A ]    Paste\n    \
+         Ctrl-A d    Detach\n    \
+         Ctrl-A x    Kill pane\n    \
+         Ctrl-A F    Resize to terminal\n    \
+         Ctrl-A K    Kill session"
+    );
 }
 
 /// Parse CLI arguments into an action.
 fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
+        Some("--help") | Some("-h") => CliAction::Help,
         Some("new-session") => CliAction::NewSession(args.get(2).cloned()),
         Some("new-server") => {
             // Auto-generate a name if none provided (server-2, server-3, ...).
@@ -79,7 +116,39 @@ fn parse_args() -> CliAction {
 fn run() -> io::Result<()> {
     let action = parse_args();
 
+    // Detect nested lrmux — running lrmux inside lrmux hangs because
+    // the inner client competes for the same terminal/PTY.
+    // Allow non-interactive subcommands (ls-*, kill-server, help) but
+    // block anything that tries to attach (default, new-session, new-server).
+    let nested = std::env::var("LRMUX").is_ok();
+    let needs_tty = matches!(
+        action,
+        CliAction::Default | CliAction::NewSession(_) | CliAction::NewServer(_)
+    );
+    if nested && needs_tty {
+        eprintln!(
+            "lrmux: cannot attach from inside lrmux.\n\
+             \n\
+             Use prefix commands instead:\n  \
+             Ctrl-A c    New window\n  \
+             Ctrl-A C    New session\n  \
+             Ctrl-A n/p  Next/prev window\n  \
+             Ctrl-A N/P  Next/prev session\n  \
+             Ctrl-A d    Detach\n\n\
+             Non-interactive subcommands still work:\n  \
+             lrmux ls-sessions\n  \
+             lrmux ls-servers\n  \
+             lrmux kill-server [name]\n  \
+             lrmux --help"
+        );
+        return Ok(());
+    }
+
     match action {
+        CliAction::Help => {
+            print_help();
+            Ok(())
+        }
         CliAction::NewSession(name) => {
             // Connect to the default server (must already be running).
             let sock = socket_path("default");

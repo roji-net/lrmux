@@ -33,6 +33,11 @@ impl Pty {
             ws_ypixel: 0,
         };
 
+        // Set LRMUX env var so the child process knows it's inside lrmux.
+        // The child inherits this via fork; we unset it in the parent after.
+        // Safety: we are single-threaded here (before fork), no race possible.
+        unsafe { std::env::set_var("LRMUX", "1") };
+
         let result = unsafe { forkpty(Some(&winsize), None) }.expect("forkpty failed");
 
         match result {
@@ -46,10 +51,15 @@ impl Pty {
                     process::exit(127);
                 }
             }
-            ForkptyResult::Parent { master, child } => Pty {
-                master,
-                child_pid: child,
-            },
+            ForkptyResult::Parent { master, child } => {
+                // Unset in the parent so the server process doesn't have it.
+                // Safety: single-threaded, no race.
+                unsafe { std::env::remove_var("LRMUX") };
+                Pty {
+                    master,
+                    child_pid: child,
+                }
+            }
         }
     }
 
