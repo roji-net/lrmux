@@ -155,6 +155,11 @@ pub fn run(
     let mut copy_mode: Option<copy_mode::CopyMode> = None;
     // Internal paste buffer (for Prefix ] paste).
     let mut paste_buffer = String::new();
+    // When true, skip \x1b[NS terminal scroll for the next ScrollbackUpdate.
+    // Set by GridSnapshot (window/session switch) because the scrollback
+    // replayed there is history, not new scroll-off — emitting \x1b[NS
+    // would scroll the just-rendered content off the screen.
+    let mut skip_terminal_scroll = false;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -490,7 +495,11 @@ pub fn run(
                             // Scroll the terminal to push content into the
                             // terminal's native scrollback buffer.
                             // Skip in copy mode (terminal is showing copy view).
-                            if n > 0 && copy_mode.is_none() {
+                            // Also skip when this scrollback is a replay of the
+                            // window's history (after GridSnapshot) — emitting
+                            // \x1b[NS here would scroll the just-rendered content
+                            // off the screen, leaving it blank.
+                            if n > 0 && copy_mode.is_none() && !skip_terminal_scroll {
                                 let mut stdout = io::stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
@@ -501,6 +510,9 @@ pub fn run(
                                 grid.mark_all_dirty();
                                 renderer.invalidate();
                             }
+                            // Reset the flag — only the first ScrollbackUpdate
+                            // after a GridSnapshot should be skipped.
+                            skip_terminal_scroll = false;
                         }
                         ServerMsg::GridUpdate {
                             dirty,
@@ -539,6 +551,11 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                         } => {
+                            // The server sends ScrollbackUpdate right after
+                            // GridSnapshot to replay the window's history.
+                            // We must NOT emit \x1b[NS for that replay — it
+                            // would scroll the just-rendered content off screen.
+                            skip_terminal_scroll = true;
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
                             renderer.resize(rows as usize, cols as usize);
@@ -565,7 +582,12 @@ pub fn run(
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
                             let mut stdout = io::stdout();
-                            stdout.write_all(b"\x1b[2J\x1b[H")?;
+                            // Reset scroll region to full screen, clear, then
+                            // re-establish the scroll region. This ensures the
+                            // clear affects the entire screen and the terminal
+                            // viewport is in a clean state before rendering.
+                            let view_rows = term_rows.saturating_sub(1);
+                            write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
                             renderer.render(&mut stdout, &mut grid)?;
                             render_filler(
                                 &mut stdout,
