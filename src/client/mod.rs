@@ -920,6 +920,13 @@ fn render_status_bar(
     let max_cols = term_cols.min(200);
     let display: String = text.chars().take(max_cols).collect();
     stdout.write_all(display.as_bytes())?;
+    // Pad the rest of the line with the bar background color so the
+    // blue background extends to the right edge of the terminal.
+    let display_len = display.chars().count();
+    if display_len < max_cols {
+        // Use the same blue background, no text attributes.
+        write!(stdout, "\x1b[44m{}", " ".repeat(max_cols - display_len))?;
+    }
     // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
     // Reposition cursor to the grid cursor location so the user sees
