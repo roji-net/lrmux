@@ -697,6 +697,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         window,
                                         keys,
                                     } => {
+                                        crate::log::info(&format!(
+                                            "SendKeys: session={:?} window={:?} keys_len={}",
+                                            session,
+                                            window,
+                                            keys.len()
+                                        ));
                                         // Find the target session by name, or use the first.
                                         let si = match session {
                                             Some(ref name) => {
@@ -718,6 +724,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             if let Some(wi) = wi
                                                 && wi < sessions[si].windows.len()
                                             {
+                                                crate::log::info(&format!(
+                                                    "SendKeys: writing {} bytes to session '{}' window {}",
+                                                    keys.len(),
+                                                    sessions[si].name,
+                                                    wi
+                                                ));
                                                 let translated = translate_cursor_keys(
                                                     &keys,
                                                     sessions[si].windows[wi]
@@ -728,7 +740,19 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                                 let _ = sessions[si].windows[wi]
                                                     .pane
                                                     .write_input(&translated);
+                                            } else {
+                                                crate::log::warn(&format!(
+                                                    "SendKeys: window index {} out of range (session '{}' has {} windows)",
+                                                    wi.unwrap_or(0),
+                                                    sessions[si].name,
+                                                    sessions[si].windows.len()
+                                                ));
                                             }
+                                        } else {
+                                            crate::log::warn(&format!(
+                                                "SendKeys: session {:?} not found",
+                                                session
+                                            ));
                                         }
                                     }
                                     ClientMsg::GetLog => {
@@ -839,20 +863,25 @@ fn default_window_name() -> String {
 }
 
 /// Translate normal cursor keys to application cursor keys when the mode is active.
-/// When `app_cursor_keys` is true, \x1b[A/B/C/D are translated to \x1bOA/B/C/D.
-/// This handles the DECCKM (cursor key mode) that programs like htop enable.
+/// When `app_cursor_keys` is true:
+/// - \x1b[A/B/C/D → \x1bOA/B/C/D (arrow keys)
+/// - \x1b[H → \x1bOH (Home)
+/// - \x1b[F → \x1bOF (End)
+///
+/// This handles the DECCKM (cursor key mode) that programs like htop and zsh enable.
 fn translate_cursor_keys(data: &[u8], app_cursor_keys: bool) -> Vec<u8> {
     if !app_cursor_keys {
         return data.to_vec();
     }
-    // Look for \x1b[A, \x1b[B, \x1b[C, \x1b[D and translate to \x1bO[A→O, etc.
+    // Look for \x1b[A, \x1b[B, \x1b[C, \x1b[D (arrows) and \x1b[H, \x1b[F (Home/End).
+    // Translate the intermediate '[' to 'O' when in application cursor keys mode.
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
         if i + 2 < data.len()
             && data[i] == 0x1b
             && data[i + 1] == b'['
-            && matches!(data[i + 2], b'A' | b'B' | b'C' | b'D')
+            && matches!(data[i + 2], b'A' | b'B' | b'C' | b'D' | b'H' | b'F')
         {
             result.push(0x1b);
             result.push(b'O');

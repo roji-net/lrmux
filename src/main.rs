@@ -68,6 +68,7 @@ enum CliAction {
         session: Option<String>,
         window: Option<u8>,
         keys: String,
+        quiet: bool,
     },
     /// `--help` / `-h`: show usage.
     Help,
@@ -296,6 +297,7 @@ fn parse_send_keys(args: &[String]) -> CliAction {
     let mut session: Option<String> = None;
     let mut window: Option<u8> = None;
     let mut key_parts: Vec<String> = Vec::new();
+    let mut quiet = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -310,6 +312,10 @@ fn parse_send_keys(args: &[String]) -> CliAction {
             "--window" if i + 1 < args.len() => {
                 window = args[i + 1].parse::<u8>().ok();
                 i += 2;
+            }
+            "-q" | "--quiet" => {
+                quiet = true;
+                i += 1;
             }
             _ => {
                 // First positional with ':' is a target.
@@ -338,6 +344,7 @@ fn parse_send_keys(args: &[String]) -> CliAction {
         session,
         window,
         keys,
+        quiet,
     }
 }
 
@@ -424,7 +431,8 @@ fn run() -> io::Result<()> {
             session,
             window,
             keys,
-        } => cli_send_keys(&server, session, window, &keys),
+            quiet,
+        } => cli_send_keys(&server, session, window, &keys, quiet),
     }
 }
 
@@ -688,6 +696,7 @@ fn cli_send_keys(
     session: Option<String>,
     window: Option<u8>,
     keys: &str,
+    quiet: bool,
 ) -> io::Result<()> {
     let sock = socket_path(server);
     if !ipc::server_exists(&sock) {
@@ -710,12 +719,29 @@ fn cli_send_keys(
         }
         Err(e) => return Err(e),
     }
+    if !quiet {
+        eprintln!(
+            "lrmux: send-keys: server={server} session={:?} window={:?} keys={:?} ({} bytes)",
+            session,
+            window,
+            keys,
+            keys.len()
+        );
+    }
     let msg = proto::encode_client(&ClientMsg::SendKeys {
         session,
         window,
         keys: keys.as_bytes().to_vec(),
     });
     proto::send(&mut stream, &msg)?;
+    // Give the server time to process the message before we close the socket.
+    // The server processes client messages in its poll loop; if we close
+    // immediately, the server may detect the disconnect and remove the
+    // client before processing the SendKeys message.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    if !quiet {
+        eprintln!("lrmux: send-keys: message sent");
+    }
     Ok(())
 }
 

@@ -123,6 +123,16 @@ impl Perform for VtHandler<'_> {
                 let n = param(0, 1) as usize;
                 self.grid.scroll_down(n);
             }
+            'L' => {
+                // IL - insert lines at cursor
+                let n = param(0, 1) as usize;
+                self.grid.insert_lines(n);
+            }
+            'M' => {
+                // DL - delete lines at cursor
+                let n = param(0, 1) as usize;
+                self.grid.delete_lines(n);
+            }
 
             // DECSTBM - set scroll region
             'r' => {

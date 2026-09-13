@@ -308,6 +308,59 @@ impl Grid {
         }
     }
 
+    /// Insert n blank lines at the cursor row, scrolling lines within the
+    /// scroll region down. Lines that scroll off the bottom are lost.
+    /// (IL — Insert Line, CSI L)
+    pub fn insert_lines(&mut self, n: usize) {
+        let cursor = self.cursor_row;
+        if cursor < self.scroll_top || cursor >= self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom - cursor);
+        if n == 0 {
+            return;
+        }
+
+        let blank_row = vec![Cell::blank(); self.cols];
+        for _ in 0..n {
+            self.rows.insert(cursor, blank_row.clone());
+        }
+        // Remove the extra rows from the bottom of the scroll region.
+        for _ in 0..n {
+            self.rows.remove(self.scroll_bottom - 1);
+        }
+
+        for i in cursor..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Delete n lines at the cursor row, scrolling lines within the scroll
+    /// region up. Blank lines appear at the bottom of the scroll region.
+    /// (DL — Delete Line, CSI M)
+    pub fn delete_lines(&mut self, n: usize) {
+        let cursor = self.cursor_row;
+        if cursor < self.scroll_top || cursor >= self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom - cursor);
+        if n == 0 {
+            return;
+        }
+
+        for _ in 0..n {
+            self.rows.remove(cursor);
+        }
+        let blank_row = vec![Cell::blank(); self.cols];
+        for _ in 0..n {
+            self.rows.insert(self.scroll_bottom - 1, blank_row.clone());
+        }
+
+        for i in cursor..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
+    }
+
     /// Erase from cursor to end of line.
     pub fn erase_to_end_of_line(&mut self) {
         let (crow, ccol) = (self.cursor_row, self.cursor_col);
