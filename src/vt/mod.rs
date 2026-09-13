@@ -215,7 +215,5 @@ impl Perform for VtHandler<'_> {
 /// Parse a buffer of bytes through the VT parser, updating the grid.
 pub fn parse_bytes(parser: &mut vte::Parser, grid: &mut Grid, bytes: &[u8]) {
     let mut handler = VtHandler { grid };
-    for &byte in bytes {
-        parser.advance(&mut handler, byte);
-    }
+    parser.advance(&mut handler, bytes);
 }
