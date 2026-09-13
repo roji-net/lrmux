@@ -791,8 +791,8 @@ fn process_prefix(
                             send_cmd(stream, &ClientMsg::PrevWindow)?;
                         }
                     }
-                    // 'd' → detach (handled by caller after passthrough is sent).
-                    b'd' => {
+                    // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
+                    b'd' | 0x04 => {
                         detach = true;
                     }
                     // 'x' → kill pane (no confirmation, immediate).
