@@ -13,6 +13,7 @@ use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
 use crate::pty;
 use crate::server::session::Session;
+use crate::server::state;
 use crate::server::window::Window;
 
 /// A connected client.
@@ -71,6 +72,9 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
 
+    // Periodic state save counter (save every ~1000 iterations ≈ 10s).
+    let mut iter_count: u32 = 0;
+
     loop {
         // Build pollfd array: listener + all window PTY fds (across all sessions) + all client fds.
         // We need a mapping from pollfd index to (session_idx, window_idx).
@@ -123,6 +127,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                     // KillServer received — shut down gracefully.
                     crate::log::info("KillServer received, shutting down");
                     kill_all_children(&sessions);
+                    state::save_state(socket_path, &sessions);
                     broadcast_to_all(
                         &mut clients,
                         &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
@@ -784,11 +789,18 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         if sessions.is_empty() && clients.is_empty() {
             break;
         }
+
+        // Periodic state save (every ~1000 iterations ≈ 10s).
+        iter_count = iter_count.wrapping_add(1);
+        if iter_count.is_multiple_of(1000) && !sessions.is_empty() {
+            state::save_state(socket_path, &sessions);
+        }
     }
 
     crate::log::info("no sessions and no clients remaining, server exiting");
     // Send SIGHUP to all remaining child processes before cleanup.
     kill_all_children(&sessions);
+    state::save_state(socket_path, &sessions);
     ipc::cleanup(socket_path);
     Ok(())
 }

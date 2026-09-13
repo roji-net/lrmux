@@ -1471,10 +1471,7 @@ fn show_session_chooser(sessions: &[String]) -> Option<String> {
 
     // Wait for a single keypress.
     let mut buf = [0u8; 1];
-    if std::io::stdin().read(&mut buf).is_ok()
-        && buf[0] >= b'0'
-        && buf[0] <= b'9'
-    {
+    if std::io::stdin().read(&mut buf).is_ok() && buf[0] >= b'0' && buf[0] <= b'9' {
         let idx = (buf[0] - b'0') as usize;
         if idx < sessions.len() {
             // Clear and request a full re-render.
