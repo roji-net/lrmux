@@ -793,15 +793,15 @@ fn process_prefix(
                         send_cmd(stream, &ClientMsg::NewWindow)?;
                     }
                     // 'n', Space, or Ctrl-Space → next window.
-                    b'n' | b' ' | 0x00 => {
+                    b'n' | b' ' | 0x00 | 0x0e => {
                         if window_count <= 1 {
                             flash = Some("No next window".to_string());
                         } else {
                             send_cmd(stream, &ClientMsg::NextWindow)?;
                         }
                     }
-                    // 'p' → previous window.
-                    b'p' => {
+                    // 'p' or Ctrl-P → previous window.
+                    b'p' | 0x10 => {
                         if window_count <= 1 {
                             flash = Some("No previous window".to_string());
                         } else {
