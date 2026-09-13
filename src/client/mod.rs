@@ -792,8 +792,8 @@ fn process_prefix(
                     b'c' => {
                         send_cmd(stream, &ClientMsg::NewWindow)?;
                     }
-                    // 'n' or Space → next window.
-                    b'n' | b' ' => {
+                    // 'n', Space, or Ctrl-Space → next window.
+                    b'n' | b' ' | 0x00 => {
                         if window_count <= 1 {
                             flash = Some("No next window".to_string());
                         } else {
