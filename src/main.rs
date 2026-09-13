@@ -99,6 +99,7 @@ fn print_help() {
          COMMON PREFIX COMMANDS:\n    \
          Ctrl-A c    New window\n    \
          Ctrl-A n/p  Next/prev window\n    \
+         Ctrl-A Ctrl-A  Toggle last window\n    \
          Ctrl-A 0-9  Select window\n    \
          Ctrl-A C    New session\n    \
          Ctrl-A N/P  Next/prev session\n    \

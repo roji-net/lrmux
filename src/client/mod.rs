@@ -131,6 +131,10 @@ pub fn run(
     let mut current_window_count: usize = 0;
     // Number of sessions on the server (from StatusBarUpdate).
     let mut session_count: usize = 0;
+    // Last active window index (for Ctrl-A Ctrl-A toggle).
+    let mut last_window: Option<u8> = None;
+    // Current active window index (tracked from StatusBarUpdate).
+    let mut current_window: Option<u8> = None;
     // Temporary status bar message (shown for a few seconds, then cleared).
     let mut flash_msg: Option<String> = None;
     let mut flash_deadline: Option<std::time::Instant> = None;
@@ -405,6 +409,7 @@ pub fn run(
                             &mut stream,
                             current_window_count,
                             session_count,
+                            last_window,
                         )?;
                     if let Some(msg) = flash {
                         flash_msg = Some(msg);
@@ -659,6 +664,12 @@ pub fn run(
                             active,
                             session_count: sc,
                         } => {
+                            // Track last window for Ctrl-A Ctrl-A toggle.
+                            let new_active = Some(active as u8);
+                            if new_active != current_window && current_window.is_some() {
+                                last_window = current_window;
+                            }
+                            current_window = new_active;
                             current_session = session.clone();
                             current_window_count = windows.len();
                             session_count = sc as usize;
@@ -728,6 +739,7 @@ fn process_prefix(
     stream: &mut std::os::unix::net::UnixStream,
     window_count: usize,
     session_count: usize,
+    last_window: Option<u8>,
 ) -> io::Result<(
     Vec<u8>,
     bool,
@@ -767,9 +779,14 @@ fn process_prefix(
             }
             PrefixState::Command => {
                 match byte {
-                    // Double prefix → send literal prefix to child.
+                    // Double prefix → toggle to last focused window.
                     PREFIX => {
-                        passthrough.push(PREFIX);
+                        if let Some(idx) = last_window {
+                            send_cmd(stream, &ClientMsg::SelectWindow { index: idx })?;
+                        } else {
+                            // No last window — send literal prefix to child.
+                            passthrough.push(PREFIX);
+                        }
                     }
                     // 'c' → new window.
                     b'c' => {
