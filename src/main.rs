@@ -313,7 +313,9 @@ fn parse_send_keys(args: &[String]) -> CliAction {
             }
             _ => {
                 // First positional with ':' is a target.
-                if key_parts.is_empty() && args[i].contains(':') {
+                // First positional that's a plain number is a window index.
+                if key_parts.is_empty() && (args[i].contains(':') || args[i].parse::<u8>().is_ok())
+                {
                     let t = parse_target(&args[i]);
                     server = t.server;
                     if t.session.is_some() {

@@ -36,6 +36,9 @@ pub struct Grid {
     wrap_pending: bool,
     /// Saved cursor position (for DECSC/DECRC).
     saved_cursor: Option<(usize, usize)>,
+    /// Application cursor keys mode (DECCKM). When true, arrow keys
+    /// should be translated from \x1b[A/B/C/D to \x1bOA/B/C/D.
+    pub app_cursor_keys: bool,
     /// Rows modified since the last render. The renderer uses this to
     /// skip unchanged rows instead of scanning the entire grid.
     dirty: Vec<bool>,
@@ -61,6 +64,7 @@ impl Grid {
             scroll_bottom: rows,
             wrap_pending: false,
             saved_cursor: None,
+            app_cursor_keys: false,
             dirty: vec![true; rows],
         };
         grid.scroll_bottom = rows;

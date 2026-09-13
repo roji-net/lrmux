@@ -282,8 +282,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         let si = clients[client_idx].session_idx;
                                         let aw = clients[client_idx].active_window;
                                         if si < sessions.len() && aw < sessions[si].windows.len() {
-                                            let _ =
-                                                sessions[si].windows[aw].pane.write_input(&data);
+                                            let pane = &mut sessions[si].windows[aw].pane;
+                                            let translated = translate_cursor_keys(
+                                                &data,
+                                                pane.grid.app_cursor_keys,
+                                            );
+                                            let _ = pane.write_input(&translated);
                                         }
                                     }
                                     ClientMsg::Resize { rows, cols } => {
@@ -714,9 +718,16 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             if let Some(wi) = wi
                                                 && wi < sessions[si].windows.len()
                                             {
+                                                let translated = translate_cursor_keys(
+                                                    &keys,
+                                                    sessions[si].windows[wi]
+                                                        .pane
+                                                        .grid
+                                                        .app_cursor_keys,
+                                                );
                                                 let _ = sessions[si].windows[wi]
                                                     .pane
-                                                    .write_input(&keys);
+                                                    .write_input(&translated);
                                             }
                                         }
                                     }
@@ -825,6 +836,34 @@ fn kill_all_children(sessions: &[Session]) {
 /// Default name for a new window.
 fn default_window_name() -> String {
     "shell".to_string()
+}
+
+/// Translate normal cursor keys to application cursor keys when the mode is active.
+/// When `app_cursor_keys` is true, \x1b[A/B/C/D are translated to \x1bOA/B/C/D.
+/// This handles the DECCKM (cursor key mode) that programs like htop enable.
+fn translate_cursor_keys(data: &[u8], app_cursor_keys: bool) -> Vec<u8> {
+    if !app_cursor_keys {
+        return data.to_vec();
+    }
+    // Look for \x1b[A, \x1b[B, \x1b[C, \x1b[D and translate to \x1bO[A→O, etc.
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 2 < data.len()
+            && data[i] == 0x1b
+            && data[i + 1] == b'['
+            && matches!(data[i + 2], b'A' | b'B' | b'C' | b'D')
+        {
+            result.push(0x1b);
+            result.push(b'O');
+            result.push(data[i + 2]);
+            i += 3;
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    result
 }
 
 /// Generate a default session name based on the current directory.
