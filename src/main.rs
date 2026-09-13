@@ -11,6 +11,7 @@ mod grid;
 mod ipc;
 mod keys;
 mod layout;
+mod log;
 mod proto;
 mod pty;
 mod server;
