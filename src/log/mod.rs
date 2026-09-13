@@ -1,6 +1,7 @@
 // Logging: file + optional remote syslog (UDP RFC 3164).
 // Minimal, no external dependencies.
 
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::UdpSocket;
@@ -8,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::SystemTime;
+
+const RING_CAPACITY: usize = 500;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
@@ -41,6 +44,7 @@ struct Logger {
     file: Option<Mutex<std::fs::File>>,
     syslog: Option<SyslogConfig>,
     min_level: Level,
+    ring: Mutex<VecDeque<String>>,
 }
 
 struct SyslogConfig {
@@ -79,6 +83,7 @@ pub fn init(log_dir: &str, server_name: &str, min_level: Level, syslog: Option<(
         file,
         syslog,
         min_level,
+        ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
     });
 }
 
@@ -124,19 +129,38 @@ pub fn error(msg: &str) {
     log_raw(Level::Error, msg);
 }
 
+/// Get a copy of the in-memory ring log (newest last).
+/// Returns an empty vector if logging is not initialized.
+pub fn get_ring_log() -> Vec<String> {
+    if let Some(logger) = LOGGER.get()
+        && let Ok(ring) = logger.ring.lock()
+    {
+        return ring.iter().cloned().collect();
+    }
+    Vec::new()
+}
+
 fn log_raw(level: Level, msg: &str) {
     if let Some(logger) = LOGGER.get() {
         if level < logger.min_level {
             return;
         }
         let timestamp = format_timestamp();
-        let line = format!("[{timestamp}] [{level}] {msg}\n", level = level.as_str());
+        let line = format!("[{timestamp}] [{level}] {msg}", level = level.as_str());
+
+        // Write to ring buffer.
+        if let Ok(mut ring) = logger.ring.lock() {
+            if ring.len() >= RING_CAPACITY {
+                ring.pop_front();
+            }
+            ring.push_back(line.clone());
+        }
 
         // Write to file.
         if let Some(ref file) = logger.file
             && let Ok(mut f) = file.lock()
         {
-            let _ = f.write_all(line.as_bytes());
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
 
         // Send to remote syslog (UDP RFC 3164).

@@ -104,13 +104,16 @@ fn print_help() {
          Ctrl-A 0-9  Select window\n    \
          Ctrl-A C    New session\n    \
          Ctrl-A N/P  Next/prev session\n    \
+         Ctrl-A S    Session chooser\n    \
          Ctrl-A $    Rename session\n    \
          Ctrl-A [    Enter copy mode\n    \
          Ctrl-A ]    Paste\n    \
          Ctrl-A d    Detach\n    \
          Ctrl-A x    Kill pane\n    \
          Ctrl-A F    Resize to terminal\n    \
-         Ctrl-A K    Kill session"
+         Ctrl-A K    Kill session\n    \
+         Ctrl-A \\    Show server log\n    \
+         Ctrl-A ?    Show keybindings"
     );
 }
 
@@ -361,8 +364,10 @@ fn run() -> io::Result<()> {
              Ctrl-A C    New session\n  \
              Ctrl-A n/p  Next/prev window\n  \
              Ctrl-A N/P  Next/prev session\n  \
+             Ctrl-A S    Session chooser\n  \
              Ctrl-A $    Rename session\n  \
-             Ctrl-A d    Detach\n\n\
+             Ctrl-A d    Detach\n  \
+             Ctrl-A ?    Show keybindings\n\n\
              Non-interactive subcommands still work:\n  \
              lrmux ls-sessions\n  \
              lrmux ls-servers\n  \

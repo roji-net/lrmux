@@ -458,23 +458,26 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::NewSession { name } => {
-                                        // Use the CWD of the active window's child process
-                                        // as the default session name and working directory.
+                                    ClientMsg::NewSession { name, cwd } => {
+                                        // Use the CWD from the client message if provided
+                                        // (e.g. from `lrmux new-session` CLI). Otherwise,
+                                        // fall back to the CWD of the active window's child.
                                         let si = clients[client_idx].session_idx;
                                         let wi = clients[client_idx].active_window;
-                                        let cwd_full = if si < sessions.len()
-                                            && wi < sessions[si].windows.len()
-                                        {
-                                            let pane = &sessions[si].windows[wi].pane;
-                                            if !pane.exited {
-                                                pty::child_cwd_full(pane.pty.child_pid)
+                                        let cwd_full = cwd.or_else(|| {
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                            {
+                                                let pane = &sessions[si].windows[wi].pane;
+                                                if !pane.exited {
+                                                    pty::child_cwd_full(pane.pty.child_pid)
+                                                } else {
+                                                    None
+                                                }
                                             } else {
                                                 None
                                             }
-                                        } else {
-                                            None
-                                        };
+                                        });
                                         let session_name =
                                             name.unwrap_or_else(|| match &cwd_full {
                                                 Some(cwd) => {
@@ -711,6 +714,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                                     .write_input(&keys);
                                             }
                                         }
+                                    }
+                                    ClientMsg::GetLog => {
+                                        let lines = crate::log::get_ring_log();
+                                        let msg =
+                                            proto::encode_server(&ServerMsg::LogContent { lines });
+                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
                                     }
                                 }
                             }
@@ -1264,7 +1273,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x09 => ClientMsg::KillPane,
         0x0a => {
-            // NewSession: 1 byte flag (0 = no name, 1 = has name) + optional name
+            // NewSession: name flag + optional name, then cwd flag + optional cwd
             if data.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1272,25 +1281,53 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 ));
             }
             let has_name = data[0];
-            if has_name != 0 {
-                if data.len() < 5 {
+            let mut pos = 1;
+            let name = if has_name != 0 {
+                if data.len() < pos + 4 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "NewSession name needs 4-byte length",
                     ));
                 }
-                let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-                if data.len() < 5 + len {
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                pos += 4;
+                if data.len() < pos + len {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "NewSession name truncated",
                     ));
                 }
-                let name = String::from_utf8_lossy(&data[5..5 + len]).into_owned();
-                ClientMsg::NewSession { name: Some(name) }
+                let n = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+                pos += len;
+                Some(n)
             } else {
-                ClientMsg::NewSession { name: None }
-            }
+                None
+            };
+            let cwd = if pos < data.len() && data[pos] != 0 {
+                pos += 1;
+                if data.len() < pos + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession cwd needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                pos += 4;
+                if data.len() < pos + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession cwd truncated",
+                    ));
+                }
+                Some(String::from_utf8_lossy(&data[pos..pos + len]).into_owned())
+            } else {
+                None
+            };
+            ClientMsg::NewSession { name, cwd }
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
@@ -1516,6 +1553,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 keys,
             }
         }
+        0x15 => ClientMsg::GetLog,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

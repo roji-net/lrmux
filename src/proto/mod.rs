@@ -30,8 +30,11 @@ pub enum ClientMsg {
     SelectWindow { index: u8 },
     /// Kill the active pane/window.
     KillPane,
-    /// Create a new session and switch to it. Optional name.
-    NewSession { name: Option<String> },
+    /// Create a new session and switch to it. Optional name, optional CWD.
+    NewSession {
+        name: Option<String>,
+        cwd: Option<String>,
+    },
     /// Switch to next session.
     NextSession,
     /// Switch to previous session.
@@ -68,6 +71,8 @@ pub enum ClientMsg {
         window: Option<u8>,
         keys: Vec<u8>,
     },
+    /// Request the server's in-memory ring log.
+    GetLog,
 }
 
 /// Server → Client messages.
@@ -109,6 +114,8 @@ pub enum ServerMsg {
     SessionList { sessions: Vec<String> },
     /// Captured window content (response to CaptureWindow).
     WindowCapture { content: String },
+    /// Server ring log (response to GetLog).
+    LogContent { lines: Vec<String> },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -133,6 +140,7 @@ const C_RENAME_SESSION: u8 = 0x11;
 const C_NEW_WINDOW_IN: u8 = 0x12;
 const C_CAPTURE_WINDOW: u8 = 0x13;
 const C_SEND_KEYS: u8 = 0x14;
+const C_GET_LOG: u8 = 0x15;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -143,6 +151,7 @@ const S_ERROR: u8 = 0x14;
 const S_STATUS_BAR: u8 = 0x15;
 const S_SESSION_LIST: u8 = 0x16;
 const S_WINDOW_CAPTURE: u8 = 0x18;
+const S_LOG_CONTENT: u8 = 0x19;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -183,13 +192,21 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::KillPane => {
             payload.push(C_KILL_PANE);
         }
-        ClientMsg::NewSession { name } => {
+        ClientMsg::NewSession { name, cwd } => {
             payload.push(C_NEW_SESSION);
             match name {
                 Some(n) => {
                     payload.push(1);
                     payload.extend_from_slice(&(n.len() as u32).to_le_bytes());
                     payload.extend_from_slice(n.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match cwd {
+                Some(c) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(c.as_bytes());
                 }
                 None => payload.push(0),
             }
@@ -279,6 +296,9 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             }
             payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
             payload.extend_from_slice(keys);
+        }
+        ClientMsg::GetLog => {
+            payload.push(C_GET_LOG);
         }
     }
     frame(payload)
@@ -380,6 +400,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&(content.len() as u32).to_le_bytes());
             payload.extend_from_slice(content.as_bytes());
         }
+        ServerMsg::LogContent { lines } => {
+            payload.push(S_LOG_CONTENT);
+            payload.extend_from_slice(&(lines.len() as u32).to_le_bytes());
+            for line in lines {
+                payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
+                payload.extend_from_slice(line.as_bytes());
+            }
+        }
     }
     frame(payload)
 }
@@ -479,13 +507,20 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         C_KILL_PANE => Ok(ClientMsg::KillPane),
         C_NEW_SESSION => {
             let has_name = read_u8(&mut r)?;
-            if has_name != 0 {
+            let name = if has_name != 0 {
                 let len = read_u32(&mut r)? as usize;
-                let name = String::from_utf8_lossy(&r[..len]).into_owned();
-                Ok(ClientMsg::NewSession { name: Some(name) })
+                Some(String::from_utf8_lossy(&r[..len]).into_owned())
             } else {
-                Ok(ClientMsg::NewSession { name: None })
-            }
+                None
+            };
+            let has_cwd = read_u8(&mut r)?;
+            let cwd = if has_cwd != 0 {
+                let len = read_u32(&mut r)? as usize;
+                Some(String::from_utf8_lossy(&r[..len]).into_owned())
+            } else {
+                None
+            };
+            Ok(ClientMsg::NewSession { name, cwd })
         }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
@@ -568,6 +603,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
                 keys,
             })
         }
+        C_GET_LOG => Ok(ClientMsg::GetLog),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -686,6 +722,16 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let len = read_u32(&mut r)? as usize;
             let content = String::from_utf8_lossy(&r[..len]).into_owned();
             Ok(ServerMsg::WindowCapture { content })
+        }
+        S_LOG_CONTENT => {
+            let count = read_u32(&mut r)? as usize;
+            let mut lines = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = read_u32(&mut r)? as usize;
+                lines.push(String::from_utf8_lossy(&r[..len]).into_owned());
+                r = &r[len..];
+            }
+            Ok(ServerMsg::LogContent { lines })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
