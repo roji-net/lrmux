@@ -25,7 +25,9 @@ impl Pty {
     ///
     /// Uses `forkpty` to create a pseudo-terminal and fork. The child
     /// execs the command; the parent gets the master fd.
-    pub fn spawn(argv: &[CString], size: PtySize) -> Self {
+    /// If `cwd` is provided, the child process changes to that directory
+    /// before exec.
+    pub fn spawn(argv: &[CString], size: PtySize, cwd: Option<&str>) -> Self {
         let winsize = Winsize {
             ws_row: size.rows,
             ws_col: size.cols,
@@ -44,6 +46,12 @@ impl Pty {
             ForkptyResult::Child => {
                 // Child process: exec the command.
                 // Only async-signal-safe operations allowed here.
+                // chdir is not strictly async-signal-safe per POSIX but works
+                // in practice on macOS/Linux (same approach as tmux).
+                if let Some(cwd) = cwd {
+                    let c_cwd = CString::new(cwd).unwrap();
+                    unsafe { libc::chdir(c_cwd.as_ptr()) };
+                }
                 // execvp replaces the process image; if it returns, it failed.
                 #[allow(unreachable_code)]
                 {
@@ -122,8 +130,8 @@ pub fn child_exit(code: i32) -> ! {
 }
 
 /// Get the current working directory of a child process by PID.
-/// Returns None if the CWD cannot be determined.
-pub fn child_cwd(pid: Pid) -> Option<String> {
+/// Returns the full path. None if the CWD cannot be determined.
+pub fn child_cwd_full(pid: Pid) -> Option<String> {
     let pid = pid.as_raw();
     #[cfg(target_os = "macos")]
     {
@@ -138,19 +146,10 @@ pub fn child_cwd(pid: Pid) -> Option<String> {
             ) -> i32;
         }
         const PROC_PIDVNODEPATHINFO: u32 = 9;
-        // struct proc_vnodepathinfo { vnode_info_path pvi_cdir; vnode_info_path pvi_rdir; }
-        // struct vnode_info_path { vnode_info vip_vi; char vip_path[MAXPATHLEN]; }
-        // MAXPATHLEN = 1024 on macOS.
-        // We only need pvi_cdir.vip_path, which is at offset sizeof(vnode_info).
-        // Total size: 2 * sizeof(vnode_info_path) = 2 * (sizeof(vnode_info) + 1024)
-        // But we can use a simpler approach: allocate enough and read the path.
         const MAXPATHLEN: usize = 1024;
-        // vnode_info is 48 bytes (vi_stat + vi_type + vi_pad + vi_fsid + vi_fsid_padding).
-        // Total vnode_info_path = 48 + 1024 = 1072 bytes.
-        // proc_vnodepathinfo = 2 * 1072 = 2144 bytes.
         #[repr(C)]
         struct VnodeInfoPath {
-            _vi: [u8; 48], // vnode_info (48 bytes)
+            _vi: [u8; 48],
             path: [u8; MAXPATHLEN],
         }
         #[repr(C)]
@@ -183,9 +182,7 @@ pub fn child_cwd(pid: Pid) -> Option<String> {
                 unsafe { std::ffi::CStr::from_ptr(info.cdir.path.as_ptr() as *const libc::c_char) };
             let path = path_cstr.to_string_lossy().into_owned();
             if !path.is_empty() {
-                return std::path::Path::new(&path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
+                return Some(path);
             }
         }
         None
@@ -196,10 +193,20 @@ pub fn child_cwd(pid: Pid) -> Option<String> {
         let link = format!("/proc/{pid}/cwd");
         std::fs::read_link(&link)
             .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .map(|p| p.to_string_lossy().into_owned())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         None
     }
+}
+
+/// Get the basename of the current working directory of a child process.
+/// Returns None if the CWD cannot be determined.
+pub fn child_cwd(pid: Pid) -> Option<String> {
+    child_cwd_full(pid).and_then(|p| {
+        std::path::Path::new(&p)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    })
 }

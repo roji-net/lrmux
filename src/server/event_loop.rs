@@ -285,11 +285,34 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                     ClientMsg::NewWindow => {
                                         let si = clients[client_idx].session_idx;
                                         if si < sessions.len() {
-                                            sessions[si].windows.push(Window::new(
-                                                grid_rows,
-                                                grid_cols,
-                                                default_window_name(),
-                                            ));
+                                            // Get the CWD of the active window's child
+                                            // process so the new window opens in the
+                                            // same directory.
+                                            let aw = clients[client_idx].active_window;
+                                            let cwd = if aw < sessions[si].windows.len() {
+                                                let pane = &sessions[si].windows[aw].pane;
+                                                if !pane.exited {
+                                                    pty::child_cwd_full(pane.pty.child_pid)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            let win = match cwd {
+                                                Some(ref dir) => Window::new_in_cwd(
+                                                    grid_rows,
+                                                    grid_cols,
+                                                    default_window_name(),
+                                                    dir,
+                                                ),
+                                                None => Window::new(
+                                                    grid_rows,
+                                                    grid_cols,
+                                                    default_window_name(),
+                                                ),
+                                            };
+                                            sessions[si].windows.push(win);
                                             clients[client_idx].active_window =
                                                 sessions[si].windows.len() - 1;
                                             if !need_snapshot.contains(&client_idx) {
@@ -398,30 +421,44 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                     }
                                     ClientMsg::NewSession { name } => {
                                         // Use the CWD of the active window's child process
-                                        // as the default session name.
-                                        let session_name = name.unwrap_or_else(|| {
-                                            let si = clients[client_idx].session_idx;
-                                            let wi = clients[client_idx].active_window;
-                                            if si < sessions.len()
-                                                && wi < sessions[si].windows.len()
-                                            {
-                                                let pane = &sessions[si].windows[wi].pane;
-                                                if !pane.exited
-                                                    && let Some(cwd) =
-                                                        pty::child_cwd(pane.pty.child_pid)
-                                                {
-                                                    return ensure_unique_session_name(
-                                                        &cwd, &sessions,
-                                                    );
-                                                }
+                                        // as the default session name and working directory.
+                                        let si = clients[client_idx].session_idx;
+                                        let wi = clients[client_idx].active_window;
+                                        let cwd_full = if si < sessions.len()
+                                            && wi < sessions[si].windows.len()
+                                        {
+                                            let pane = &sessions[si].windows[wi].pane;
+                                            if !pane.exited {
+                                                pty::child_cwd_full(pane.pty.child_pid)
+                                            } else {
+                                                None
                                             }
-                                            default_session_name(&sessions)
-                                        });
-                                        sessions.push(Session::new(
-                                            session_name,
-                                            grid_rows,
-                                            grid_cols,
-                                        ));
+                                        } else {
+                                            None
+                                        };
+                                        let session_name =
+                                            name.unwrap_or_else(|| match &cwd_full {
+                                                Some(cwd) => {
+                                                    let base = std::path::Path::new(cwd)
+                                                        .file_name()
+                                                        .map(|n| n.to_string_lossy().into_owned())
+                                                        .unwrap_or_else(|| "session".to_string());
+                                                    ensure_unique_session_name(&base, &sessions)
+                                                }
+                                                None => default_session_name(&sessions),
+                                            });
+                                        let session = match &cwd_full {
+                                            Some(cwd) => Session::new_in_cwd(
+                                                session_name,
+                                                grid_rows,
+                                                grid_cols,
+                                                cwd,
+                                            ),
+                                            None => {
+                                                Session::new(session_name, grid_rows, grid_cols)
+                                            }
+                                        };
+                                        sessions.push(session);
                                         let new_si = sessions.len() - 1;
                                         clients[client_idx].session_idx = new_si;
                                         clients[client_idx].active_window = 0;

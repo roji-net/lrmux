@@ -17,4 +17,12 @@ impl Session {
             windows: vec![window],
         }
     }
+
+    pub fn new_in_cwd(name: String, grid_rows: u16, grid_cols: u16, cwd: &str) -> Self {
+        let window = Window::new_in_cwd(grid_rows, grid_cols, "shell".to_string(), cwd);
+        Self {
+            name,
+            windows: vec![window],
+        }
+    }
 }

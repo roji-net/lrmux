@@ -26,7 +26,13 @@ impl Pane {
     /// Spawn a new pane with the default shell.
     pub fn new(rows: u16, cols: u16) -> Self {
         let argv = default_shell_argv();
-        Self::new_with_argv(rows, cols, &argv)
+        Self::new_with_argv(rows, cols, &argv, None)
+    }
+
+    /// Spawn a new pane with the default shell in a specific directory.
+    pub fn new_in_cwd(rows: u16, cols: u16, cwd: &str) -> Self {
+        let argv = default_shell_argv();
+        Self::new_with_argv(rows, cols, &argv, Some(cwd))
     }
 
     /// Spawn a new pane with a custom command string.
@@ -38,12 +44,12 @@ impl Pane {
             CString::new("-c").unwrap(),
             CString::new(command).unwrap(),
         ];
-        Self::new_with_argv(rows, cols, &argv)
+        Self::new_with_argv(rows, cols, &argv, None)
     }
 
-    /// Spawn a new pane with the given argv.
-    fn new_with_argv(rows: u16, cols: u16, argv: &[CString]) -> Self {
-        let pty = Pty::spawn(argv, PtySize { rows, cols });
+    /// Spawn a new pane with the given argv and optional working directory.
+    fn new_with_argv(rows: u16, cols: u16, argv: &[CString], cwd: Option<&str>) -> Self {
+        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd);
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {
