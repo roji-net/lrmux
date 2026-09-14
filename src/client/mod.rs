@@ -65,6 +65,7 @@ pub fn run(
     socket_path: &std::path::Path,
     new_session: Option<Option<String>>,
     select_session: Option<String>,
+    command: Option<String>,
 ) -> io::Result<()> {
     // Connect to the server.
     let mut stream = ipc::connect(socket_path)?;
@@ -150,7 +151,19 @@ pub fn run(
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd });
+        let msg = proto::encode_client(&ClientMsg::NewSession {
+            name,
+            cwd,
+            command: command.clone(),
+        });
+        proto::send(&mut stream, &msg)?;
+    } else if let Some(ref cmd) = command {
+        // Not creating a new session, but a command was specified.
+        // Create a new window with that command.
+        let msg = proto::encode_client(&ClientMsg::NewWindowIn {
+            session: None,
+            command: Some(cmd.clone()),
+        });
         proto::send(&mut stream, &msg)?;
     }
     // If requested, switch to an existing session by name.
@@ -904,6 +917,7 @@ fn process_prefix(
                             &ClientMsg::NewSession {
                                 name: None,
                                 cwd: None,
+                                command: None,
                             },
                         )?;
                     }

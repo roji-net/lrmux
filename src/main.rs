@@ -38,10 +38,17 @@ fn main() {
 enum CliAction {
     /// Default: show the selector (or auto-join if exactly one server/session).
     Default,
+    /// `lrmux -- <cmd>`: create a new window running <cmd> (non-interactive when nested).
+    RunCommand(String),
     /// `session-selector` / `ss`: force the interactive selector (no auto-join).
     SessionSelector,
-    /// `new-session [name]`: connect to default server, create a new session, attach to it.
-    NewSession(Option<String>),
+    /// `new-session [name] [-- cmd]`: connect to default server, create a new session, attach to it.
+    NewSession {
+        name: Option<String>,
+        command: Option<String>,
+    },
+    /// `select-session <name>`: switch the interactive client to a session.
+    SelectSession(String),
     /// `new-server [name]`: start a new server with the given name (or "default").
     NewServer(String),
     /// `ls-servers`: list all running servers.
@@ -67,7 +74,7 @@ enum CliAction {
         server: String,
         session: Option<String>,
         window: Option<u8>,
-        keys: String,
+        keys: Vec<u8>,
         quiet: bool,
     },
     /// `--help` / `-h`: show usage.
@@ -84,9 +91,11 @@ fn print_help() {
          \n\
          COMMANDS:\n    \
          lrmux                  Attach to a session (selector if multiple exist)\n    \
+         lrmux -- <cmd> [args]  Create a new window running <cmd> and attach\n    \
          lrmux session-selector  Force the interactive session selector\n    \
          lrmux ss               Alias for session-selector\n    \
-         lrmux new-session [N]   Create a new session on the default server\n    \
+         lrmux new-session [N] [-- cmd]  Create a new session (optionally running cmd)\n    \
+         lrmux select-session <N>  Switch the interactive client to a session\n    \
          lrmux new-server [N]    Start a new named server\n    \
          lrmux ls-servers        List running servers\n    \
          lrmux ls-sessions [S]   List sessions on a server (default: default)\n    \
@@ -94,6 +103,8 @@ fn print_help() {
          lrmux new-window [T] [CMD]  Create a new window (T = [server]:[session])\n    \
          lrmux capture-window [T]    Capture window content (T = [server]:[session]:window)\n    \
          lrmux send-keys [T] [KEYS]  Send keys to a window (T = [server]:[session]:window)\n    \
+         lrmux send-keys [T] C-c     Send Ctrl-C (tmux-style: C-a, F1-F12, Enter, etc.)\n    \
+         lrmux send-keys [T] -q [KEYS]  Quiet mode (no stderr output)\n    \
          lrmux --help, -h        Show this help message\n\
          \n\
          NESTED USAGE:\n    \
@@ -139,8 +150,20 @@ fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("--help") | Some("-h") => CliAction::Help,
+        Some("--") => {
+            // `lrmux -- <cmd> [args]` — run a command in a new window.
+            let cmd = args[2..].join(" ");
+            if cmd.is_empty() {
+                CliAction::Help
+            } else {
+                CliAction::RunCommand(cmd)
+            }
+        }
         Some("session-selector") | Some("ss") => CliAction::SessionSelector,
-        Some("new-session") => CliAction::NewSession(args.get(2).cloned()),
+        Some("new-session") => parse_new_session(&args[2..]),
+        Some("select-session") => {
+            CliAction::SelectSession(args.get(2).cloned().unwrap_or_default())
+        }
         Some("new-server") => {
             // Auto-generate a name if none provided (server-2, server-3, ...).
             let name = args
@@ -217,6 +240,116 @@ fn parse_target(s: &str) -> Target {
             window: None,
         },
     }
+}
+
+/// Parse `new-session` args: optional name, optional `-- command`.
+/// Examples:
+///   new-session              → NewSession { name: None, command: None }
+///   new-session foo          → NewSession { name: Some("foo"), command: None }
+///   new-session -- htop      → NewSession { name: None, command: Some("htop") }
+///   new-session foo -- htop  → NewSession { name: Some("foo"), command: Some("htop") }
+fn parse_new_session(args: &[String]) -> CliAction {
+    let mut name: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--" {
+            // Everything after `--` is the command.
+            let cmd = args[i + 1..].join(" ");
+            if !cmd.is_empty() {
+                command = Some(cmd);
+            }
+            break;
+        }
+        // First non-`--` arg is the session name.
+        if name.is_none() {
+            name = Some(args[i].clone());
+        }
+        i += 1;
+    }
+    CliAction::NewSession { name, command }
+}
+
+/// Parse tmux-style key names into byte sequences.
+/// Supported:
+///   C-a, C-c, C-z  → Ctrl+key (0x01, 0x03, 0x1a)
+///   F1-F12         → function key escape sequences
+///   Enter          → \r
+///   Tab            → \t
+///   Escape, Esc    → \x1b
+///   Space          → ' '
+///   BS, BSpace     → \x7f
+///   Up/Down/Left/Right → arrow key escape sequences
+///   Home/End       → Home/End escape sequences
+///   PageUp/PageDown   → page up/down escape sequences
+///   Any other string  → its raw bytes (literal text)
+fn parse_tmux_keys(parts: &[String]) -> Vec<u8> {
+    let mut result = Vec::new();
+    for part in parts {
+        match part.as_str() {
+            "Enter" | "Return" => result.push(b'\r'),
+            "Tab" => result.push(b'\t'),
+            "Escape" | "Esc" => result.push(0x1b),
+            "Space" => result.push(b' '),
+            "BS" | "BSpace" => result.push(0x7f),
+            "Up" => result.extend_from_slice(b"\x1b[A"),
+            "Down" => result.extend_from_slice(b"\x1b[B"),
+            "Right" => result.extend_from_slice(b"\x1b[C"),
+            "Left" => result.extend_from_slice(b"\x1b[D"),
+            "Home" => result.extend_from_slice(b"\x1b[H"),
+            "End" => result.extend_from_slice(b"\x1b[F"),
+            "PageUp" | "PgUp" => result.extend_from_slice(b"\x1b[5~"),
+            "PageDown" | "PgDn" => result.extend_from_slice(b"\x1b[6~"),
+            "F1" => result.extend_from_slice(b"\x1bOP"),
+            "F2" => result.extend_from_slice(b"\x1bOQ"),
+            "F3" => result.extend_from_slice(b"\x1bOR"),
+            "F4" => result.extend_from_slice(b"\x1bOS"),
+            "F5" => result.extend_from_slice(b"\x1b[15~"),
+            "F6" => result.extend_from_slice(b"\x1b[17~"),
+            "F7" => result.extend_from_slice(b"\x1b[18~"),
+            "F8" => result.extend_from_slice(b"\x1b[19~"),
+            "F9" => result.extend_from_slice(b"\x1b[20~"),
+            "F10" => result.extend_from_slice(b"\x1b[21~"),
+            "F11" => result.extend_from_slice(b"\x1b[23~"),
+            "F12" => result.extend_from_slice(b"\x1b[24~"),
+            _ if part.starts_with("C-") && part.len() == 3 => {
+                let key = part.as_bytes()[2];
+                // C-@ through C-_ → 0x00 through 0x1f
+                if key.is_ascii_uppercase() {
+                    result.push(key - b'A' + 1);
+                } else if key.is_ascii_lowercase() {
+                    result.push(key - b'a' + 1);
+                } else if key == b'@' {
+                    result.push(0x00);
+                } else if key == b'[' {
+                    result.push(0x1b);
+                } else if key == b'\\' {
+                    result.push(0x1c);
+                } else if key == b']' {
+                    result.push(0x1d);
+                } else if key == b'^' {
+                    result.push(0x1e);
+                } else if key == b'_' {
+                    result.push(0x1f);
+                } else if key == b'?' {
+                    result.push(0x7f);
+                } else {
+                    // Unknown C-x, pass literally.
+                    result.extend_from_slice(part.as_bytes());
+                }
+            }
+            _ if part.starts_with("M-") && part.len() == 3 => {
+                // M-x → ESC + x (meta prefix)
+                result.push(0x1b);
+                result.push(part.as_bytes()[2]);
+            }
+            _ => {
+                // Literal text — pass as raw bytes.
+                result.extend_from_slice(part.as_bytes());
+            }
+        }
+    }
+    result
 }
 
 /// Parse `new-window` args: optional target + optional command.
@@ -354,7 +487,7 @@ fn parse_send_keys(args: &[String]) -> CliAction {
             }
         }
     }
-    let keys = key_parts.join(" ");
+    let keys = parse_tmux_keys(&key_parts);
     CliAction::SendKeys {
         server,
         session,
@@ -379,8 +512,13 @@ fn run() -> io::Result<()> {
     let nested_server = std::env::var("LRMUX_SERVER").unwrap_or_else(|_| "default".to_string());
     if nested {
         match action {
-            CliAction::Default => {
+            CliAction::Default | CliAction::RunCommand(_) => {
                 // Create a new window on the parent's server, non-interactive.
+                // RunCommand passes a command to run in the new window.
+                let command = match &action {
+                    CliAction::RunCommand(cmd) => Some(cmd.clone()),
+                    _ => None,
+                };
                 let sock = socket_path(&nested_server);
                 if !ipc::server_exists(&sock) {
                     eprintln!("lrmux: no server running; start one from outside lrmux");
@@ -402,7 +540,7 @@ fn run() -> io::Result<()> {
                 }
                 let msg = proto::encode_client(&ClientMsg::NewWindowIn {
                     session: None,
-                    command: None,
+                    command,
                 });
                 proto::send(&mut stream, &msg)?;
                 // Give the server time to process the message before closing.
@@ -410,7 +548,7 @@ fn run() -> io::Result<()> {
                 eprintln!("lrmux: new window created (use Ctrl-A n/p to switch)");
                 return Ok(());
             }
-            CliAction::NewSession(name) => {
+            CliAction::NewSession { name, command } => {
                 // Create a new session on the parent's server, non-interactive.
                 let sock = socket_path(&nested_server);
                 if !ipc::server_exists(&sock) {
@@ -434,11 +572,48 @@ fn run() -> io::Result<()> {
                 let cwd = std::env::current_dir()
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned());
-                let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd });
+                let msg = proto::encode_client(&ClientMsg::NewSession {
+                    name: name.clone(),
+                    cwd,
+                    command,
+                });
                 proto::send(&mut stream, &msg)?;
-                // Give the server time to process the message before closing.
+                // Send SelectSession so the server switches the interactive client.
+                if let Some(ref name) = name {
+                    let msg =
+                        proto::encode_client(&ClientMsg::SelectSession { name: name.clone() });
+                    proto::send(&mut stream, &msg)?;
+                }
+                // Give the server time to process the messages before closing.
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new session created (use Ctrl-A N/P to switch)");
+                return Ok(());
+            }
+            CliAction::SelectSession(name) => {
+                // Switch the interactive client to a different session.
+                let sock = socket_path(&nested_server);
+                if !ipc::server_exists(&sock) {
+                    eprintln!("lrmux: no server running; start one from outside lrmux");
+                    return Ok(());
+                }
+                let mut stream = ipc::connect(&sock)?;
+                let msg = proto::encode_client(&ClientMsg::Identify {
+                    rows: 24,
+                    cols: 80,
+                    attach: false,
+                });
+                proto::send(&mut stream, &msg)?;
+                match proto::decode_server(&mut stream) {
+                    Ok(ServerMsg::IdentifyAck { .. }) => {}
+                    _ => {
+                        eprintln!("lrmux: failed to connect to server");
+                        return Ok(());
+                    }
+                }
+                let msg = proto::encode_client(&ClientMsg::SelectSession { name: name.clone() });
+                proto::send(&mut stream, &msg)?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                eprintln!("lrmux: switched to session '{name}'");
                 return Ok(());
             }
             CliAction::NewServer(_) | CliAction::SessionSelector => {
@@ -475,10 +650,10 @@ fn run() -> io::Result<()> {
             print_help();
             Ok(())
         }
-        CliAction::NewSession(name) => {
+        CliAction::NewSession { name, command } => {
             // Connect to the default server (must already be running).
             let sock = socket_path("default");
-            match client::run(&sock, Some(name), None) {
+            match client::run(&sock, Some(name), None, command) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -490,6 +665,43 @@ fn run() -> io::Result<()> {
                 )),
                 Err(e) => Err(e),
             }
+        }
+        CliAction::SelectSession(name) => {
+            // Non-interactive: send SelectSession to the default server.
+            let sock = socket_path("default");
+            if !ipc::server_exists(&sock) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no server running"));
+            }
+            let mut stream = ipc::connect(&sock)?;
+            let msg = proto::encode_client(&ClientMsg::Identify {
+                rows: 24,
+                cols: 80,
+                attach: false,
+            });
+            proto::send(&mut stream, &msg)?;
+            match proto::decode_server(&mut stream) {
+                Ok(ServerMsg::IdentifyAck { .. }) => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "failed to connect to server",
+                    ));
+                }
+            }
+            let msg = proto::encode_client(&ClientMsg::SelectSession { name });
+            proto::send(&mut stream, &msg)?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            eprintln!("lrmux: switched to session");
+            Ok(())
+        }
+        CliAction::RunCommand(cmd) => {
+            // Outside lrmux: start a new server if needed, create a window with the command, attach.
+            let sock = socket_path("default");
+            if !ipc::server_exists(&sock) {
+                return start_new_server("default", Some(None));
+            }
+            // Server exists: create a new window with the command and attach.
+            client::run(&sock, None, None, Some(cmd))
         }
         CliAction::NewServer(name) => start_new_server(&name, None),
         CliAction::Default => run_default(),
@@ -523,7 +735,7 @@ fn run_default() -> io::Result<()> {
         Ok(SelectorResult::Attach { server, session }) => {
             // Attach to the selected server and switch to the selected session.
             let sock = socket_path(&server);
-            client::run(&sock, None, Some(session))
+            client::run(&sock, None, Some(session), None)
         }
         Ok(SelectorResult::NewSession { server, name }) => {
             let sock = socket_path(&server);
@@ -531,7 +743,7 @@ fn run_default() -> io::Result<()> {
                 // Server doesn't exist — start it first.
                 start_new_server(&server, None)?;
             }
-            client::run(&sock, Some(name), None)
+            client::run(&sock, Some(name), None, None)
         }
         Ok(SelectorResult::NewServer { name }) => start_new_server(&name, None),
         Ok(SelectorResult::Quit) => Ok(()),
@@ -547,7 +759,7 @@ fn run_default() -> io::Result<()> {
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
-            client::run(&sock, None, None)
+            client::run(&sock, None, None, None)
         }
     }
 }
@@ -557,14 +769,14 @@ fn run_session_selector() -> io::Result<()> {
     match client::selector::run_selector_forced() {
         Ok(SelectorResult::Attach { server, session }) => {
             let sock = socket_path(&server);
-            client::run(&sock, None, Some(session))
+            client::run(&sock, None, Some(session), None)
         }
         Ok(SelectorResult::NewSession { server, name }) => {
             let sock = socket_path(&server);
             if !ipc::server_exists(&sock) {
                 start_new_server(&server, None)?;
             }
-            client::run(&sock, Some(name), None)
+            client::run(&sock, Some(name), None, None)
         }
         Ok(SelectorResult::NewServer { name }) => start_new_server(&name, None),
         Ok(SelectorResult::Quit) => Ok(()),
@@ -579,7 +791,7 @@ fn run_session_selector() -> io::Result<()> {
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
-            client::run(&sock, None, None)
+            client::run(&sock, None, None, None)
         }
     }
 }
@@ -606,7 +818,7 @@ fn start_new_server(name: &str, new_session: Option<Option<String>>) -> io::Resu
     wait_for_server(&sock)?;
     eprintln!("lrmux: server '{name}' ready.");
 
-    client::run(&sock, new_session, None)
+    client::run(&sock, new_session, None, None)
 }
 
 /// List all running servers.
@@ -784,7 +996,7 @@ fn cli_send_keys(
     server: &str,
     session: Option<String>,
     window: Option<u8>,
-    keys: &str,
+    keys: &[u8],
     quiet: bool,
 ) -> io::Result<()> {
     let sock = socket_path(server);
@@ -817,14 +1029,14 @@ fn cli_send_keys(
             "lrmux: send-keys: server={server} session={:?} window={:?} keys={:?} ({} bytes)",
             session,
             window,
-            keys,
+            String::from_utf8_lossy(keys),
             keys.len()
         );
     }
     let msg = proto::encode_client(&ClientMsg::SendKeys {
         session,
         window,
-        keys: keys.as_bytes().to_vec(),
+        keys: keys.to_vec(),
     });
     proto::send(&mut stream, &msg)?;
     // Give the server time to process the message before we close the socket.

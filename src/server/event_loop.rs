@@ -25,10 +25,12 @@ struct ClientConn {
     session_idx: usize,
     /// This client's active window index within its session (per-client, not shared).
     active_window: usize,
+    /// Whether this is an interactive (attached) client or a short-lived CLI client.
+    attach: bool,
 }
 
 impl ClientConn {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: UnixStream, attach: bool) -> Self {
         let fd = stream.as_raw_fd();
         Self {
             stream,
@@ -36,6 +38,7 @@ impl ClientConn {
             buf: Vec::new(),
             session_idx: 0,
             active_window: 0,
+            attach,
         }
     }
 }
@@ -477,7 +480,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::NewSession { name, cwd } => {
+                                    ClientMsg::NewSession { name, cwd, command } => {
                                         // Use the CWD from the client message if provided
                                         // (e.g. from `lrmux new-session` CLI). Otherwise,
                                         // fall back to the CWD of the active window's child.
@@ -525,10 +528,39 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         crate::log::info(&format!(
                                             "new session '{new_name}' created (index {new_si})"
                                         ));
-                                        clients[client_idx].session_idx = new_si;
-                                        clients[client_idx].active_window = 0;
-                                        if !need_snapshot.contains(&client_idx) {
-                                            need_snapshot.push(client_idx);
+                                        // If a command was specified, replace the
+                                        // default shell window with a window running
+                                        // that command.
+                                        if let Some(ref cmd) = command {
+                                            let win = Window::new_with_command(
+                                                grid_rows,
+                                                grid_cols,
+                                                default_window_name(),
+                                                cmd,
+                                            );
+                                            // Replace the first window (default shell)
+                                            // with the command window.
+                                            sessions[new_si].windows[0] = win;
+                                        }
+                                        // Switch the sending client to the new session.
+                                        if clients[client_idx].attach {
+                                            clients[client_idx].session_idx = new_si;
+                                            clients[client_idx].active_window = 0;
+                                            if !need_snapshot.contains(&client_idx) {
+                                                need_snapshot.push(client_idx);
+                                            }
+                                        }
+                                        // Also switch all other attached clients
+                                        // (auto-switch to new session).
+                                        for (ci, c) in clients.iter_mut().enumerate() {
+                                            if ci != client_idx
+                                                && c.attach
+                                                && !need_snapshot.contains(&ci)
+                                            {
+                                                c.session_idx = new_si;
+                                                c.active_window = 0;
+                                                need_snapshot.push(ci);
+                                            }
                                         }
                                         need_status_bar_all = true;
                                     }
@@ -560,12 +592,30 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         if let Some(idx) =
                                             sessions.iter().position(|s| s.name == name)
                                         {
-                                            clients[client_idx].session_idx = idx;
-                                            clients[client_idx].active_window = 0;
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
+                                            if clients[client_idx].attach {
+                                                // Interactive client: switch just this one.
+                                                clients[client_idx].session_idx = idx;
+                                                clients[client_idx].active_window = 0;
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                            } else {
+                                                // CLI client: switch all attached clients.
+                                                for (ci, c) in clients.iter_mut().enumerate() {
+                                                    if c.attach {
+                                                        c.session_idx = idx;
+                                                        c.active_window = 0;
+                                                        if !need_snapshot.contains(&ci) {
+                                                            need_snapshot.push(ci);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             need_status_bar_all = true;
+                                        } else {
+                                            crate::log::warn(&format!(
+                                                "SelectSession: session '{name}' not found"
+                                            ));
                                         }
                                     }
                                     ClientMsg::KillSession => {
@@ -850,7 +900,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                     ));
                                 }
                             }
-                            ClientMsg::NewSession { name, cwd } => {
+                            ClientMsg::NewSession { name, cwd, command } => {
                                 let cwd_full = cwd.or_else(|| {
                                     let si = clients[client_idx].session_idx;
                                     let wi = clients[client_idx].active_window;
@@ -882,11 +932,30 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                     None => Session::new(session_name, grid_rows, grid_cols),
                                 };
                                 sessions.push(session);
+                                let new_si = sessions.len() - 1;
+                                // If a command was specified, replace the default
+                                // shell window with a command window.
+                                if let Some(ref cmd) = command {
+                                    let win = Window::new_with_command(
+                                        grid_rows,
+                                        grid_cols,
+                                        default_window_name(),
+                                        cmd,
+                                    );
+                                    sessions[new_si].windows[0] = win;
+                                }
+                                // Auto-switch all attached clients to the new session.
+                                for c in &mut *clients {
+                                    if c.attach {
+                                        c.session_idx = new_si;
+                                        c.active_window = 0;
+                                    }
+                                }
                                 need_status_bar_all = true;
                                 crate::log::info(&format!(
                                     "new session '{}' created (index {}, from POLLHUP)",
                                     sessions.last().unwrap().name,
-                                    sessions.len() - 1
+                                    new_si
                                 ));
                             }
                             ClientMsg::SendKeys {
@@ -926,6 +995,24 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             wi
                                         ));
                                     }
+                                }
+                            }
+                            ClientMsg::SelectSession { name } => {
+                                if let Some(idx) = sessions.iter().position(|s| s.name == name) {
+                                    for c in &mut *clients {
+                                        if c.attach {
+                                            c.session_idx = idx;
+                                            c.active_window = 0;
+                                        }
+                                    }
+                                    need_status_bar_all = true;
+                                    crate::log::info(&format!(
+                                        "SelectSession: switched to '{name}' (from POLLHUP)"
+                                    ));
+                                } else {
+                                    crate::log::warn(&format!(
+                                        "SelectSession: session '{name}' not found (from POLLHUP)"
+                                    ));
                                 }
                             }
                             _ => {
@@ -1260,7 +1347,7 @@ fn handshake_first_client(
     });
     proto::send(&mut client, &status)?;
 
-    let mut conn = ClientConn::new(client);
+    let mut conn = ClientConn::new(client, true);
     conn.session_idx = 0;
     conn.active_window = 0;
 
@@ -1352,7 +1439,7 @@ fn accept_new_client(
                 }
             }
 
-            let mut conn = ClientConn::new(stream);
+            let mut conn = ClientConn::new(stream, attach);
             conn.session_idx = session_idx;
             conn.active_window = active;
             crate::log::info(&format!(
@@ -1511,7 +1598,8 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x09 => ClientMsg::KillPane,
         0x0a => {
-            // NewSession: name flag + optional name, then cwd flag + optional cwd
+            // NewSession: name flag + optional name, then cwd flag + optional cwd,
+            // then command flag + optional command.
             if data.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1561,11 +1649,36 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                         "NewSession cwd truncated",
                     ));
                 }
+                let c = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+                pos += len;
+                Some(c)
+            } else {
+                pos += 1; // skip the 0 flag
+                None
+            };
+            let command = if pos < data.len() && data[pos] != 0 {
+                pos += 1;
+                if data.len() < pos + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession command needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                pos += 4;
+                if data.len() < pos + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession command truncated",
+                    ));
+                }
                 Some(String::from_utf8_lossy(&data[pos..pos + len]).into_owned())
             } else {
                 None
             };
-            ClientMsg::NewSession { name, cwd }
+            ClientMsg::NewSession { name, cwd, command }
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,

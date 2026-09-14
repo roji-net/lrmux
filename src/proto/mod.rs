@@ -35,6 +35,7 @@ pub enum ClientMsg {
     NewSession {
         name: Option<String>,
         cwd: Option<String>,
+        command: Option<String>,
     },
     /// Switch to next session.
     NextSession,
@@ -194,7 +195,7 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::KillPane => {
             payload.push(C_KILL_PANE);
         }
-        ClientMsg::NewSession { name, cwd } => {
+        ClientMsg::NewSession { name, cwd, command } => {
             payload.push(C_NEW_SESSION);
             match name {
                 Some(n) => {
@@ -205,6 +206,14 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
                 None => payload.push(0),
             }
             match cwd {
+                Some(c) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(c.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match command {
                 Some(c) => {
                     payload.push(1);
                     payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
@@ -523,7 +532,14 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             } else {
                 None
             };
-            Ok(ClientMsg::NewSession { name, cwd })
+            let has_cmd = read_u8(&mut r)?;
+            let command = if has_cmd != 0 {
+                let len = read_u32(&mut r)? as usize;
+                Some(String::from_utf8_lossy(&r[..len]).into_owned())
+            } else {
+                None
+            };
+            Ok(ClientMsg::NewSession { name, cwd, command })
         }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
