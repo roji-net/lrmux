@@ -13,7 +13,8 @@ use crate::grid::{Attr, Cell, Color};
 #[derive(Debug)]
 pub enum ClientMsg {
     /// Initial handshake: client terminal size.
-    Identify { rows: u16, cols: u16 },
+    /// `attach: false` for CLI commands (no snapshot needed).
+    Identify { rows: u16, cols: u16, attach: bool },
     /// Raw keystrokes from the client's stdin → forward to PTY.
     PaneInput { data: Vec<u8> },
     /// Client terminal resized.
@@ -159,10 +160,11 @@ const S_LOG_CONTENT: u8 = 0x19;
 pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
     let mut payload = Vec::new();
     match msg {
-        ClientMsg::Identify { rows, cols } => {
+        ClientMsg::Identify { rows, cols, attach } => {
             payload.push(C_IDENTIFY);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
+            payload.push(if *attach { 1 } else { 0 });
         }
         ClientMsg::PaneInput { data } => {
             payload.push(C_PANE_INPUT);
@@ -488,7 +490,8 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         C_IDENTIFY => {
             let rows = read_u16(&mut r)?;
             let cols = read_u16(&mut r)?;
-            Ok(ClientMsg::Identify { rows, cols })
+            let attach = r.first().copied().unwrap_or(1) != 0;
+            Ok(ClientMsg::Identify { rows, cols, attach })
         }
         C_PANE_INPUT => Ok(ClientMsg::PaneInput { data: r.to_vec() }),
         C_RESIZE => {

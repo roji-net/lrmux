@@ -385,7 +385,11 @@ fn run() -> io::Result<()> {
                     return Ok(());
                 }
                 let mut stream = ipc::connect(&sock)?;
-                let msg = proto::encode_client(&ClientMsg::Identify { rows: 24, cols: 80 });
+                let msg = proto::encode_client(&ClientMsg::Identify {
+                    rows: 24,
+                    cols: 80,
+                    attach: false,
+                });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
                     Ok(ServerMsg::IdentifyAck { .. }) => {}
@@ -410,7 +414,11 @@ fn run() -> io::Result<()> {
                     return Ok(());
                 }
                 let mut stream = ipc::connect(&sock)?;
-                let msg = proto::encode_client(&ClientMsg::Identify { rows: 24, cols: 80 });
+                let msg = proto::encode_client(&ClientMsg::Identify {
+                    rows: 24,
+                    cols: 80,
+                    attach: false,
+                });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
                     Ok(ServerMsg::IdentifyAck { .. }) => {}
@@ -698,7 +706,11 @@ fn cli_new_window(
     let mut stream = ipc::connect(&sock)?;
     // Send Identify first (required by the protocol).
     let (rows, cols) = (24u16, 80u16);
-    let msg = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    let msg = proto::encode_client(&ClientMsg::Identify {
+        rows,
+        cols,
+        attach: false,
+    });
     proto::send(&mut stream, &msg)?;
     // Wait for IdentifyAck.
     match proto::decode_server(&mut stream) {
@@ -728,7 +740,11 @@ fn cli_capture_window(server: &str, session: Option<String>, window: Option<u8>)
     }
     let mut stream = ipc::connect(&sock)?;
     let (rows, cols) = (24u16, 80u16);
-    let msg = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    let msg = proto::encode_client(&ClientMsg::Identify {
+        rows,
+        cols,
+        attach: false,
+    });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
         Ok(ServerMsg::IdentifyAck { .. }) => {}
@@ -774,7 +790,11 @@ fn cli_send_keys(
     }
     let mut stream = ipc::connect(&sock)?;
     let (rows, cols) = (24u16, 80u16);
-    let msg = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    let msg = proto::encode_client(&ClientMsg::Identify {
+        rows,
+        cols,
+        attach: false,
+    });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
         Ok(ServerMsg::IdentifyAck { .. }) => {}

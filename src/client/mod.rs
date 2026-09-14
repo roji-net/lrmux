@@ -88,7 +88,11 @@ pub fn run(
 
     // Get terminal size and send Identify.
     let (rows, cols) = terminal::get_size();
-    let identify = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    let identify = proto::encode_client(&ClientMsg::Identify {
+        rows,
+        cols,
+        attach: true,
+    });
     proto::send(&mut stream, &identify)?;
 
     // Wait for IdentifyAck to get grid dimensions.

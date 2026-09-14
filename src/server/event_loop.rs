@@ -1045,7 +1045,7 @@ fn handshake_first_client(
     let mut client = stream;
 
     let (client_rows, client_cols) = match proto::decode_client(&mut client) {
-        Ok(ClientMsg::Identify { rows, cols }) => (rows, cols),
+        Ok(ClientMsg::Identify { rows, cols, .. }) => (rows, cols),
         Ok(ClientMsg::ListSessions) => {
             // Respond with empty session list (no sessions yet) and signal retry.
             let msg = proto::encode_server(&ServerMsg::SessionList { sessions: vec![] });
@@ -1128,8 +1128,11 @@ fn accept_new_client(
         Ok((mut stream, _)) => {
             stream.set_nonblocking(false)?;
 
+            let attach;
             match proto::decode_client(&mut stream) {
-                Ok(ClientMsg::Identify { .. }) => {}
+                Ok(ClientMsg::Identify { attach: a, .. }) => {
+                    attach = a;
+                }
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
                     let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
@@ -1167,33 +1170,37 @@ fn accept_new_client(
             // New client defaults to session 0, window 0.
             let session_idx = 0usize;
             let active = 0usize;
-            if let Some(session) = sessions.get(session_idx)
-                && let Some(window) = session.windows.get(active)
-            {
-                let pane = &window.pane;
-                let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-                let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-                    rows: pane.rows,
-                    cols: pane.cols,
-                    cells: pane.snapshot(),
-                    cursor_row,
-                    cursor_col,
-                    cursor_visible,
-                });
-                if proto::send(&mut stream, &snapshot).is_err() {
-                    return Ok(());
+            // Only send snapshot + status bar to interactive clients (attach=true).
+            // CLI commands (attach=false) only need the IdentifyAck.
+            if attach {
+                if let Some(session) = sessions.get(session_idx)
+                    && let Some(window) = session.windows.get(active)
+                {
+                    let pane = &window.pane;
+                    let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+                    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+                        rows: pane.rows,
+                        cols: pane.cols,
+                        cells: pane.snapshot(),
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                    });
+                    if proto::send(&mut stream, &snapshot).is_err() {
+                        return Ok(());
+                    }
                 }
-            }
 
-            // Send status bar.
-            if let Some(session) = sessions.get(session_idx) {
-                let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
-                    session: session.name.clone(),
-                    windows: window_names(session),
-                    active: active as u16,
-                    session_count: sessions.len() as u16,
-                });
-                let _ = proto::send(&mut stream, &status);
+                // Send status bar.
+                if let Some(session) = sessions.get(session_idx) {
+                    let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
+                        session: session.name.clone(),
+                        windows: window_names(session),
+                        active: active as u16,
+                        session_count: sessions.len() as u16,
+                    });
+                    let _ = proto::send(&mut stream, &status);
+                }
             }
 
             let mut conn = ClientConn::new(stream);
@@ -1323,7 +1330,8 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             }
             let rows = u16::from_le_bytes([data[0], data[1]]);
             let cols = u16::from_le_bytes([data[2], data[3]]);
-            ClientMsg::Identify { rows, cols }
+            let attach = data.get(4).copied().unwrap_or(1) != 0;
+            ClientMsg::Identify { rows, cols, attach }
         }
         0x02 => ClientMsg::PaneInput {
             data: data.to_vec(),
