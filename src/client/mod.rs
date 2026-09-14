@@ -193,6 +193,8 @@ pub fn run(
     // replayed there is history, not new scroll-off — emitting \x1b[NS
     // would scroll the just-rendered content off the screen.
     let mut skip_terminal_scroll = false;
+    // Reason for exiting the relay loop, printed after terminal restoration.
+    let mut exit_reason: Option<String> = None;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -476,7 +478,7 @@ pub fn run(
                     if detach {
                         let msg = proto::encode_client(&ClientMsg::Detach);
                         proto::send(&mut stream, &msg)?;
-                        eprintln!("\r\nlrmux: detached.\r");
+                        exit_reason = Some("detached".to_string());
                         break;
                     }
                     if enter_copy_mode {
@@ -740,7 +742,7 @@ pub fn run(
                             }
                         }
                         ServerMsg::PaneExit { .. } => {
-                            eprintln!("\r\nlrmux: session ended (last pane exited).\r");
+                            exit_reason = Some("session ended (last pane exited)".to_string());
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
@@ -773,7 +775,7 @@ pub fn run(
                             renderer.render(&mut stdout, &mut grid)?;
                         }
                         ServerMsg::Error { msg } => {
-                            eprintln!("\r\nlrmux: server error: {msg}\r");
+                            exit_reason = Some(format!("server error: {msg}"));
                             break;
                         }
                     }
@@ -782,16 +784,17 @@ pub fn run(
                 // Server closed the connection (EOF).
                 let sock_path = socket_path.to_string_lossy();
                 if !std::path::Path::new(&*sock_path).exists() {
-                    eprintln!("\r\nlrmux: server shut down.\r");
+                    exit_reason = Some("server shut down".to_string());
                 } else {
-                    eprintln!("\r\nlrmux: server closed the connection (may have crashed).\r");
-                    eprintln!("lrmux: check log at {sock_path}.log\r");
+                    exit_reason = Some(format!(
+                        "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                    ));
                 }
                 break;
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() != io::ErrorKind::WouldBlock {
-                    eprintln!("\r\nlrmux: read error from server: {err}\r");
+                    exit_reason = Some(format!("read error from server: {err}"));
                     break;
                 }
             }
@@ -806,20 +809,20 @@ pub fn run(
             // to give the user a clue about why we disconnected.
             let sock_path = socket_path.to_string_lossy();
             if !std::path::Path::new(&*sock_path).exists() {
-                eprintln!("\r\nlrmux: server shut down (socket removed).\r");
+                exit_reason = Some("server shut down".to_string());
             } else {
-                eprintln!(
-                    "\r\nlrmux: disconnected from server (socket still present — server may have crashed).\r"
-                );
-                eprintln!(
-                    "lrmux: check log at {sock_path}.log or use `lrmux kill-server` to clean up.\r"
-                );
+                exit_reason = Some(format!(
+                    "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                ));
             }
             break;
         }
     }
 
     restore_terminal();
+    if let Some(reason) = exit_reason {
+        eprintln!("lrmux: {reason}");
+    }
     Ok(())
 }
 
