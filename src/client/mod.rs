@@ -820,6 +820,9 @@ pub fn run(
     }
 
     restore_terminal();
+    // Drop the raw mode guard before printing the exit reason so the
+    // terminal is in cooked mode (ONLCR) and newlines work normally.
+    drop(_raw_guard);
     if let Some(reason) = exit_reason {
         eprintln!("lrmux: {reason}");
     }
