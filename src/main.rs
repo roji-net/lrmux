@@ -104,7 +104,8 @@ fn print_help() {
          ENVIRONMENT:\n    \
          LRMUX_SYSLOG=host:port   Send logs to remote syslog (UDP RFC 3164)\n    \
          LRMUX_LOG_LEVEL=debug|info|warn|error   Log level (default: info)\n    \
-         LRMUX=1                  Set automatically inside lrmux panes\n\
+         LRMUX=1                  Set automatically inside lrmux panes\n    \
+         LRMUX_SERVER=name        Server name (set automatically inside lrmux panes)\n\
          \n\
          PREFIX KEY: Ctrl-A (default)\n\
          \n\
@@ -375,11 +376,12 @@ fn run() -> io::Result<()> {
     //   lrmux new-server  → still blocked (can't start a new server from inside)
     //   lrmux ss          → still blocked (needs interactive TTY)
     let nested = std::env::var("LRMUX").is_ok();
+    let nested_server = std::env::var("LRMUX_SERVER").unwrap_or_else(|_| "default".to_string());
     if nested {
         match action {
             CliAction::Default => {
-                // Create a new window on the default server, non-interactive.
-                let sock = socket_path("default");
+                // Create a new window on the parent's server, non-interactive.
+                let sock = socket_path(&nested_server);
                 if !ipc::server_exists(&sock) {
                     eprintln!("lrmux: no server running; start one from outside lrmux");
                     return Ok(());
@@ -407,8 +409,8 @@ fn run() -> io::Result<()> {
                 return Ok(());
             }
             CliAction::NewSession(name) => {
-                // Create a new session on the default server, non-interactive.
-                let sock = socket_path("default");
+                // Create a new session on the parent's server, non-interactive.
+                let sock = socket_path(&nested_server);
                 if !ipc::server_exists(&sock) {
                     eprintln!("lrmux: no server running; start one from outside lrmux");
                     return Ok(());

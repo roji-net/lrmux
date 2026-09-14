@@ -260,6 +260,11 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         let mut need_status_bar_all = false;
 
         for client_idx in 0..polled_clients {
+            // Clients may have been removed during PTY processing (write
+            // failures). Bounds-check before indexing.
+            if client_idx >= clients.len() {
+                break;
+            }
             let pf = &fds[1 + num_pty_fds + client_idx];
             if pf.revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 8192];

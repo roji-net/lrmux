@@ -8,9 +8,19 @@ mod window;
 
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::ipc;
 use crate::log;
+
+/// The server name (socket file name), set once at startup.
+/// Used by PTY spawn to set LRMUX_SERVER in the child environment.
+static SERVER_NAME: OnceLock<String> = OnceLock::new();
+
+/// Get the server name (for child process env vars).
+pub fn server_name() -> &'static str {
+    SERVER_NAME.get().map(|s| s.as_str()).unwrap_or("default")
+}
 
 /// Start the server: bind the socket, run the event loop.
 pub fn run(socket_path: &Path) -> io::Result<()> {
@@ -23,6 +33,7 @@ pub fn run(socket_path: &Path) -> io::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("default");
+    let _ = SERVER_NAME.set(server_name.to_string());
     let syslog = std::env::var("LRMUX_SYSLOG").ok().and_then(|s| {
         let parts: Vec<&str> = s.rsplitn(2, ':').collect();
         if parts.len() == 2 {
