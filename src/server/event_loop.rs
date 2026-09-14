@@ -266,6 +266,10 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                 break;
             }
             let pf = &fds[1 + num_pty_fds + client_idx];
+            crate::log::debug(&format!(
+                "client {} poll revents=0x{:x} fd={}",
+                client_idx, pf.revents, pf.fd
+            ));
             if pf.revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 8192];
                 let n = unsafe {
@@ -787,6 +791,149 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             }
             if pf.revents & (libc::POLLHUP | libc::POLLERR) != 0 && !to_remove.contains(&client_idx)
             {
+                // On POLLHUP, try one more read — the peer may have sent data
+                // before closing (e.g. CLI commands that send a message and exit).
+                let mut buf = [0u8; 8192];
+                let n = unsafe {
+                    libc::read(
+                        clients[client_idx].fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    crate::log::debug(&format!(
+                        "read {} bytes from client {} on POLLHUP",
+                        n, client_idx
+                    ));
+                    clients[client_idx]
+                        .buf
+                        .extend_from_slice(&buf[..n as usize]);
+                    // Process any complete frames before removing the client.
+                    while let Ok(Some(msg)) = try_parse_frame(&mut clients[client_idx].buf) {
+                        crate::log::debug(&format!(
+                            "client {} POLLHUP frame processed: {:?}",
+                            client_idx, msg
+                        ));
+                        // Handle simple non-attach messages that don't need
+                        // the full client context.
+                        match msg {
+                            ClientMsg::NewWindowIn { session, command } => {
+                                let si = match session {
+                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
+                                    None => {
+                                        if sessions.is_empty() {
+                                            None
+                                        } else {
+                                            Some(0)
+                                        }
+                                    }
+                                };
+                                if let Some(si) = si {
+                                    let win = match command {
+                                        Some(ref cmd) => Window::new_with_command(
+                                            grid_rows,
+                                            grid_cols,
+                                            default_window_name(),
+                                            cmd,
+                                        ),
+                                        None => {
+                                            Window::new(grid_rows, grid_cols, default_window_name())
+                                        }
+                                    };
+                                    sessions[si].windows.push(win);
+                                    need_status_bar_all = true;
+                                    crate::log::info(&format!(
+                                        "new window {} in session '{}' (from POLLHUP)",
+                                        sessions[si].windows.len() - 1,
+                                        sessions[si].name
+                                    ));
+                                }
+                            }
+                            ClientMsg::NewSession { name, cwd } => {
+                                let cwd_full = cwd.or_else(|| {
+                                    let si = clients[client_idx].session_idx;
+                                    let wi = clients[client_idx].active_window;
+                                    if si < sessions.len() && wi < sessions[si].windows.len() {
+                                        let pane = &sessions[si].windows[wi].pane;
+                                        if !pane.exited {
+                                            pty::child_cwd_full(pane.pty.child_pid)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let session_name = name.unwrap_or_else(|| match &cwd_full {
+                                    Some(cwd) => {
+                                        let base = std::path::Path::new(cwd)
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "session".to_string());
+                                        ensure_unique_session_name(&base, &sessions)
+                                    }
+                                    None => default_session_name(&sessions),
+                                });
+                                let session = match &cwd_full {
+                                    Some(cwd) => {
+                                        Session::new_in_cwd(session_name, grid_rows, grid_cols, cwd)
+                                    }
+                                    None => Session::new(session_name, grid_rows, grid_cols),
+                                };
+                                sessions.push(session);
+                                need_status_bar_all = true;
+                                crate::log::info(&format!(
+                                    "new session '{}' created (index {}, from POLLHUP)",
+                                    sessions.last().unwrap().name,
+                                    sessions.len() - 1
+                                ));
+                            }
+                            ClientMsg::SendKeys {
+                                session,
+                                window,
+                                keys,
+                            } => {
+                                crate::log::info(&format!(
+                                    "SendKeys: session={:?} window={:?} keys_len={} (from POLLHUP)",
+                                    session,
+                                    window,
+                                    keys.len()
+                                ));
+                                let si = match session {
+                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
+                                    None => Some(0),
+                                };
+                                if let Some(si) = si
+                                    && let Some(session) = sessions.get_mut(si)
+                                {
+                                    let wi = match window {
+                                        Some(w) => Some(w as usize),
+                                        None => Some(clients[client_idx].active_window),
+                                    };
+                                    if let Some(wi) = wi
+                                        && let Some(window) = session.windows.get_mut(wi)
+                                    {
+                                        let translated = translate_cursor_keys(
+                                            &keys,
+                                            window.pane.grid.app_cursor_keys,
+                                        );
+                                        let _ = window.pane.write_input(&translated);
+                                        crate::log::info(&format!(
+                                            "SendKeys: writing {} bytes to session '{}' window {}",
+                                            translated.len(),
+                                            session.name,
+                                            wi
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Other messages are ignored on POLLHUP.
+                            }
+                        }
+                    }
+                }
                 to_remove.push(client_idx);
             }
         }
@@ -1133,11 +1280,8 @@ fn accept_new_client(
         Ok((mut stream, _)) => {
             stream.set_nonblocking(false)?;
 
-            let attach;
-            match proto::decode_client(&mut stream) {
-                Ok(ClientMsg::Identify { attach: a, .. }) => {
-                    attach = a;
-                }
+            let attach = match proto::decode_client(&mut stream) {
+                Ok(ClientMsg::Identify { attach: a, .. }) => a,
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
                     let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
@@ -1161,7 +1305,7 @@ fn accept_new_client(
                     );
                     return Ok(());
                 }
-            }
+            };
 
             // Send IdentifyAck with grid dimensions.
             let ack = proto::encode_server(&ServerMsg::IdentifyAck {

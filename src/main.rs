@@ -405,6 +405,8 @@ fn run() -> io::Result<()> {
                     command: None,
                 });
                 proto::send(&mut stream, &msg)?;
+                // Give the server time to process the message before closing.
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new window created (use Ctrl-A n/p to switch)");
                 return Ok(());
             }
@@ -434,6 +436,8 @@ fn run() -> io::Result<()> {
                     .map(|p| p.to_string_lossy().into_owned());
                 let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd });
                 proto::send(&mut stream, &msg)?;
+                // Give the server time to process the message before closing.
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new session created (use Ctrl-A N/P to switch)");
                 return Ok(());
             }
