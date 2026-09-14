@@ -354,39 +354,91 @@ fn run() -> io::Result<()> {
 
     // Detect nested lrmux — running lrmux inside lrmux hangs because
     // the inner client competes for the same terminal/PTY.
-    // Allow non-interactive subcommands (ls-*, kill-server, help) but
-    // block anything that tries to attach (default, new-session, new-server).
+    // Instead of erroring, redirect to non-interactive commands:
+    //   lrmux           → create a new window (like Ctrl-A c)
+    //   lrmux new-session → create a new session (like Ctrl-A C)
+    //   lrmux new-server  → still blocked (can't start a new server from inside)
+    //   lrmux ss          → still blocked (needs interactive TTY)
     let nested = std::env::var("LRMUX").is_ok();
-    let needs_tty = matches!(
-        action,
-        CliAction::Default
-            | CliAction::SessionSelector
-            | CliAction::NewSession(_)
-            | CliAction::NewServer(_)
-    );
-    if nested && needs_tty {
-        eprintln!(
-            "lrmux: cannot attach from inside lrmux.\n\
-             \n\
-             Use prefix commands instead:\n  \
-             Ctrl-A c    New window\n  \
-             Ctrl-A C    New session\n  \
-             Ctrl-A n/p  Next/prev window\n  \
-             Ctrl-A N/P  Next/prev session\n  \
-             Ctrl-A S    Session chooser\n  \
-             Ctrl-A $    Rename session\n  \
-             Ctrl-A d    Detach\n  \
-             Ctrl-A ?    Show keybindings\n\n\
-             Non-interactive subcommands still work:\n  \
-             lrmux ls-sessions\n  \
-             lrmux ls-servers\n  \
-             lrmux new-window [target] [command]\n  \
-             lrmux capture-window [target]\n  \
-             lrmux send-keys [target] [keys]\n  \
-             lrmux kill-server [name]\n  \
-             lrmux --help"
-        );
-        return Ok(());
+    if nested {
+        match action {
+            CliAction::Default => {
+                // Create a new window on the default server, non-interactive.
+                let sock = socket_path("default");
+                if !ipc::server_exists(&sock) {
+                    eprintln!("lrmux: no server running; start one from outside lrmux");
+                    return Ok(());
+                }
+                let mut stream = ipc::connect(&sock)?;
+                let msg = proto::encode_client(&ClientMsg::Identify { rows: 24, cols: 80 });
+                proto::send(&mut stream, &msg)?;
+                match proto::decode_server(&mut stream) {
+                    Ok(ServerMsg::IdentifyAck { .. }) => {}
+                    _ => {
+                        eprintln!("lrmux: failed to connect to server");
+                        return Ok(());
+                    }
+                }
+                let msg = proto::encode_client(&ClientMsg::NewWindowIn {
+                    session: None,
+                    command: None,
+                });
+                proto::send(&mut stream, &msg)?;
+                eprintln!("lrmux: new window created (use Ctrl-A n/p to switch)");
+                return Ok(());
+            }
+            CliAction::NewSession(name) => {
+                // Create a new session on the default server, non-interactive.
+                let sock = socket_path("default");
+                if !ipc::server_exists(&sock) {
+                    eprintln!("lrmux: no server running; start one from outside lrmux");
+                    return Ok(());
+                }
+                let mut stream = ipc::connect(&sock)?;
+                let msg = proto::encode_client(&ClientMsg::Identify { rows: 24, cols: 80 });
+                proto::send(&mut stream, &msg)?;
+                match proto::decode_server(&mut stream) {
+                    Ok(ServerMsg::IdentifyAck { .. }) => {}
+                    _ => {
+                        eprintln!("lrmux: failed to connect to server");
+                        return Ok(());
+                    }
+                }
+                let cwd = std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd });
+                proto::send(&mut stream, &msg)?;
+                eprintln!("lrmux: new session created (use Ctrl-A N/P to switch)");
+                return Ok(());
+            }
+            CliAction::NewServer(_) | CliAction::SessionSelector => {
+                eprintln!(
+                    "lrmux: this command needs an interactive terminal.\n\
+                     \n\
+                     Use prefix commands instead:\n  \
+                     Ctrl-A c    New window\n  \
+                     Ctrl-A C    New session\n  \
+                     Ctrl-A n/p  Next/prev window\n  \
+                     Ctrl-A N/P  Next/prev session\n  \
+                     Ctrl-A S    Session chooser\n  \
+                     Ctrl-A $    Rename session\n  \
+                     Ctrl-A d    Detach\n  \
+                     Ctrl-A ?    Show keybindings\n\n\
+                     Non-interactive subcommands still work:\n  \
+                     lrmux ls-sessions\n  \
+                     lrmux ls-servers\n  \
+                     lrmux new-window [target] [command]\n  \
+                     lrmux capture-window [target]\n  \
+                     lrmux send-keys [target] [keys]\n  \
+                     lrmux kill-server [name]\n  \
+                     lrmux --help"
+                );
+                return Ok(());
+            }
+            // Non-interactive subcommands pass through.
+            _ => {}
+        }
     }
 
     match action {
