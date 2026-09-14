@@ -321,13 +321,13 @@ impl Grid {
             return;
         }
 
+        // Rotate the region [cursor..scroll_bottom] right by n.
+        // This brings the bottom n rows to the top of the region.
+        self.rows[cursor..self.scroll_bottom].rotate_right(n);
+        // Blank the first n rows of the region (the newly inserted blanks).
         let blank_row = vec![Cell::blank(); self.cols];
-        for _ in 0..n {
-            self.rows.insert(cursor, blank_row.clone());
-        }
-        // Remove the extra rows from the bottom of the scroll region.
-        for _ in 0..n {
-            self.rows.remove(self.scroll_bottom - 1);
+        for i in 0..n {
+            self.rows[cursor + i] = blank_row.clone();
         }
 
         for i in cursor..self.scroll_bottom {
@@ -348,12 +348,13 @@ impl Grid {
             return;
         }
 
-        for _ in 0..n {
-            self.rows.remove(cursor);
-        }
+        // Rotate the region [cursor..scroll_bottom] left by n.
+        // This brings rows after cursor up by n positions.
+        self.rows[cursor..self.scroll_bottom].rotate_left(n);
+        // Blank the last n rows of the region (the newly freed space).
         let blank_row = vec![Cell::blank(); self.cols];
-        for _ in 0..n {
-            self.rows.insert(self.scroll_bottom - 1, blank_row.clone());
+        for i in 0..n {
+            self.rows[self.scroll_bottom - 1 - i] = blank_row.clone();
         }
 
         for i in cursor..self.scroll_bottom {

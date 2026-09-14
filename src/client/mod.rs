@@ -427,6 +427,13 @@ pub fn run(
                     )?;
                     if show_help {
                         show_help_overlay();
+                        // Invalidate the renderer so the screen is fully redrawn.
+                        renderer.invalidate();
+                        // Re-establish the scroll region and re-render.
+                        let view_rows = term_rows.saturating_sub(1);
+                        let mut stdout = io::stdout();
+                        write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
+                        renderer.render(&mut stdout, &mut grid)?;
                     }
                     if request_session_chooser {
                         pending_session_chooser = true;
@@ -727,11 +734,24 @@ pub fn run(
                                     });
                                     let _ = proto::send(&mut stream, &msg);
                                 }
+                                // Invalidate the renderer so the screen is fully redrawn.
+                                renderer.invalidate();
+                                let view_rows = term_rows.saturating_sub(1);
+                                let mut stdout = io::stdout();
+                                write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
+                                renderer.render(&mut stdout, &mut grid)?;
                             }
                         }
                         ServerMsg::WindowCapture { .. } => {}
                         ServerMsg::LogContent { lines } => {
                             show_log_overlay(&lines);
+                            // Invalidate the renderer so the screen is fully redrawn.
+                            renderer.invalidate();
+                            // Re-establish the scroll region and re-render.
+                            let view_rows = term_rows.saturating_sub(1);
+                            let mut stdout = io::stdout();
+                            write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
+                            renderer.render(&mut stdout, &mut grid)?;
                         }
                         ServerMsg::Error { msg } => {
                             eprintln!("\r\nlrmux: server error: {msg}\r");

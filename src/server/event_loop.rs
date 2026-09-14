@@ -271,6 +271,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                     )
                 };
                 if n > 0 {
+                    crate::log::debug(&format!("read {} bytes from client {}", n, client_idx));
                     clients[client_idx]
                         .buf
                         .extend_from_slice(&buf[..n as usize]);
@@ -1110,6 +1111,8 @@ fn handshake_first_client(
     let mut conn = ClientConn::new(client);
     conn.session_idx = 0;
     conn.active_window = 0;
+    // Set the stream to non-blocking for the poll loop.
+    let _ = conn.stream.set_nonblocking(true);
 
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
@@ -1198,6 +1201,11 @@ fn accept_new_client(
             let mut conn = ClientConn::new(stream);
             conn.session_idx = session_idx;
             conn.active_window = active;
+            // Set the stream back to non-blocking for the poll loop.
+            // It was set to blocking for the handshake (proto::decode_client
+            // uses read_exact which needs blocking mode), but the poll loop
+            // uses libc::read which must not block.
+            let _ = conn.stream.set_nonblocking(true);
             crate::log::info(&format!(
                 "client connected: session_idx={session_idx}, window={active}, total clients={}",
                 clients.len() + 1
