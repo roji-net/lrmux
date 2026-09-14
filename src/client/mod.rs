@@ -476,6 +476,7 @@ pub fn run(
                     if detach {
                         let msg = proto::encode_client(&ClientMsg::Detach);
                         proto::send(&mut stream, &msg)?;
+                        eprintln!("\r\nlrmux: detached.\r");
                         break;
                     }
                     if enter_copy_mode {
@@ -739,6 +740,7 @@ pub fn run(
                             }
                         }
                         ServerMsg::PaneExit { .. } => {
+                            eprintln!("\r\nlrmux: session ended (last pane exited).\r");
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
@@ -777,19 +779,42 @@ pub fn run(
                     }
                 }
             } else if n == 0 {
+                // Server closed the connection (EOF).
+                let sock_path = socket_path.to_string_lossy();
+                if !std::path::Path::new(&*sock_path).exists() {
+                    eprintln!("\r\nlrmux: server shut down.\r");
+                } else {
+                    eprintln!("\r\nlrmux: server closed the connection (may have crashed).\r");
+                    eprintln!("lrmux: check log at {sock_path}.log\r");
+                }
                 break;
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() != io::ErrorKind::WouldBlock {
+                    eprintln!("\r\nlrmux: read error from server: {err}\r");
                     break;
                 }
             }
         }
 
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            // stdin closed — terminal gone, just exit.
             break;
         }
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            // Server socket hung up. Check if the server is still alive
+            // to give the user a clue about why we disconnected.
+            let sock_path = socket_path.to_string_lossy();
+            if !std::path::Path::new(&*sock_path).exists() {
+                eprintln!("\r\nlrmux: server shut down (socket removed).\r");
+            } else {
+                eprintln!(
+                    "\r\nlrmux: disconnected from server (socket still present — server may have crashed).\r"
+                );
+                eprintln!(
+                    "lrmux: check log at {sock_path}.log or use `lrmux kill-server` to clean up.\r"
+                );
+            }
             break;
         }
     }
