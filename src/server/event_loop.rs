@@ -6,8 +6,6 @@
 // A status bar (1 row) is reserved at the bottom of the client terminal.
 
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
@@ -18,7 +16,7 @@ use crate::server::window::Window;
 
 /// A connected client.
 struct ClientConn {
-    stream: UnixStream,
+    stream: crate::ipc::ConnStream,
     fd: i32,
     buf: Vec<u8>,
     /// Which session this client is attached to.
@@ -30,7 +28,7 @@ struct ClientConn {
 }
 
 impl ClientConn {
-    fn new(stream: UnixStream, attach: bool) -> Self {
+    fn new(stream: crate::ipc::ConnStream, attach: bool) -> Self {
         let fd = stream.as_raw_fd();
         Self {
             stream,
@@ -48,49 +46,68 @@ impl ClientConn {
 /// Phase 4: multiple sessions, multiple windows, multiple clients, prefix-key commands.
 /// Each client has its own active session and active window. The server persists until
 /// all sessions are closed.
-pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<()> {
-    // Wait for the first client to determine terminal size.
-    // Retry on bad connections (e.g. ListSessions queries from the selector,
-    // or connections that send unexpected data).
-    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = loop {
-        let (stream, _) = listener.accept()?;
-        match handshake_first_client(stream) {
-            Ok(result) => break result,
-            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                // KillServer received during initial handshake — shut down.
-                crate::log::info("KillServer during initial handshake, shutting down");
-                ipc::cleanup(socket_path);
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!(
-                    "lrmux server: initial handshake failed ({e}), waiting for next client..."
-                );
-                continue;
+pub fn run(
+    listeners: Vec<crate::ipc::ConnListener>,
+    socket_path: &std::path::Path,
+    headless: bool,
+) -> io::Result<()> {
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
+        // Headless mode: create a default session (24x80) without waiting
+        // for the first client. Used by `lrmux start-server` for testing
+        // and remote management.
+        let session_name = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "session".to_string());
+        let session = Session::new(session_name, 24, 80);
+        crate::log::info("server started in headless mode (24x80)");
+        (24u16, 80u16, vec![session], vec![])
+    } else {
+        // Normal mode: wait for the first client to determine terminal size.
+        // Retry on bad connections (e.g. ListSessions queries from the selector,
+        // or connections that send unexpected data).
+        loop {
+            // Accept from any listener (Unix or TCP).
+            let stream = accept_from_any(&listeners)?;
+            match handshake_first_client(stream) {
+                Ok(result) => break result,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                    crate::log::info("KillServer during initial handshake, shutting down");
+                    ipc::cleanup(socket_path);
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lrmux server: initial handshake failed ({e}), waiting for next client..."
+                    );
+                    continue;
+                }
             }
         }
     };
 
-    // Set listener to non-blocking so we can poll it alongside clients.
-    listener.set_nonblocking(true)?;
-    let listener_fd = listener.as_raw_fd();
+    // Set all listeners to non-blocking so we can poll them alongside clients.
+    for l in &listeners {
+        l.set_nonblocking(true)?;
+    }
+    let listener_fds: Vec<i32> = listeners.iter().map(|l| l.as_raw_fd()).collect();
 
     // Periodic state save counter (save every ~1000 iterations ≈ 10s).
     let mut iter_count: u32 = 0;
 
     loop {
-        // Build pollfd array: listener + all window PTY fds (across all sessions) + all client fds.
-        // We need a mapping from pollfd index to (session_idx, window_idx).
+        // Build pollfd array: listeners + all window PTY fds + all client fds.
         let mut pty_map: Vec<(usize, usize)> = Vec::new();
-        let mut fds = Vec::with_capacity(1 + 64 + clients.len());
-        fds.push(libc::pollfd {
-            fd: listener_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        let mut fds = Vec::with_capacity(listener_fds.len() + 64 + clients.len());
+        for &lfd in &listener_fds {
+            fds.push(libc::pollfd {
+                fd: lfd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         for (si, session) in sessions.iter().enumerate() {
             for (wi, w) in session.windows.iter().enumerate() {
-                // Skip exited panes — their child is dead, no more PTY output.
                 if w.pane.is_exited() {
                     continue;
                 }
@@ -122,23 +139,31 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
 
         let polled_clients = clients.len();
 
-        // Listener readable → accept new client.
-        if fds[0].revents & libc::POLLIN != 0 {
-            match accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                    // KillServer received — shut down gracefully.
-                    crate::log::info("KillServer received, shutting down");
-                    kill_all_children(&sessions);
-                    state::save_state(socket_path, &sessions);
-                    broadcast_to_all(
-                        &mut clients,
-                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
-                    );
-                    ipc::cleanup(socket_path);
-                    return Ok(());
+        // Listeners readable → accept new client from any listener.
+        for (li, _lfd) in listener_fds.iter().enumerate() {
+            if fds[li].revents & libc::POLLIN != 0 {
+                match accept_new_client(
+                    &listeners[li],
+                    &sessions,
+                    grid_rows,
+                    grid_cols,
+                    &mut clients,
+                ) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                        // KillServer received — shut down gracefully.
+                        crate::log::info("KillServer received, shutting down");
+                        kill_all_children(&sessions);
+                        state::save_state(socket_path, &sessions);
+                        broadcast_to_all(
+                            &mut clients,
+                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        );
+                        ipc::cleanup(socket_path);
+                        return Ok(());
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
 
@@ -1279,7 +1304,7 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io
 /// Returns Err if the connection is not an Identify (e.g. ListSessions query or bad data).
 /// The caller should retry by accepting the next connection.
 fn handshake_first_client(
-    stream: UnixStream,
+    stream: crate::ipc::ConnStream,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = stream;
 
@@ -1357,14 +1382,14 @@ fn handshake_first_client(
 /// Accept a new client, do the handshake, and add it to the clients list.
 /// New clients default to session 0, window 0.
 fn accept_new_client(
-    listener: &UnixListener,
+    listener: &crate::ipc::ConnListener,
     sessions: &[Session],
     grid_rows: u16,
     grid_cols: u16,
     clients: &mut Vec<ClientConn>,
 ) -> io::Result<()> {
     match listener.accept() {
-        Ok((mut stream, _)) => {
+        Ok(mut stream) => {
             stream.set_nonblocking(false)?;
 
             let attach = match proto::decode_client(&mut stream) {
@@ -1913,4 +1938,39 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
     };
     Ok(Some(msg))
+}
+
+/// Accept a connection from any of the given listeners (blocking).
+/// Used during the initial handshake to wait for the first client
+/// from either a Unix or TCP listener.
+fn accept_from_any(listeners: &[crate::ipc::ConnListener]) -> io::Result<crate::ipc::ConnStream> {
+    if listeners.len() == 1 {
+        return listeners[0].accept();
+    }
+    // Poll all listener fds and accept from the first ready one.
+    let mut fds: Vec<libc::pollfd> = listeners
+        .iter()
+        .map(|l| libc::pollfd {
+            fd: l.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+        }
+        return Err(err);
+    }
+    for (i, fd) in fds.iter().enumerate() {
+        if fd.revents & libc::POLLIN != 0 {
+            return listeners[i].accept();
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "no listener ready",
+    ))
 }

@@ -33,37 +33,42 @@ impl Perform for VtHandler<'_> {
 
         // Helper to get param or default.
         let param = |idx: usize, default: u16| -> u16 { p.get(idx).copied().unwrap_or(default) };
+        // Helper for cursor movement / scroll commands where 0 means 1 (per VT spec).
+        let param1 = |idx: usize| -> u16 {
+            let v = p.get(idx).copied().unwrap_or(1);
+            if v == 0 { 1 } else { v }
+        };
 
         match action {
             // Cursor positioning
             'A' => {
                 // CUU - cursor up
-                let n = param(0, 1) as i32;
+                let n = param1(0) as i32;
                 self.grid.move_cursor_rel(-n, 0);
             }
             'B' => {
                 // CUD - cursor down
-                let n = param(0, 1) as i32;
+                let n = param1(0) as i32;
                 self.grid.move_cursor_rel(n, 0);
             }
             'C' => {
                 // CUF - cursor forward
-                let n = param(0, 1) as i32;
+                let n = param1(0) as i32;
                 self.grid.move_cursor_rel(0, n);
             }
             'D' => {
                 // CUB - cursor back
-                let n = param(0, 1) as i32;
+                let n = param1(0) as i32;
                 self.grid.move_cursor_rel(0, -n);
             }
             'E' => {
                 // CNL - cursor next line
-                let n = param(0, 1);
+                let n = param1(0);
                 self.grid.move_cursor(self.grid.cursor_row + n as usize, 0);
             }
             'F' => {
                 // CPL - cursor previous line
-                let n = param(0, 1) as usize;
+                let n = param1(0) as usize;
                 let row = self.grid.cursor_row.saturating_sub(n);
                 self.grid.move_cursor(row, 0);
             }
@@ -115,22 +120,22 @@ impl Perform for VtHandler<'_> {
             // Scroll
             'S' => {
                 // SU - scroll up
-                let n = param(0, 1) as usize;
+                let n = param1(0) as usize;
                 self.grid.scroll_up(n);
             }
             'T' => {
                 // SD - scroll down
-                let n = param(0, 1) as usize;
+                let n = param1(0) as usize;
                 self.grid.scroll_down(n);
             }
             'L' => {
                 // IL - insert lines at cursor
-                let n = param(0, 1) as usize;
+                let n = param1(0) as usize;
                 self.grid.insert_lines(n);
             }
             'M' => {
                 // DL - delete lines at cursor
-                let n = param(0, 1) as usize;
+                let n = param1(0) as usize;
                 self.grid.delete_lines(n);
             }
 

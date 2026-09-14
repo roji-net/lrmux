@@ -23,8 +23,20 @@ pub fn server_name() -> &'static str {
 }
 
 /// Start the server: bind the socket, run the event loop.
-pub fn run(socket_path: &Path) -> io::Result<()> {
-    let listener = ipc::listen(socket_path)?;
+/// If `tcp_addr` is provided, also listen on TCP.
+/// If `headless` is true, create a default session without waiting for
+/// the first client (used by `lrmux start-server`).
+pub fn run(socket_path: &Path, tcp_addr: Option<&str>, headless: bool) -> io::Result<()> {
+    let unix_listener = ipc::listen(socket_path)?;
+
+    // Build the listeners list (Unix + optional TCP).
+    let mut listeners: Vec<ipc::ConnListener> = vec![ipc::ConnListener::Unix(unix_listener)];
+    if let Some(addr) = tcp_addr {
+        let tcp_listener = ipc::listen_tcp(addr)?;
+        log::info(&format!("server also listening on TCP {addr}"));
+        eprintln!("lrmux: server listening on TCP {addr}");
+        listeners.push(ipc::ConnListener::Tcp(tcp_listener));
+    }
 
     // Initialize logging.
     let uid = unsafe { libc::getuid() };
@@ -69,7 +81,7 @@ pub fn run(socket_path: &Path) -> io::Result<()> {
     // If the event loop panics, we log it and exit with an error
     // (state file is kept for crash analysis).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_loop::run(listener, socket_path)
+        event_loop::run(listeners, socket_path, headless)
     }));
 
     match result {

@@ -21,11 +21,31 @@ mod vt;
 
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::client::selector::SelectorResult;
 use crate::ipc::socket_path;
 use crate::proto::{ClientMsg, ServerMsg};
+
+/// Global TCP address for CLI commands (--tcp <addr>).
+/// When set, CLI commands connect via TCP instead of Unix socket.
+static TCP_ADDR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Connect to a server. Uses TCP if --tcp was set, otherwise Unix socket.
+fn connect_to_server(server: &str) -> io::Result<crate::ipc::ConnStream> {
+    if let Some(addr) = TCP_ADDR.lock().unwrap().as_ref() {
+        return crate::ipc::connect_tcp(addr);
+    }
+    let sock = socket_path(server);
+    if !crate::ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("server '{server}' is not running"),
+        ));
+    }
+    crate::ipc::connect(&sock).map(crate::ipc::ConnStream::Unix)
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -51,6 +71,8 @@ enum CliAction {
     SelectSession(String),
     /// `new-server [name]`: start a new server with the given name (or "default").
     NewServer(String),
+    /// `start-server [name] [--tcp addr]`: start a headless server (no TTY needed).
+    StartServer { name: String, tcp: Option<String> },
     /// `ls-servers`: list all running servers.
     LsServers,
     /// `ls-sessions [server]`: list sessions on a server (default: "default").
@@ -97,6 +119,7 @@ fn print_help() {
          lrmux new-session [N] [-- cmd]  Create a new session (optionally running cmd)\n    \
          lrmux select-session <N>  Switch the interactive client to a session\n    \
          lrmux new-server [N]    Start a new named server\n    \
+         lrmux start-server [N] [--tcp addr]  Start a headless server (no TTY, optional TCP)\n    \
          lrmux ls-servers        List running servers\n    \
          lrmux ls-sessions [S]   List sessions on a server (default: default)\n    \
          lrmux kill-server [N]   Kill a named server (default: default)\n    \
@@ -141,13 +164,38 @@ fn print_help() {
          LOGS:\n    \
          File: /tmp/lrmux-<UID>/logs/<server>.log\n    \
          State: /tmp/lrmux-<UID>/logs/<server>.state\n    \
-         Ring log: Ctrl-A \\ (in-session, last 500 entries)"
+         Ring log: Ctrl-A \\ (in-session, last 500 entries)\n\
+         \n\
+         TCP:\n    \
+         lrmux start-server --tcp <addr>  Listen on TCP\n    \
+         lrmux --tcp <addr> <command>      Connect via TCP"
     );
 }
 
 /// Parse CLI arguments into an action.
 fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().collect();
+    // Check if the subcommand is `start-server` — if so, don't extract --tcp
+    // globally because `start-server` has its own --tcp parser.
+    let is_start_server = args.iter().any(|a| a == "start-server");
+    // Extract --tcp <addr> flag if present (global, for CLI commands).
+    let mut tcp_addr: Option<String> = None;
+    let mut filtered: Vec<String> = vec![args[0].clone()];
+    let mut i = 1;
+    while i < args.len() {
+        if !is_start_server && args[i] == "--tcp" && i + 1 < args.len() {
+            tcp_addr = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            filtered.push(args[i].clone());
+            i += 1;
+        }
+    }
+    let args = filtered;
+    // Store tcp_addr in a global for CLI commands to use.
+    if let Some(ref addr) = tcp_addr {
+        *TCP_ADDR.lock().unwrap() = Some(addr.clone());
+    }
     match args.get(1).map(|s| s.as_str()) {
         Some("--help") | Some("-h") => CliAction::Help,
         Some("--") => {
@@ -172,6 +220,7 @@ fn parse_args() -> CliAction {
                 .unwrap_or_else(ipc::auto_server_name);
             CliAction::NewServer(name)
         }
+        Some("start-server") => parse_start_server(&args[2..]),
         Some("ls-servers") => CliAction::LsServers,
         Some("ls-sessions") => {
             let server = args.get(2).map(|s| s.as_str()).unwrap_or("default");
@@ -268,6 +317,32 @@ fn parse_new_session(args: &[String]) -> CliAction {
         i += 1;
     }
     CliAction::NewSession { name, command }
+}
+
+/// Parse `start-server` args: optional name + optional --tcp addr.
+///   start-server              → StartServer { name: "default", tcp: None }
+///   start-server foo          → StartServer { name: "foo", tcp: None }
+///   start-server --tcp :9000  → StartServer { name: "default", tcp: Some(":9000") }
+///   start-server foo --tcp :9000 → StartServer { name: "foo", tcp: Some(":9000") }
+fn parse_start_server(args: &[String]) -> CliAction {
+    let mut name: Option<String> = None;
+    let mut tcp: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--tcp" && i + 1 < args.len() {
+            tcp = Some(args[i + 1].clone());
+            i += 2;
+        } else if name.is_none() {
+            name = Some(args[i].clone());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    CliAction::StartServer {
+        name: name.unwrap_or_else(|| "default".to_string()),
+        tcp,
+    }
 }
 
 /// Parse tmux-style key names into byte sequences.
@@ -704,6 +779,7 @@ fn run() -> io::Result<()> {
             client::run(&sock, None, None, Some(cmd))
         }
         CliAction::NewServer(name) => start_new_server(&name, None),
+        CliAction::StartServer { name, tcp } => start_headless_server(&name, tcp.as_deref()),
         CliAction::Default => run_default(),
         CliAction::SessionSelector => run_session_selector(),
         CliAction::LsServers => list_servers(),
@@ -755,7 +831,7 @@ fn run_default() -> io::Result<()> {
                 if sock.exists() {
                     let _ = std::fs::remove_file(&sock);
                 }
-                fork_server(&sock)?;
+                fork_server(&sock, None, false)?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
@@ -787,7 +863,7 @@ fn run_session_selector() -> io::Result<()> {
                 if sock.exists() {
                     let _ = std::fs::remove_file(&sock);
                 }
-                fork_server(&sock)?;
+                fork_server(&sock, None, false)?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
@@ -814,11 +890,40 @@ fn start_new_server(name: &str, new_session: Option<Option<String>>) -> io::Resu
     if sock.exists() {
         let _ = std::fs::remove_file(&sock);
     }
-    fork_server(&sock)?;
+    fork_server(&sock, None, false)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: server '{name}' ready.");
 
     client::run(&sock, new_session, None, None)
+}
+
+/// Start a headless server (no TTY needed). Used for testing and remote management.
+/// The server creates a default session (24x80) and waits for clients.
+fn start_headless_server(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
+    let sock = socket_path(name);
+
+    if ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("server '{name}' is already running"),
+        ));
+    }
+
+    eprintln!(
+        "lrmux: starting headless server '{name}' on {}...",
+        sock.display()
+    );
+    if let Some(ref addr) = tcp_addr {
+        eprintln!("lrmux: TCP listener: {addr}");
+    }
+    if sock.exists() {
+        let _ = std::fs::remove_file(&sock);
+    }
+    fork_server(&sock, tcp_addr, true)?;
+    wait_for_server(&sock)?;
+    eprintln!("lrmux: headless server '{name}' ready.");
+    eprintln!("lrmux: connect with `lrmux` or use CLI commands (send-keys, capture-window, etc.)");
+    Ok(())
 }
 
 /// List all running servers.
@@ -845,14 +950,7 @@ fn list_servers() -> io::Result<()> {
 
 /// List sessions on a server.
 fn list_sessions(server: &str) -> io::Result<()> {
-    let sock = socket_path(server);
-    if !ipc::server_exists(&sock) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("server '{server}' is not running"),
-        ));
-    }
-    let mut stream = ipc::connect(&sock)?;
+    let mut stream = connect_to_server(server)?;
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
@@ -877,6 +975,17 @@ fn list_sessions(server: &str) -> io::Result<()> {
 /// Kill a named server by sending a KillServer message.
 /// Falls back to removing the socket file if the server can't be reached.
 fn kill_server(name: &str) -> io::Result<()> {
+    // Try TCP first if --tcp is set.
+    if TCP_ADDR.lock().unwrap().is_some() {
+        let mut stream = connect_to_server(name)?;
+        let msg = proto::encode_client(&ClientMsg::KillServer);
+        proto::send(&mut stream, &msg)?;
+        eprintln!("lrmux: sent KillServer via TCP.");
+        std::thread::sleep(Duration::from_millis(100));
+        eprintln!("lrmux: killed server '{name}'.");
+        return Ok(());
+    }
+
     let sock = socket_path(name);
     if !sock.exists() {
         return Err(io::Error::new(
@@ -914,14 +1023,7 @@ fn cli_new_window(
     session: Option<String>,
     command: Option<String>,
 ) -> io::Result<()> {
-    let sock = socket_path(server);
-    if !ipc::server_exists(&sock) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("server '{server}' is not running"),
-        ));
-    }
-    let mut stream = ipc::connect(&sock)?;
+    let mut stream = connect_to_server(server)?;
     // Send Identify first (required by the protocol).
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
@@ -949,14 +1051,7 @@ fn cli_new_window(
 
 /// CLI: capture the content of a window.
 fn cli_capture_window(server: &str, session: Option<String>, window: Option<u8>) -> io::Result<()> {
-    let sock = socket_path(server);
-    if !ipc::server_exists(&sock) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("server '{server}' is not running"),
-        ));
-    }
-    let mut stream = ipc::connect(&sock)?;
+    let mut stream = connect_to_server(server)?;
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
         rows,
@@ -999,14 +1094,7 @@ fn cli_send_keys(
     keys: &[u8],
     quiet: bool,
 ) -> io::Result<()> {
-    let sock = socket_path(server);
-    if !ipc::server_exists(&sock) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("server '{server}' is not running"),
-        ));
-    }
-    let mut stream = ipc::connect(&sock)?;
+    let mut stream = connect_to_server(server)?;
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
         rows,
@@ -1051,7 +1139,7 @@ fn cli_send_keys(
 }
 
 /// Fork a server process. The child binds the socket and runs the event loop.
-fn fork_server(sock: &Path) -> io::Result<()> {
+fn fork_server(sock: &Path, tcp_addr: Option<&str>, headless: bool) -> io::Result<()> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
@@ -1062,7 +1150,8 @@ fn fork_server(sock: &Path) -> io::Result<()> {
             libc::setsid();
         }
         let sock = sock.to_path_buf();
-        match server::run(&sock) {
+        let tcp = tcp_addr.map(|s| s.to_string());
+        match server::run(&sock, tcp.as_deref(), headless) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("lrmux server: {e}");
