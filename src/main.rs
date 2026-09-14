@@ -96,6 +96,16 @@ fn print_help() {
          lrmux send-keys [T] [KEYS]  Send keys to a window (T = [server]:[session]:window)\n    \
          lrmux --help, -h        Show this help message\n\
          \n\
+         NESTED USAGE:\n    \
+         Running lrmux inside lrmux creates a new window (like Ctrl-A c).\n    \
+         Running `lrmux new-session` inside lrmux creates a new session (like Ctrl-A C).\n    \
+         `lrmux new-server` and `lrmux ss` need an interactive terminal.\n\
+         \n\
+         ENVIRONMENT:\n    \
+         LRMUX_SYSLOG=host:port   Send logs to remote syslog (UDP RFC 3164)\n    \
+         LRMUX_LOG_LEVEL=debug|info|warn|error   Log level (default: info)\n    \
+         LRMUX=1                  Set automatically inside lrmux panes\n\
+         \n\
          PREFIX KEY: Ctrl-A (default)\n\
          \n\
          COMMON PREFIX COMMANDS:\n    \
@@ -114,7 +124,12 @@ fn print_help() {
          Ctrl-A F    Resize to terminal\n    \
          Ctrl-A K    Kill session\n    \
          Ctrl-A \\    Show server log\n    \
-         Ctrl-A ?    Show keybindings"
+         Ctrl-A ?    Show keybindings\n\
+         \n\
+         LOGS:\n    \
+         File: /tmp/lrmux-<UID>/logs/<server>.log\n    \
+         State: /tmp/lrmux-<UID>/logs/<server>.state\n    \
+         Ring log: Ctrl-A \\ (in-session, last 500 entries)"
     );
 }
 
