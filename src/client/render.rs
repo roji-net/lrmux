@@ -188,7 +188,7 @@ impl Renderer {
 }
 
 /// Emit SGR escape sequence for the given colors and attributes.
-fn emit_sgr(buf: &mut String, fg: Color, bg: Color, attrs: Attr) {
+pub(crate) fn emit_sgr(buf: &mut String, fg: Color, bg: Color, attrs: Attr) {
     buf.push_str("\x1b[0"); // Reset first
 
     if attrs.bold {

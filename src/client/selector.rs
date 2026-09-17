@@ -49,12 +49,17 @@ fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
     let servers = discover_servers();
     let mut entries: Vec<Entry> = Vec::new();
     for server in &servers {
-        if let Ok(sessions) = query_sessions(server) {
-            for session in sessions {
-                entries.push(Entry {
-                    server: server.clone(),
-                    session,
-                });
+        match query_sessions(server) {
+            Ok(sessions) => {
+                for session in sessions {
+                    entries.push(Entry {
+                        server: server.clone(),
+                        session,
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("lrmux: server '{server}' is not responding ({e})");
             }
         }
     }
@@ -106,6 +111,9 @@ fn discover_servers() -> Vec<String> {
 fn query_sessions(server_name: &str) -> io::Result<Vec<String>> {
     let sock = ipc::socket_path(server_name);
     let mut stream = ipc::connect(&sock)?;
+    // A wedged server accepts but never responds — bound the wait so one
+    // bad server doesn't freeze the selector.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
 
     // Send ListSessions directly (no Identify needed for query).
     let msg = proto::encode_client(&ClientMsg::ListSessions);
@@ -113,11 +121,17 @@ fn query_sessions(server_name: &str) -> io::Result<Vec<String>> {
 
     // Read the SessionList response.
     match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::SessionList { sessions }) => Ok(sessions),
+        Ok(ServerMsg::SessionList {
+            sessions,
+            address: _,
+        }) => Ok(sessions),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "expected SessionList",
         )),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(io::Error::new(e.kind(), "timed out"))
+        }
         Err(e) => Err(e),
     }
 }

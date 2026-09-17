@@ -21,6 +21,13 @@ impl ConnStream {
         }
     }
 
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            ConnStream::Unix(s) => s.set_read_timeout(dur),
+            ConnStream::Tcp(s) => s.set_read_timeout(dur),
+        }
+    }
+
     pub fn as_raw_fd(&self) -> RawFd {
         match self {
             ConnStream::Unix(s) => s.as_raw_fd(),

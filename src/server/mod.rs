@@ -17,9 +17,20 @@ use crate::log;
 /// Used by PTY spawn to set LRMUX_SERVER in the child environment.
 static SERVER_NAME: OnceLock<String> = OnceLock::new();
 
+/// The server primary address (TCP if any, otherwise the Unix socket path).
+static SERVER_ADDRESS: OnceLock<String> = OnceLock::new();
+
 /// Get the server name (for child process env vars).
 pub fn server_name() -> &'static str {
     SERVER_NAME.get().map(|s| s.as_str()).unwrap_or("default")
+}
+
+/// Get the server primary address (TCP or Unix socket).
+pub fn server_address() -> &'static str {
+    SERVER_ADDRESS
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("unknown")
 }
 
 /// Start the server: bind the socket, run the event loop.
@@ -46,6 +57,11 @@ pub fn run(socket_path: &Path, tcp_addr: Option<&str>, headless: bool) -> io::Re
         .and_then(|n| n.to_str())
         .unwrap_or("default");
     let _ = SERVER_NAME.set(server_name.to_string());
+    let _ = SERVER_ADDRESS.set(
+        tcp_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| socket_path.to_string_lossy().into_owned()),
+    );
     let syslog = std::env::var("LRMUX_SYSLOG").ok().and_then(|s| {
         let parts: Vec<&str> = s.rsplitn(2, ':').collect();
         if parts.len() == 2 {
