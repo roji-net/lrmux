@@ -46,7 +46,9 @@ struct ClientConn {
     /// incremental grid/scrollback updates are skipped once outbuf passes
     /// CLIENT_SUPPRESS_HIGH. The server grid is authoritative, so instead
     /// of disconnecting we freeze the client and send a fresh snapshot +
-    /// scrollback replay once outbuf drains below CLIENT_SUPPRESS_LOW.
+    /// paced scrollback replay once outbuf drains below CLIENT_SUPPRESS_LOW.
+    /// Control clients stay suppressed until they send a command *after*
+    /// draining — auto-resume re-floods iTerm2.
     suppressed: bool,
 }
 
@@ -80,16 +82,18 @@ impl ClientConn {
 
 /// Queue bytes for a client and flush what can be written without blocking.
 /// Returns false if the client should be disconnected (write error, or the
-/// buffer grew past CLIENT_OUTBUF_CAP because the client stopped reading).
+/// buffer would grow past CLIENT_OUTBUF_CAP because the client stopped reading).
 fn client_send(client: &mut ClientConn, bytes: &[u8]) -> bool {
-    client.outbuf.extend_from_slice(bytes);
-    if client.outbuf.len() > CLIENT_OUTBUF_CAP {
+    // Refuse before extending — otherwise a single oversized enqueue (e.g.
+    // scrollback replay after a burst) trips the cap and kills the client.
+    if client.outbuf.len().saturating_add(bytes.len()) > CLIENT_OUTBUF_CAP {
         crate::log::warn(&format!(
             "client fd {} outbuf exceeded {CLIENT_OUTBUF_CAP} bytes, disconnecting",
             client.fd
         ));
         return false;
     }
+    client.outbuf.extend_from_slice(bytes);
     flush_client_outbuf(client)
 }
 
@@ -203,9 +207,10 @@ pub fn run(
                     continue;
                 }
                 pty_map.push((si, wi));
+                let pending = !w.pane.pending_input.is_empty();
                 fds.push(libc::pollfd {
                     fd: w.pty_fd(),
-                    events: libc::POLLIN,
+                    events: libc::POLLIN | if pending { libc::POLLOUT } else { 0 },
                     revents: 0,
                 });
             }
@@ -307,6 +312,19 @@ pub fn run(
                             }),
                         );
                     }
+                }
+            }
+        }
+
+        // Drain pending stdin for PTYs that are now writable. This completes
+        // writes that couldn't be done in one shot (e.g., a burst of arrow keys
+        // while the child is busy), keeping escape sequences intact.
+        for pty_i in 0..num_pty_fds {
+            let pf = &fds[1 + pty_i];
+            if pf.revents & libc::POLLOUT != 0 {
+                let (si, wi) = pty_map[pty_i];
+                if si < sessions.len() && wi < sessions[si].windows.len() {
+                    let _ = sessions[si].windows[wi].pane.flush_pending_input();
                 }
             }
         }
@@ -467,6 +485,20 @@ pub fn run(
                                             }
                                         }
                                         need_status_bar_all = true;
+                                    }
+                                    ClientMsg::Refresh => {
+                                        // Ctrl-A r: force a full resync of the current view
+                                        // and exit high-output suppression for this client.
+                                        let ci = client_idx;
+                                        clients[ci].suppressed = false;
+                                        if !need_snapshot.contains(&ci) {
+                                            need_snapshot.push(ci);
+                                        }
+                                        need_status_bar_all = true;
+                                        crate::log::info(&format!(
+                                            "client fd {} requested refresh",
+                                            clients[ci].fd
+                                        ));
                                     }
                                     ClientMsg::Detach => {
                                         to_remove.push(client_idx);
@@ -983,6 +1015,25 @@ pub fn run(
                                         );
                                     }
                                     ClientMsg::ControlCommand { line } => {
+                                        // Resume fast-forward only once the client
+                                        // has drained enough that a new flood won't
+                                        // immediately re-trip the cap. Clearing on
+                                        // every select-pane/send while still behind
+                                        // oscillates and freezes iTerm2.
+                                        if clients[client_idx].suppressed
+                                            && clients[client_idx].outbuf.len()
+                                                <= CLIENT_SUPPRESS_LOW
+                                        {
+                                            clients[client_idx].suppressed = false;
+                                            crate::log::info(&format!(
+                                                "control client fd {} resumed after fast-forward",
+                                                clients[client_idx].fd
+                                            ));
+                                            send_control_notify(
+                                                &mut clients[client_idx],
+                                                "%message lrmux: output resumed",
+                                            );
+                                        }
                                         // Parse and execute a tmux-style command.
                                         let mut pending_affinities = None;
                                         if handle_control_command(
@@ -1218,10 +1269,13 @@ pub fn run(
                 if !flush_client_outbuf(&mut clients[client_idx]) {
                     to_remove.push(client_idx);
                 } else if clients[client_idx].suppressed
+                    && !clients[client_idx].is_control
                     && clients[client_idx].outbuf.len() <= CLIENT_SUPPRESS_LOW
                 {
-                    // The client caught up — resync it with a fresh snapshot
-                    // + scrollback replay instead of disconnecting.
+                    // Interactive client caught up — resync with a fresh
+                    // snapshot. Control clients stay suppressed until they
+                    // send a command after draining (auto-resume re-floods
+                    // iTerm2 and freezes the -CC session).
                     clients[client_idx].suppressed = false;
                     crate::log::info(&format!(
                         "client fd {} caught up after output burst, resyncing",
@@ -1463,6 +1517,7 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
             windows: window_names(&sessions[si]),
             active: clients[i].active_window as u16,
             session_count: sessions.len() as u16,
+            high_output: clients[i].suppressed,
         });
         if !client_send(&mut clients[i], &msg) {
             clients.remove(i);
@@ -1483,6 +1538,7 @@ fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
         windows: window_names(&sessions[si]),
         active: client.active_window as u16,
         session_count: sessions.len() as u16,
+        high_output: client.suppressed,
     });
     let _ = client_send(client, &msg);
 }
@@ -1518,22 +1574,71 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     }
 
     // Then send scrollback so the client can populate the fresh grid's
-    // history. Chunk it — a full 10k-row buffer at wide sizes encodes to
-    // tens of MB in one frame, blowing the client outbuf cap.
+    // history. Chunk it and pace against outbuf — a full 10k-row buffer at
+    // wide sizes encodes to tens of MB. Prefer recent history when the
+    // budget can't fit everything (oldest rows are dropped first).
     let sb_rows = pane.scrollback_rows();
-    for chunk in sb_rows.chunks(500) {
+    if !sb_rows.is_empty() && !send_scrollback_replay_paced(client, &sb_rows) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "client gone",
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort scrollback replay that never pushes a client to the hard
+/// outbuf cap. A fast client (outbuf drains each send) gets the full
+/// history; a slow/post-burst client gets recent history only.
+fn send_scrollback_replay_paced(
+    client: &mut ClientConn,
+    sb_rows: &[Vec<crate::grid::Cell>],
+) -> bool {
+    // When already behind (typical after burst resync), prefer the newest
+    // rows that fit under CLIENT_SUPPRESS_HIGH. Quiet attaches start at 0
+    // and stream the full buffer while the client keeps up.
+    let start = if client.outbuf.len() > CLIENT_SUPPRESS_LOW {
+        let cols = sb_rows.first().map(|r| r.len()).unwrap_or(80).max(1);
+        let approx_row = cols * 10;
+        let room = CLIENT_SUPPRESS_HIGH.saturating_sub(client.outbuf.len());
+        let max_rows = (room / approx_row).max(1);
+        let s = sb_rows.len().saturating_sub(max_rows);
+        if s > 0 {
+            crate::log::info(&format!(
+                "client fd {}: scrollback replay truncated (sending newest {}/{} rows)",
+                client.fd,
+                sb_rows.len() - s,
+                sb_rows.len()
+            ));
+        }
+        s
+    } else {
+        0
+    };
+
+    let mut sent = 0usize;
+    for chunk in sb_rows[start..].chunks(500) {
         let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate {
             rows: chunk.to_vec(),
             replay: true,
         });
-        if !client_send(client, &sb_msg) {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "client gone",
+        // Stop if the client isn't draining — don't climb toward the hard cap.
+        if client.outbuf.len() > CLIENT_SUPPRESS_HIGH
+            || client.outbuf.len().saturating_add(sb_msg.len()) > CLIENT_OUTBUF_CAP
+        {
+            crate::log::info(&format!(
+                "client fd {}: stopping scrollback replay at {sent} rows (outbuf {})",
+                client.fd,
+                client.outbuf.len()
             ));
+            break;
         }
+        if !client_send(client, &sb_msg) {
+            return false;
+        }
+        sent += chunk.len();
     }
-    Ok(())
+    true
 }
 
 /// Send each client a snapshot of its own active window.
@@ -1626,6 +1731,7 @@ fn handshake_first_client(
         windows: vec![window.name.clone()],
         active: 0,
         session_count: 1,
+        high_output: false,
     });
     proto::send(&mut client, &status)?;
 
@@ -1725,6 +1831,7 @@ fn accept_new_client(
                         windows: window_names(session),
                         active: active as u16,
                         session_count: sessions.len() as u16,
+                        high_output: false,
                     });
                     let _ = proto::send(&mut stream, &status);
                 }
@@ -2253,6 +2360,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             let line = String::from_utf8_lossy(&data[4..4 + clen]).into_owned();
             ClientMsg::ControlCommand { line }
         }
+        0x18 => ClientMsg::Refresh,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2320,9 +2428,27 @@ fn forward_output_to_control_clients(
             // every control client — a window may live in a session other
             // than the client's attached session (affinity migration maps
             // each iTerm2 window to its own lrmux session).
-            if client.is_control {
-                send_control_notify(client, &line);
+            if !client.is_control {
+                continue;
             }
+            if client.suppressed {
+                // Fast-forward mode: the client is behind, drop intermediate
+                // output until it drains or sends a new command (any key).
+                continue;
+            }
+            if client.outbuf.len() + line.len() > CLIENT_SUPPRESS_HIGH {
+                client.suppressed = true;
+                crate::log::info(&format!(
+                    "control client fd {} entering fast-forward mode",
+                    client.fd
+                ));
+                send_control_notify(
+                    client,
+                    "%message lrmux: high output detected — press any key to resume",
+                );
+                continue;
+            }
+            send_control_notify(client, &line);
         }
     }
 }
@@ -2803,7 +2929,22 @@ fn format_var(
         "scroll_region_lower" => window
             .map(|w| (w.pane.rows - 1).to_string())
             .unwrap_or_default(),
-        "pane_tabs" => window.map(|w| w.pane.cols.to_string()).unwrap_or_default(),
+        "pane_tabs" => window
+            .map(|w| {
+                // tmux reports comma-separated tab stops (every 8 cols).
+                // A single value equal to pane width makes iTerm2 treat the
+                // right margin as the only stop — tabs in live %output then
+                // jump there (e.g. red git-status text appears as one char
+                // on the right edge). capture-pane expands tabs in the grid,
+                // which is why detach/reattach looked fine.
+                let cols = w.pane.cols as usize;
+                (8..cols)
+                    .step_by(8)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default(),
         _ => {
             // Conditional format: #{?condition,true-value,false-value}
             if let Some(rest) = var.strip_prefix('?') {
@@ -2861,6 +3002,11 @@ fn split_command_list(line: &str) -> Vec<&str> {
 /// Handle a tmux-style command line from a control-mode client.
 /// The line may be a `;`-separated command list; each sub-command gets its
 /// own %begin/%end block. Returns true if the server should shut down.
+///
+/// Consecutive `send`/`send-keys` targeting the same pane are coalesced into
+/// a single PTY `write_input` so iTerm2's split arrow-key lists
+/// (`send -H 1b; send 0x5b; send -lt D`) arrive as one ESC [ D sequence,
+/// while still emitting one %begin/%end per sub-command for the command queue.
 fn handle_control_command(
     client: &mut ClientConn,
     sessions: &mut Vec<Session>,
@@ -2873,10 +3019,61 @@ fn handle_control_command(
     if line.is_empty() {
         return false;
     }
-    for cmd in split_command_list(line) {
+    let cmds = split_command_list(line);
+    let mut i = 0;
+    while i < cmds.len() {
+        let cmd = cmds[i].trim();
+        if cmd.is_empty() {
+            i += 1;
+            continue;
+        }
+        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        let cmd_name = crate::cmd::canonical_name(parts[0]);
+
+        if cmd_name == "send-keys" {
+            // Gather consecutive send-keys to the same target.
+            let mut coalesced: Vec<u8> = Vec::new();
+            let mut n_respond = 0;
+            let mut group_loc: Option<(usize, usize)> = None;
+            while i < cmds.len() {
+                let c = cmds[i].trim();
+                if c.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let p: Vec<&str> = c.splitn(2, ' ').collect();
+                if crate::cmd::canonical_name(p[0]) != "send-keys" {
+                    break;
+                }
+                let args_str = p.get(1).unwrap_or(&"");
+                let (keys, target_str) = parse_send_keys_args(args_str);
+                let loc = resolve_target(sessions, client, target_str.as_deref());
+                if n_respond == 0 {
+                    group_loc = loc;
+                } else if loc != group_loc {
+                    // Different pane — flush this group first.
+                    break;
+                }
+                coalesced.extend_from_slice(&keys);
+                n_respond += 1;
+                i += 1;
+            }
+            if let Some((si, wi)) = group_loc {
+                let window = &mut sessions[si].windows[wi];
+                if !window.pane.exited && !coalesced.is_empty() {
+                    let _ = window.pane.write_input(&coalesced);
+                }
+            }
+            for _ in 0..n_respond {
+                control_respond(client, &[]);
+            }
+            continue;
+        }
+
         if handle_single_control_command(client, sessions, cmd, socket_path, pending_affinities) {
             return true;
         }
+        i += 1;
     }
     false
 }
@@ -3304,64 +3501,16 @@ fn handle_single_control_command(
             respond(client, &[]);
         }
         "send-keys" => {
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
-            // Parse send-keys flags manually: -H (hex args), -l (literal),
-            // -t <target>. Combined forms like "-lt" come from iTerm2.
-            let mut hex_mode = false;
-            let mut target_str: Option<String> = None;
-            let mut positionals: Vec<String> = Vec::new();
-            let mut i = 0;
-            while i < args.len() {
-                let a = &args[i];
-                if a.starts_with('-') && a.len() > 1 {
-                    let flags = &a[1..];
-                    if flags == "t" || flags.ends_with('t') && flags.len() > 1 {
-                        // -t or -Xt: takes next arg as target.
-                        if i + 1 < args.len() {
-                            target_str = Some(args[i + 1].clone());
-                            i += 1;
-                        }
-                    }
-                    if flags.contains('H') {
-                        hex_mode = true;
-                    }
-                } else {
-                    positionals.push(a.clone());
-                }
-                i += 1;
-            }
-            let keys = if hex_mode {
-                // -H: each positional is hex-encoded bytes ("0d", "0d0a").
-                let mut out = Vec::new();
-                for h in &positionals {
-                    let h = h.trim();
-                    let mut j = 0;
-                    while j + 1 < h.len() + 1 && j + 2 <= h.len() {
-                        if let Ok(b) = u8::from_str_radix(&h[j..j + 2], 16) {
-                            out.push(b);
-                        }
-                        j += 2;
-                    }
-                }
-                out
-            } else {
-                parse_tmux_keys_for_control(&positionals)
-            };
-
-            // Resolve -t: "%N" is a pane id, "@N" a window id, otherwise a
-            // session name. Default = client's current window.
+            let (keys, target_str) = parse_send_keys_args(args_str);
             let loc = resolve_target(sessions, client, target_str.as_deref());
             let Some((si, wi)) = loc else {
                 respond(client, &[]);
                 return false;
             };
-
-            // Write keys to the PTY.
             let window = &mut sessions[si].windows[wi];
             if !window.pane.exited {
                 let _ = window.pane.write_input(&keys);
             }
-
             respond(client, &[]);
         }
         "kill-server" => {
@@ -3480,6 +3629,54 @@ fn handle_single_control_command(
     false
 }
 
+/// Parse send-keys flags: -H (hex args), -l (literal), -t <target>.
+/// Combined forms like "-lt" / "-H" come from iTerm2.
+/// Returns (key bytes, optional target string).
+fn parse_send_keys_args(args_str: &str) -> (Vec<u8>, Option<String>) {
+    let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+    let mut hex_mode = false;
+    let mut target_str: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') && a.len() > 1 {
+            let flags = &a[1..];
+            if flags == "t" || flags.ends_with('t') && flags.len() > 1 {
+                // -t or -Xt: takes next arg as target.
+                if i + 1 < args.len() {
+                    target_str = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            if flags.contains('H') {
+                hex_mode = true;
+            }
+        } else {
+            positionals.push(a.clone());
+        }
+        i += 1;
+    }
+    let keys = if hex_mode {
+        // -H: each positional is hex-encoded bytes ("0d", "1b", "0d0a").
+        let mut out = Vec::new();
+        for h in &positionals {
+            let h = h.trim();
+            let mut j = 0;
+            while j + 2 <= h.len() {
+                if let Ok(b) = u8::from_str_radix(&h[j..j + 2], 16) {
+                    out.push(b);
+                }
+                j += 2;
+            }
+        }
+        out
+    } else {
+        parse_tmux_keys_for_control(&positionals)
+    };
+    (keys, target_str)
+}
+
 /// Parse tmux-style key names into byte sequences (for control mode send-keys).
 /// Reuses the same logic as main.rs::parse_tmux_keys.
 fn parse_tmux_keys_for_control(parts: &[String]) -> Vec<u8> {
@@ -3539,11 +3736,16 @@ fn parse_tmux_keys_for_control(parts: &[String]) -> Vec<u8> {
                 result.push(0x1b);
                 result.push(part.as_bytes()[2]);
             }
-            // Hex key code: tmux accepts 0xNN (iTerm2 sends e.g. 0x7f for
-            // Backspace and 0x20 for Space).
+            // Hex key code without -H: tmux treats 0xNN as a Unicode
+            // codepoint and UTF-8-encodes it. iTerm2 sends non-ASCII keys
+            // this way (e.g. ñ → `send -t %0 0xf1`). With -H (handled
+            // above) the same form means raw bytes instead.
             _ if part.starts_with("0x") || part.starts_with("0X") => {
-                if let Ok(b) = u8::from_str_radix(&part[2..], 16) {
-                    result.push(b);
+                if let Ok(cp) = u32::from_str_radix(&part[2..], 16) {
+                    if let Some(ch) = char::from_u32(cp) {
+                        let mut buf = [0u8; 4];
+                        result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
                 } else {
                     result.extend_from_slice(part.as_bytes());
                 }
