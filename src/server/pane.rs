@@ -1,6 +1,7 @@
 // Pane: a rectangular region with a PTY running a child process, plus a grid.
 
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::grid::{Cell, Grid};
 use crate::pty::{Pty, PtySize, default_shell_argv};
@@ -8,8 +9,12 @@ use crate::vt;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use std::ffi::CString;
 
+/// Global pane ID counter (tmux uses %N format).
+static PANE_ID: AtomicU32 = AtomicU32::new(0);
+
 /// A single pane: PTY + grid + VT parser.
 pub struct Pane {
+    pub id: u32,
     pub pty: Pty,
     pub grid: Grid,
     pub vt_parser: vte::Parser,
@@ -53,6 +58,7 @@ impl Pane {
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {
+            id: PANE_ID.fetch_add(1, Ordering::Relaxed),
             pty,
             grid,
             vt_parser,
@@ -61,6 +67,11 @@ impl Pane {
             exited: false,
             exit_code: None,
         }
+    }
+
+    /// Format the pane ID as tmux-style: %N
+    pub fn id_str(&self) -> String {
+        format!("%{}", self.id)
     }
 
     /// Get the PTY master fd (for poll). Returns -1 if the child has exited.
