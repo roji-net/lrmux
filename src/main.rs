@@ -120,6 +120,9 @@ enum CliAction {
     Versions,
     /// `--help` / `-h`: show usage.
     Help,
+    /// Unrecognized subcommand — must not fall through to Default
+    /// (inside a pane, Default creates a new window).
+    Unknown(String),
 }
 
 /// Print usage information.
@@ -133,11 +136,11 @@ fn print_help() {
          COMMANDS (tmux-compatible syntax):\n    \
          lrmux                       Attach to a session (selector if multiple exist)\n    \
          lrmux -- <cmd> [args]       Create a new window running <cmd> and attach\n    \
-         lrmux new-session -s <name> [-c <cwd>] [-d] [-- <cmd>]\n    \
+         lrmux new-session [-s <name>] [-c <cwd>] [-d] [--] [<cmd> [args...]]\n    \
          lrmux attach-session [-s <server>] ([-t <[server:][session]>] | <[server:][session]>)\n    \
          lrmux select-session -t <name>\n    \
          lrmux kill-session -t <name>\n    \
-         lrmux new-window -t <target> -n <name> [-c <cwd>] [-- <cmd>]\n    \
+         lrmux new-window -t <target> -n <name> [-c <cwd>] [--] [<cmd> [args...]]\n    \
          lrmux kill-window -t <target>\n    \
          lrmux select-window -t <target>\n    \
          lrmux rename-window -t <target> <name>\n    \
@@ -158,7 +161,7 @@ fn print_help() {
          lrmux --help, -h            Show this help message\n\
          \n\
          ALIASES:\n    \
-         new=attach-session  ls=list-sessions  lsw=list-windows\n    \
+         new=new-session  ls=list-sessions  lsw=list-windows\n    \
          neww=new-window  send=send-keys  capturep=capture-pane\n    \
          ss=session-selector\n\
          \n\
@@ -413,12 +416,22 @@ fn parse_args() -> CliAction {
         }
         Some("send-keys") | Some("send") => parse_send_keys(subcmd_args),
         Some("versions") | Some("version") => CliAction::Versions,
-        _ => CliAction::Default,
+        // Bare `lrmux` (no subcommand) → selector / attach.
+        None => CliAction::Default,
+        // Anything else is a hard error — never treat typos as Default,
+        // because nested Default spawns a new window.
+        Some(other) => CliAction::Unknown(other.to_string()),
     }
 }
 
 /// Parse `new-session` args using tmux-style flags.
-///   new-session -s <name> -c <cwd> -d [-- <cmd>]
+///   new-session [-s name] [-c cwd] [-d] [--] [shell-command...]
+///
+/// The shell-command may be given after `--` or as positional args
+/// (tmux-compatible). It is run via `$SHELL -c`. Note: `-c` is the
+/// *start directory*, not the command — use e.g.
+///   lrmux new-session -- find /
+///   lrmux new-session find /
 fn parse_new_session(args: &[String]) -> CliAction {
     let parsed = cmd::parse_flags(args);
     let name = parsed
@@ -430,16 +443,49 @@ fn parse_new_session(args: &[String]) -> CliAction {
         .or_else(|| parsed.get("cwd"))
         .map(|s| s.to_string());
     let detached = parsed.has("d") || parsed.has("detach");
-    let command = if parsed.after_dash.is_empty() {
-        None
-    } else {
-        Some(parsed.after_dash.join(" "))
-    };
+    let command = shell_command_from_parsed(&parsed);
+    // Common mistake: `new-session -c 'find /'` (shell -c muscle memory).
+    // In tmux/lrmux, -c is the start directory.
+    if let Some(ref dir) = cwd
+        && command.is_none()
+        && looks_like_shell_command_not_cwd(dir)
+    {
+        eprintln!(
+            "lrmux: warning: -c is the start directory, not the command.\n\
+             To run a command in a new session, use:\n  \
+             lrmux new-session -- {dir}\n  \
+             lrmux new-session {dir}"
+        );
+    }
     CliAction::NewSession {
         name,
         cwd,
         command,
         detached,
+    }
+}
+
+/// True when a `-c` value looks like the user meant a shell command
+/// (bash/zsh `-c` habit) rather than a start directory.
+fn looks_like_shell_command_not_cwd(value: &str) -> bool {
+    // Warn when -c is not an existing directory and looks command-like.
+    !std::path::Path::new(value).is_dir()
+        && (value.contains(' ')
+            || value.contains('|')
+            || value.contains(';')
+            || value.contains('&')
+            || value.contains('>')
+            || value.contains('<'))
+}
+
+/// Shell command from `-- …` (preferred) or leftover positional args.
+fn shell_command_from_parsed(parsed: &cmd::ParsedCmd) -> Option<String> {
+    if !parsed.after_dash.is_empty() {
+        Some(parsed.after_dash.join(" "))
+    } else if !parsed.positional.is_empty() {
+        Some(parsed.positional.join(" "))
+    } else {
+        None
     }
 }
 
@@ -457,7 +503,7 @@ fn parse_start_server(args: &[String]) -> CliAction {
 }
 
 /// Parse `new-window` args using tmux-style flags.
-///   new-window -t <target> -n <name> -c <cwd> [-- <cmd>]
+///   new-window [-t target] [-n name] [-c cwd] [--] [shell-command...]
 fn parse_new_window(args: &[String]) -> CliAction {
     let parsed = cmd::parse_flags(args);
     let name = parsed
@@ -468,11 +514,7 @@ fn parse_new_window(args: &[String]) -> CliAction {
         .get("c")
         .or_else(|| parsed.get("cwd"))
         .map(|s| s.to_string());
-    let command = if parsed.after_dash.is_empty() {
-        None
-    } else {
-        Some(parsed.after_dash.join(" "))
-    };
+    let command = shell_command_from_parsed(&parsed);
     CliAction::NewWindow {
         target: parsed.target(),
         name,
@@ -601,8 +643,15 @@ fn run() -> io::Result<()> {
                 return Ok(());
             }
             CliAction::AttachSession { session: None, .. } => {
-                // No session requested — nothing to switch to. Treat as a new window.
-                // (This also covers `lrmux attach -s <current_server>`.)
+                // `attach` with no session from inside a pane: do nothing.
+                // Never invent a new window — that used to happen for typos
+                // that fell through to Default, and also for bare `attach`.
+                eprintln!(
+                    "lrmux: already inside a session on server '{nested_server}'.\n\
+                     Use `lrmux new-window` / Ctrl-A c for a window, \
+                     or `lrmux new-session` / Ctrl-A C for a session."
+                );
+                return Ok(());
             }
             CliAction::AttachSession {
                 session: Some(sess),
@@ -645,9 +694,11 @@ fn run() -> io::Result<()> {
             _ => {}
         }
         match action {
-            CliAction::Default | CliAction::RunCommand(_) | CliAction::AttachSession { .. } => {
+            CliAction::Default | CliAction::RunCommand(_) => {
                 // Create a new window on the parent's server, non-interactive.
                 // RunCommand passes a command to run in the new window.
+                // Only these (plus explicit new-window / new-session below)
+                // may spawn — never unknown commands.
                 let command = match &action {
                     CliAction::RunCommand(cmd) => Some(cmd.clone()),
                     _ => None,
@@ -809,6 +860,13 @@ fn run() -> io::Result<()> {
             print_help();
             Ok(())
         }
+        CliAction::Unknown(cmd) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unknown command '{cmd}'. Try `lrmux --help`.\n\
+                 (Inside a pane, bare `lrmux` opens a new window; typos do not.)"
+            ),
+        )),
         CliAction::Versions => {
             print_versions();
             Ok(())
@@ -821,14 +879,17 @@ fn run() -> io::Result<()> {
             detached,
         } => {
             let sock = socket_path("default");
+            // No server yet — start one, then create the session there.
+            // (Bare `lrmux` also auto-starts via the selector; new-session
+            // should be equally forgiving.)
+            if !ipc::server_exists(&sock) {
+                eprintln!("lrmux: no server running; starting default server...");
+                fork_server(&sock, None, false)?;
+                wait_for_server(&sock)?;
+                eprintln!("lrmux: server ready.");
+            }
             if detached {
                 // Detached: create session non-interactively, don't attach.
-                if !ipc::server_exists(&sock) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no server running; start one with `lrmux` first",
-                    ));
-                }
                 let mut stream = ipc::connect(&sock)?;
                 let msg = proto::encode_client(&ClientMsg::Identify {
                     rows: 24,
@@ -854,13 +915,9 @@ fn run() -> io::Result<()> {
                 // Attach: connect and create session interactively.
                 match client::run(&sock, Some(name), None, command, cwd) {
                     Ok(()) => Ok(()),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no server running; start one with `lrmux` first",
-                    )),
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
-                        "server socket is stale; start a new one with `lrmux`",
+                        "server socket is stale; try again",
                     )),
                     Err(e) => Err(e),
                 }

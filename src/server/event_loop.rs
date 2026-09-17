@@ -289,17 +289,23 @@ pub fn run(
                 }
                 let session = &mut sessions[si];
                 let pane = &mut session.windows[wi].pane;
-                let pane_id = pane.id;
                 match pane.process_pty_output() {
                     Ok((true, raw)) => {
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         // Forward raw output to control clients viewing this window.
-                        if !raw.is_empty() {
-                            forward_output_to_control_clients(&mut clients, si, wi, pane_id, &raw);
+                        let cc_bytes = pane.take_cc_forward_bytes(&raw);
+                        if !cc_bytes.is_empty() {
+                            forward_output_to_control_clients(&mut clients, pane.id, &cc_bytes);
                         }
                     }
-                    Ok((false, _)) => {
-                        // Child exited — reap and defer the removal.
+                    Ok((false, raw)) => {
+                        // Child exited — forward any remaining bytes (including
+                        // a flushed incomplete UTF-8 tail) before reaping.
+                        let mut cc_bytes = pane.take_cc_forward_bytes(&raw);
+                        cc_bytes.extend(pane.flush_cc_forward_bytes());
+                        if !cc_bytes.is_empty() {
+                            forward_output_to_control_clients(&mut clients, pane.id, &cc_bytes);
+                        }
                         let exit_code = pane.reap_child().unwrap_or(0);
                         pty_exits.push((si, wi, exit_code));
                     }
@@ -708,6 +714,7 @@ pub fn run(
                                                 grid_cols,
                                                 default_window_name(),
                                                 cmd,
+                                                cwd_full.as_deref(),
                                             );
                                             // Replace the first window (default shell)
                                             // with the command window.
@@ -879,6 +886,7 @@ pub fn run(
                                                     grid_cols,
                                                     default_window_name(),
                                                     cmd,
+                                                    None,
                                                 ),
                                                 None => Window::new(
                                                     grid_rows,
@@ -1124,6 +1132,7 @@ pub fn run(
                                             grid_cols,
                                             default_window_name(),
                                             cmd,
+                                            None,
                                         ),
                                         None => {
                                             Window::new(grid_rows, grid_cols, default_window_name())
@@ -1179,6 +1188,7 @@ pub fn run(
                                         grid_cols,
                                         default_window_name(),
                                         cmd,
+                                        cwd_full.as_deref(),
                                     );
                                     sessions[new_si].windows[0] = win;
                                 }
@@ -2410,18 +2420,23 @@ fn accept_from_any(listeners: &[crate::ipc::ConnListener]) -> io::Result<crate::
 
 /// Forward raw PTY output to all control clients viewing the given window.
 /// The output is escaped and sent as %output notifications.
-fn forward_output_to_control_clients(
-    clients: &mut [ClientConn],
-    si: usize,
-    wi: usize,
-    pane_id: u32,
-    raw: &[u8],
-) {
+fn forward_output_to_control_clients(clients: &mut [ClientConn], pane_id: u32, raw: &[u8]) {
     let pane_id_str = format!("%{}", pane_id);
-    let _ = (si, wi);
     // Chunk large bursts into multiple %output lines — a single escaped
     // notification for a multi-MB read could exceed the client outbuf cap.
-    for chunk in raw.chunks(256 * 1024) {
+    // Split on UTF-8 character boundaries so a multi-byte glyph is never
+    // torn across notifications (defense in depth alongside pane buffering).
+    let mut offset = 0;
+    while offset < raw.len() {
+        let mut end = (offset + 256 * 1024).min(raw.len());
+        if end < raw.len() {
+            let tail = super::pane::incomplete_utf8_tail_len(&raw[offset..end]);
+            if tail > 0 && tail < end - offset {
+                end -= tail;
+            }
+        }
+        let chunk = &raw[offset..end];
+        offset = end;
         let line = format!("%output {} {}", pane_id_str, escape_output(chunk));
         for client in clients.iter_mut() {
             // iTerm2 routes %output by pane id to the right tab, so send to
@@ -2661,19 +2676,43 @@ fn migrate_affinity_sessions(
 
 /// Escape binary data for %output notifications (tmux control mode format).
 /// Characters < 0x20 and backslash are replaced with \nnn octal escapes.
-/// Bytes >= 0x20 are kept raw, then decoded as UTF-8 — building the string
-/// char-by-char would double-encode multibyte sequences (byte 0xe2 became
-/// U+00E2 → 0xc3 0xa2, turning ➜ into mojibake).
+/// Complete UTF-8 sequences are kept raw. Incomplete or invalid bytes are
+/// also octal-escaped — never replaced with U+FFFD — so a multi-byte
+/// character split across reads still reassembles correctly in iTerm2.
 fn escape_output(data: &[u8]) -> String {
-    let mut out = Vec::with_capacity(data.len());
-    for &b in data {
+    let mut out = String::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
         if b < 0x20 || b == b'\\' {
-            out.extend_from_slice(format!("\\{:03o}", b).as_bytes());
-        } else {
-            out.push(b);
+            out.push_str(&format!("\\{:03o}", b));
+            i += 1;
+            continue;
         }
+        if b < 0x80 {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        let width = match b {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        if width > 0
+            && i + width <= data.len()
+            && let Ok(s) = std::str::from_utf8(&data[i..i + width])
+        {
+            out.push_str(s);
+            i += width;
+            continue;
+        }
+        // Invalid or incomplete — emit as octal so the raw byte survives.
+        out.push_str(&format!("\\{:03o}", b));
+        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Current unix time in seconds (for %begin/%end blocks).
@@ -3852,6 +3891,60 @@ fn resolve_target(
     let si = find_session(sessions, &parsed.session).or(Some(client.session_idx))?;
     let wi = find_window(&sessions[si], &parsed.window)?;
     Some((si, wi))
+}
+
+#[cfg(test)]
+mod escape_output_tests {
+    use super::escape_output;
+
+    #[test]
+    fn preserves_box_drawing() {
+        let dash = "─".as_bytes(); // E2 94 80
+        assert_eq!(escape_output(dash), "─");
+        let line = "────────────────────".as_bytes();
+        assert_eq!(escape_output(line), "────────────────────");
+    }
+
+    #[test]
+    fn never_emits_replacement_char() {
+        // Incomplete leading byte of ─ — must be octal, not U+FFFD.
+        let out = escape_output(&[0xE2]);
+        assert!(!out.contains('\u{FFFD}'), "got {out:?}");
+        assert_eq!(out, "\\342");
+
+        let out = escape_output(&[0xE2, 0x94]);
+        assert!(!out.contains('\u{FFFD}'), "got {out:?}");
+        assert_eq!(out, "\\342\\224");
+    }
+
+    #[test]
+    fn split_box_drawing_reassembles_via_octal() {
+        // Simulate two %output payloads after a bad split; concatenating the
+        // decoded escapes yields the original UTF-8 for ─.
+        let a = escape_output(&[0xE2]);
+        let b = escape_output(&[0x94, 0x80]);
+        let mut bytes = Vec::new();
+        for part in [a.as_str(), b.as_str()] {
+            let mut chars = part.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    let o1 = chars.next().unwrap().to_digit(8).unwrap();
+                    let o2 = chars.next().unwrap().to_digit(8).unwrap();
+                    let o3 = chars.next().unwrap().to_digit(8).unwrap();
+                    bytes.push(((o1 << 6) | (o2 << 3) | o3) as u8);
+                } else {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "─");
+    }
+
+    #[test]
+    fn escapes_controls_and_backslash() {
+        assert_eq!(escape_output(b"a\nb\\c"), "a\\012b\\134c");
+    }
 }
 
 /// Resolve a session target: "$N" = session id, "name" = session name,

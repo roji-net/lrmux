@@ -32,10 +32,16 @@ impl Window {
         }
     }
 
-    pub fn new_with_command(rows: u16, cols: u16, name: String, command: &str) -> Self {
+    pub fn new_with_command(
+        rows: u16,
+        cols: u16,
+        name: String,
+        command: &str,
+        cwd: Option<&str>,
+    ) -> Self {
         Self {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
-            pane: Pane::new_with_command(rows, cols, command),
+            pane: Pane::new_with_command(rows, cols, command, cwd),
             name,
         }
     }
