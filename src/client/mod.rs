@@ -66,6 +66,7 @@ pub fn run(
     new_session: Option<Option<String>>,
     select_session: Option<String>,
     command: Option<String>,
+    cwd: Option<String>,
 ) -> io::Result<()> {
     // Connect to the server.
     let mut stream = ipc::connect(socket_path)?;
@@ -148,9 +149,11 @@ pub fn run(
     // If requested, create a new session on the server right after handshake.
     // Send the client's CWD so the new session opens in the right directory.
     if let Some(name) = new_session {
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        let cwd = cwd.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
         let msg = proto::encode_client(&ClientMsg::NewSession {
             name,
             cwd,
