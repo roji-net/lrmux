@@ -37,6 +37,13 @@ pub fn server_address() -> &'static str {
 /// If `tcp_addr` is provided, also listen on TCP.
 /// If `headless` is true, create a default session without waiting for
 /// the first client (used by `lrmux start-server`).
+///
+/// Optional bootstrap env (set by the parent before fork, cleared here):
+/// - `LRMUX_INIT_COMMAND` — first window runs `$SHELL -ci <command>`
+/// - `LRMUX_INIT_SESSION` — session name override
+/// - `LRMUX_INIT_CWD` — cwd for the first window (client's cwd, or `-c`)
+///
+/// `TERM` / `COLORTERM` are inherited from the forking client as-is.
 pub fn run(socket_path: &Path, tcp_addr: Option<&str>, headless: bool) -> io::Result<()> {
     let unix_listener = ipc::listen(socket_path)?;
 

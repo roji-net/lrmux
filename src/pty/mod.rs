@@ -35,10 +35,10 @@ impl Pty {
             ws_ypixel: 0,
         };
 
-        // Set LRMUX env var so the child process knows it's inside lrmux.
-        // Also set LRMUX_SERVER so nested lrmux commands know which server
-        // to connect to.
-        // The child inherits these via fork; we unset them in the parent after.
+        // Set LRMUX / LRMUX_SERVER so the child knows it is inside lrmux and
+        // which server to talk to. Do not invent or rewrite TERM/COLORTERM —
+        // the server inherits the client's environment at fork, and panes
+        // inherit the server's; inventing xterm-* breaks truecolor terminfo.
         // Safety: we are single-threaded here (before fork), no race possible.
         let server_name = crate::server::server_name();
         unsafe {

@@ -83,6 +83,8 @@ pub enum ClientMsg {
     ControlCommand { line: String },
     /// Request a fresh grid snapshot from the server.
     Refresh,
+    /// Reply to a proxied OSC 10/11 color query (bytes from the real TTY).
+    TermOscReply { pane_id: u32, data: Vec<u8> },
 }
 
 /// Server → Client messages.
@@ -144,6 +146,13 @@ pub enum ServerMsg {
     /// Control mode notification: a text line to print to the control client's stdout.
     /// Format: "%window-add @1", "%output %0 hello", "%session-changed $1 name", etc.
     ControlNotify { line: String },
+    /// Ask the client to query its real TTY for OSC 10/11 and reply with
+    /// `TermOscReply` (so we don't invent palette colors).
+    TermOscQuery {
+        pane_id: u32,
+        code: u8,
+        bell_terminated: bool,
+    },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -172,6 +181,7 @@ const C_GET_LOG: u8 = 0x15;
 const C_IDENTIFY_CONTROL: u8 = 0x16;
 const C_CONTROL_COMMAND: u8 = 0x17;
 const C_REFRESH: u8 = 0x18;
+const C_TERM_OSC_REPLY: u8 = 0x19;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -184,6 +194,7 @@ const S_SESSION_LIST: u8 = 0x16;
 const S_WINDOW_CAPTURE: u8 = 0x18;
 const S_LOG_CONTENT: u8 = 0x19;
 const S_CONTROL_NOTIFY: u8 = 0x1a;
+const S_TERM_OSC_QUERY: u8 = 0x1b;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -354,6 +365,12 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::Refresh => {
             payload.push(C_REFRESH);
         }
+        ClientMsg::TermOscReply { pane_id, data } => {
+            payload.push(C_TERM_OSC_REPLY);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+            payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            payload.extend_from_slice(data);
+        }
     }
     frame(payload)
 }
@@ -480,6 +497,16 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(S_CONTROL_NOTIFY);
             payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
             payload.extend_from_slice(line.as_bytes());
+        }
+        ServerMsg::TermOscQuery {
+            pane_id,
+            code,
+            bell_terminated,
+        } => {
+            payload.push(S_TERM_OSC_QUERY);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+            payload.push(*code);
+            payload.push(if *bell_terminated { 1 } else { 0 });
         }
     }
     frame(payload)
@@ -696,6 +723,18 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::ControlCommand { line })
         }
         C_REFRESH => Ok(ClientMsg::Refresh),
+        C_TERM_OSC_REPLY => {
+            let pane_id = read_u32(&mut r)?;
+            let len = read_u32(&mut r)? as usize;
+            if r.len() < len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscReply truncated",
+                ));
+            }
+            let data = r[..len].to_vec();
+            Ok(ClientMsg::TermOscReply { pane_id, data })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -857,6 +896,22 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let len = read_u32(&mut r)? as usize;
             let line = String::from_utf8_lossy(&r[..len]).into_owned();
             Ok(ServerMsg::ControlNotify { line })
+        }
+        S_TERM_OSC_QUERY => {
+            let pane_id = read_u32(&mut r)?;
+            if r.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscQuery truncated",
+                ));
+            }
+            let code = r[0];
+            let bell_terminated = r.get(1).copied().unwrap_or(1) != 0;
+            Ok(ServerMsg::TermOscQuery {
+                pane_id,
+                code,
+                bell_terminated,
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
