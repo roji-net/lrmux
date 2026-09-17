@@ -972,8 +972,7 @@ fn run() -> io::Result<()> {
                             ));
                         }
                     }
-                    let msg =
-                        proto::encode_client(&ClientMsg::NewSession { name, cwd, command });
+                    let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd, command });
                     proto::send(&mut stream, &msg)?;
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -1681,14 +1680,11 @@ fn fork_server(
 ) -> io::Result<()> {
     // CWD for the first session: explicit `-c`, else the client's current
     // directory (where this `lrmux` process was invoked).
-    let cwd_owned = init
-        .cwd
-        .map(|s| s.to_string())
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        });
+    let cwd_owned = init.cwd.map(|s| s.to_string()).or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    });
 
     // Pass bootstrap options to the child via env (cleared after fork in
     // both parent and by the server's take_bootstrap()).

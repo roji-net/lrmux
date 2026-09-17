@@ -143,15 +143,12 @@ pub fn run(
         // Headless mode: create a default session (24x80) without waiting
         // for the first client. Used by `lrmux start-server` for testing
         // and remote management.
-        let session_name = boot
-            .session_name
-            .clone()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .unwrap_or_else(|| "session".to_string())
-            });
+        let session_name = boot.session_name.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "session".to_string())
+        });
         let session = make_bootstrap_session(session_name, 24, 80, &boot);
         crate::log::info("server started in headless mode (24x80)");
         (24u16, 80u16, vec![session], vec![])
@@ -526,12 +523,10 @@ pub fn run(
                                     }
                                     ClientMsg::TermOscReply { pane_id, data } => {
                                         // Real TTY answered OSC 10/11 — inject into the pane.
-                                        if let Some((si, wi)) =
-                                            find_pane_by_id(&sessions, pane_id)
+                                        if let Some((si, wi)) = find_pane_by_id(&sessions, pane_id)
                                         {
-                                            let _ = sessions[si].windows[wi]
-                                                .pane
-                                                .write_input(&data);
+                                            let _ =
+                                                sessions[si].windows[wi].pane.write_input(&data);
                                         }
                                     }
                                     ClientMsg::Detach => {
@@ -1463,9 +1458,15 @@ struct Bootstrap {
 
 /// Read and clear `LRMUX_INIT_*` so a later pane spawn does not see them.
 fn take_bootstrap() -> Bootstrap {
-    let command = std::env::var("LRMUX_INIT_COMMAND").ok().filter(|s| !s.is_empty());
-    let session_name = std::env::var("LRMUX_INIT_SESSION").ok().filter(|s| !s.is_empty());
-    let cwd = std::env::var("LRMUX_INIT_CWD").ok().filter(|s| !s.is_empty());
+    let command = std::env::var("LRMUX_INIT_COMMAND")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let session_name = std::env::var("LRMUX_INIT_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let cwd = std::env::var("LRMUX_INIT_CWD")
+        .ok()
+        .filter(|s| !s.is_empty());
     // Safety: server is single-threaded at startup.
     unsafe {
         std::env::remove_var("LRMUX_INIT_COMMAND");
@@ -1782,15 +1783,12 @@ fn handshake_first_client(
     // Create the first session. Prefer LRMUX_INIT_* from `new-server -- cmd`
     // / fresh `new-session` so we don't leave an empty shell session and
     // then add a second one for the command.
-    let session_name = boot
-        .session_name
-        .clone()
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "session".to_string())
-        });
+    let session_name = boot.session_name.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "session".to_string())
+    });
     let mut session = make_bootstrap_session(session_name, grid_rows, grid_cols, boot);
     let window = &mut session.windows[0];
 

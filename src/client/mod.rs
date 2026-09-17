@@ -809,9 +809,7 @@ pub fn run(
                             // Flush any pending render bytes first so the OSC
                             // query isn't stuck behind a partial stdout write.
                             let _ = io::stdout().flush();
-                            if let Some(reply) =
-                                query_outer_osc_color(code, bell_terminated)
-                            {
+                            if let Some(reply) = query_outer_osc_color(code, bell_terminated) {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
                                     data: reply,

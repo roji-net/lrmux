@@ -124,9 +124,7 @@ impl Pane {
     /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes, osc_queries).
     /// raw_bytes is the unprocessed output from the PTY (for control mode forwarding).
     /// osc_queries are OSC 10/11 color probes to proxy to an attached client TTY.
-    pub fn process_pty_output(
-        &mut self,
-    ) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
+    pub fn process_pty_output(&mut self) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
         if self.exited {
             return Ok((false, Vec::new(), Vec::new()));
         }
