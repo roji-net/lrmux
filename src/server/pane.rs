@@ -28,6 +28,10 @@ pub struct Pane {
     /// Input bytes waiting to be written to the PTY master when it becomes writable.
     /// Prevents partial escape sequences when the child is slow to drain stdin.
     pub pending_input: Vec<u8>,
+    /// Incomplete UTF-8 sequence at the end of the last PTY read, held so
+    /// control-mode `%output` never splits a multi-byte character across
+    /// notifications (which would turn `─` into `�`).
+    pub cc_utf8_pending: Vec<u8>,
 }
 
 impl Pane {
@@ -44,15 +48,16 @@ impl Pane {
     }
 
     /// Spawn a new pane with a custom command string.
-    /// The command is split by whitespace and executed via the shell.
-    pub fn new_with_command(rows: u16, cols: u16, command: &str) -> Self {
+    /// The command is executed via `$SHELL -c`. Optional `cwd` sets the
+    /// child's working directory (tmux `new-session -c`).
+    pub fn new_with_command(rows: u16, cols: u16, command: &str, cwd: Option<&str>) -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let argv = vec![
             CString::new(shell).unwrap(),
             CString::new("-c").unwrap(),
             CString::new(command).unwrap(),
         ];
-        Self::new_with_argv(rows, cols, &argv, None)
+        Self::new_with_argv(rows, cols, &argv, cwd)
     }
 
     /// Spawn a new pane with the given argv and optional working directory.
@@ -70,7 +75,28 @@ impl Pane {
             exited: false,
             exit_code: None,
             pending_input: Vec::new(),
+            cc_utf8_pending: Vec::new(),
         }
+    }
+
+    /// Coalesce `raw` with any incomplete UTF-8 left from the previous read.
+    /// Returns bytes safe to forward as `%output` (no trailing incomplete
+    /// sequence). Leftover incomplete bytes stay in `cc_utf8_pending`.
+    pub fn take_cc_forward_bytes(&mut self, raw: &[u8]) -> Vec<u8> {
+        if self.cc_utf8_pending.is_empty() && raw.is_empty() {
+            return Vec::new();
+        }
+        self.cc_utf8_pending.extend_from_slice(raw);
+        let incomplete = incomplete_utf8_tail_len(&self.cc_utf8_pending);
+        let cut = self.cc_utf8_pending.len() - incomplete;
+        let complete = self.cc_utf8_pending[..cut].to_vec();
+        self.cc_utf8_pending.drain(..cut);
+        complete
+    }
+
+    /// Flush any buffered incomplete UTF-8 (pane exit / final drain).
+    pub fn flush_cc_forward_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.cc_utf8_pending)
     }
 
     /// Format the pane ID as tmux-style: %N
@@ -435,5 +461,74 @@ fn ansi_input_seq_len(buf: &[u8]) -> Option<usize> {
             if buf.len() >= 3 { Some(3) } else { None }
         }
         _ => Some(2), // ESC + one more
+    }
+}
+
+/// Number of trailing bytes that form an incomplete UTF-8 sequence.
+/// Returns 0 if the buffer ends on a complete character boundary (or with
+/// orphaned continuation bytes that should be escaped, not buffered).
+pub(crate) fn incomplete_utf8_tail_len(data: &[u8]) -> usize {
+    if data.is_empty() {
+        return 0;
+    }
+    // Prefer std's verdict when the only problem is an incomplete suffix.
+    match std::str::from_utf8(data) {
+        Ok(_) => 0,
+        Err(e) if e.error_len().is_none() => data.len() - e.valid_up_to(),
+        Err(_) => {
+            // Invalid mid-stream (or orphaned continuations). Only buffer a
+            // trailing incomplete *starter* sequence; never hold garbage.
+            let len = data.len();
+            let lookback = len.min(3);
+            for i in 1..=lookback {
+                let idx = len - i;
+                let needed = match data[idx] {
+                    0x00..=0x7F => 1,
+                    0xC2..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF4 => 4,
+                    _ => 0, // continuation / invalid
+                };
+                if needed == 0 {
+                    continue;
+                }
+                if needed > i {
+                    return i;
+                }
+                return 0;
+            }
+            0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_tail_empty_and_ascii() {
+        assert_eq!(incomplete_utf8_tail_len(b""), 0);
+        assert_eq!(incomplete_utf8_tail_len(b"hello"), 0);
+    }
+
+    #[test]
+    fn incomplete_tail_box_drawing() {
+        // ─ is E2 94 80
+        assert_eq!(incomplete_utf8_tail_len(&[0xE2, 0x94, 0x80]), 0);
+        assert_eq!(incomplete_utf8_tail_len(&[0xE2]), 1);
+        assert_eq!(incomplete_utf8_tail_len(&[0xE2, 0x94]), 2);
+        assert_eq!(incomplete_utf8_tail_len(&[b'-', 0xE2, 0x94]), 2);
+    }
+
+    #[test]
+    fn take_cc_forward_coalesces_across_reads() {
+        // ─ split as [E2] + [94 80]: first read buffers, second emits the char.
+        let mut pending = vec![0xE2];
+        let incomplete = incomplete_utf8_tail_len(&pending);
+        assert_eq!(incomplete, 1);
+        pending.extend_from_slice(&[0x94, 0x80, b'x']);
+        assert_eq!(incomplete_utf8_tail_len(&pending), 0);
+        assert_eq!(&pending[..], &[0xE2, 0x94, 0x80, b'x']);
     }
 }
