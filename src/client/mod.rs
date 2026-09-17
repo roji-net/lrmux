@@ -800,6 +800,25 @@ pub fn run(
                             // Control mode notifications are only for control clients.
                             // The interactive client ignores them.
                         }
+                        ServerMsg::TermOscQuery {
+                            pane_id,
+                            code,
+                            bell_terminated,
+                        } => {
+                            // Child asked for the real terminal's fg/bg color.
+                            // Flush any pending render bytes first so the OSC
+                            // query isn't stuck behind a partial stdout write.
+                            let _ = io::stdout().flush();
+                            if let Some(reply) =
+                                query_outer_osc_color(code, bell_terminated)
+                            {
+                                let msg = proto::encode_client(&ClientMsg::TermOscReply {
+                                    pane_id,
+                                    data: reply,
+                                });
+                                proto::send(&mut stream, &msg)?;
+                            }
+                        }
                     }
                 }
                 // Render once per socket batch instead of once per frame —
@@ -1699,4 +1718,102 @@ fn show_help_overlay(server_version: &str) {
     // Clear and request a full re-render.
     write!(stdout, "\x1b[2J\x1b[H\x1b[?25l").ok();
     stdout.flush().ok();
+}
+
+/// Query the outer terminal's OSC 10 (fg) or 11 (bg) color via `/dev/tty`.
+/// Returns the full reply sequence (`ESC ] … BEL` or `ESC ] … ST`) on success.
+fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
+    if code != 10 && code != 11 {
+        return None;
+    }
+    let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return None;
+    }
+    // Always restore blocking and close on exit.
+    struct TtyFd(i32);
+    impl Drop for TtyFd {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fcntl(
+                    self.0,
+                    libc::F_SETFL,
+                    libc::fcntl(self.0, libc::F_GETFL) & !libc::O_NONBLOCK,
+                );
+                libc::close(self.0);
+            }
+        }
+    }
+    let tty = TtyFd(fd);
+
+    let mut query = Vec::with_capacity(16);
+    query.extend_from_slice(b"\x1b]");
+    query.extend_from_slice(code.to_string().as_bytes());
+    query.extend_from_slice(b";?");
+    if bell_terminated {
+        query.push(0x07);
+    } else {
+        query.extend_from_slice(b"\x1b\\");
+    }
+    let w = unsafe { libc::write(tty.0, query.as_ptr() as *const _, query.len()) };
+    if w < 0 {
+        return None;
+    }
+
+    let mut buf = Vec::with_capacity(128);
+    let mut tmp = [0u8; 256];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut pfd = libc::pollfd {
+            fd: tty.0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = remaining.as_millis().min(250) as i32;
+        let pret = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pret <= 0 {
+            continue;
+        }
+        let n = unsafe { libc::read(tty.0, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+        if n <= 0 {
+            continue;
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+        if let Some(end) = osc_reply_end(&buf) {
+            // Prefer a reply that starts at ESC ]; if leading junk, trim it.
+            if let Some(start) = buf.windows(2).position(|w| w == b"\x1b]") {
+                return Some(buf[start..end].to_vec());
+            }
+            return Some(buf[..end].to_vec());
+        }
+        if buf.len() > 4096 {
+            return None;
+        }
+    }
+}
+
+/// End index (exclusive) of a complete OSC reply in `buf`, or None if incomplete.
+fn osc_reply_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b']' {
+            let mut j = i + 2;
+            while j < buf.len() {
+                if buf[j] == 0x07 {
+                    return Some(j + 1);
+                }
+                if buf[j] == 0x1b && j + 1 < buf.len() && buf[j + 1] == b'\\' {
+                    return Some(j + 2);
+                }
+                j += 1;
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
 }

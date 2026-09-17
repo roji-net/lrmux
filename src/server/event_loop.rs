@@ -135,15 +135,24 @@ pub fn run(
     socket_path: &std::path::Path,
     headless: bool,
 ) -> io::Result<()> {
+    // Capture once at startup. Probes (ListSessions) and failed first
+    // handshakes must not consume / lose `new-server -- cmd` options.
+    let boot = take_bootstrap();
+
     let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
         // Headless mode: create a default session (24x80) without waiting
         // for the first client. Used by `lrmux start-server` for testing
         // and remote management.
-        let session_name = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "session".to_string());
-        let session = Session::new(session_name, 24, 80);
+        let session_name = boot
+            .session_name
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "session".to_string())
+            });
+        let session = make_bootstrap_session(session_name, 24, 80, &boot);
         crate::log::info("server started in headless mode (24x80)");
         (24u16, 80u16, vec![session], vec![])
     } else {
@@ -153,7 +162,7 @@ pub fn run(
         loop {
             // Accept from any listener (Unix or TCP).
             let stream = accept_from_any(&listeners)?;
-            match handshake_first_client(stream) {
+            match handshake_first_client(stream, &boot) {
                 Ok(result) => break result,
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                     crate::log::info("KillServer during initial handshake, shutting down");
@@ -290,21 +299,30 @@ pub fn run(
                 let session = &mut sessions[si];
                 let pane = &mut session.windows[wi].pane;
                 match pane.process_pty_output() {
-                    Ok((true, raw)) => {
+                    Ok((true, raw, osc_queries)) => {
+                        let pane_id = pane.id;
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         // Forward raw output to control clients viewing this window.
                         let cc_bytes = pane.take_cc_forward_bytes(&raw);
                         if !cc_bytes.is_empty() {
-                            forward_output_to_control_clients(&mut clients, pane.id, &cc_bytes);
+                            forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
+                        }
+                        // Proxy OSC 10/11 color queries to a real attached TTY.
+                        for q in osc_queries {
+                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
                         }
                     }
-                    Ok((false, raw)) => {
+                    Ok((false, raw, osc_queries)) => {
+                        let pane_id = pane.id;
                         // Child exited — forward any remaining bytes (including
                         // a flushed incomplete UTF-8 tail) before reaping.
                         let mut cc_bytes = pane.take_cc_forward_bytes(&raw);
                         cc_bytes.extend(pane.flush_cc_forward_bytes());
                         if !cc_bytes.is_empty() {
-                            forward_output_to_control_clients(&mut clients, pane.id, &cc_bytes);
+                            forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
+                        }
+                        for q in osc_queries {
+                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
                         }
                         let exit_code = pane.reap_child().unwrap_or(0);
                         pty_exits.push((si, wi, exit_code));
@@ -505,6 +523,16 @@ pub fn run(
                                             "client fd {} requested refresh",
                                             clients[ci].fd
                                         ));
+                                    }
+                                    ClientMsg::TermOscReply { pane_id, data } => {
+                                        // Real TTY answered OSC 10/11 — inject into the pane.
+                                        if let Some((si, wi)) =
+                                            find_pane_by_id(&sessions, pane_id)
+                                        {
+                                            let _ = sessions[si].windows[wi]
+                                                .pane
+                                                .write_input(&data);
+                                        }
                                     }
                                     ClientMsg::Detach => {
                                         to_remove.push(client_idx);
@@ -1426,6 +1454,42 @@ fn default_session_name(sessions: &[Session]) -> String {
     ensure_unique_session_name(&base, sessions)
 }
 
+/// Bootstrap options passed from the parent via env before `fork_server`.
+struct Bootstrap {
+    command: Option<String>,
+    session_name: Option<String>,
+    cwd: Option<String>,
+}
+
+/// Read and clear `LRMUX_INIT_*` so a later pane spawn does not see them.
+fn take_bootstrap() -> Bootstrap {
+    let command = std::env::var("LRMUX_INIT_COMMAND").ok().filter(|s| !s.is_empty());
+    let session_name = std::env::var("LRMUX_INIT_SESSION").ok().filter(|s| !s.is_empty());
+    let cwd = std::env::var("LRMUX_INIT_CWD").ok().filter(|s| !s.is_empty());
+    // Safety: server is single-threaded at startup.
+    unsafe {
+        std::env::remove_var("LRMUX_INIT_COMMAND");
+        std::env::remove_var("LRMUX_INIT_SESSION");
+        std::env::remove_var("LRMUX_INIT_CWD");
+    }
+    Bootstrap {
+        command,
+        session_name,
+        cwd,
+    }
+}
+
+fn make_bootstrap_session(name: String, rows: u16, cols: u16, boot: &Bootstrap) -> Session {
+    // `new-server -- cmd` uses `$SHELL -ci …` (see Pane::new_with_command) so
+    // interactive rc files load — plain `-c` skips `.zshrc` and breaks
+    // truecolor for tools like vim. No command → default interactive shell.
+    match (&boot.command, &boot.cwd) {
+        (Some(cmd), cwd) => Session::new_with_command(name, rows, cols, cmd, cwd.as_deref()),
+        (None, Some(cwd)) => Session::new_in_cwd(name, rows, cols, cwd),
+        (None, None) => Session::new(name, rows, cols),
+    }
+}
+
 /// Render a pane's grid as plain text (for capture-window).
 /// Each row is trimmed of trailing whitespace and joined with newlines.
 fn render_grid_text(pane: &crate::server::pane::Pane) -> String {
@@ -1669,6 +1733,7 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io
 /// The caller should retry by accepting the next connection.
 fn handshake_first_client(
     stream: crate::ipc::ConnStream,
+    boot: &Bootstrap,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = stream;
     // Bound the handshake read: a client that connects and stays silent
@@ -1714,12 +1779,19 @@ fn handshake_first_client(
     let grid_rows = client_rows.saturating_sub(1);
     let grid_cols = client_cols;
 
-    // Create the first session, named after the current directory.
-    let session_name = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "session".to_string());
-    let mut session = Session::new(session_name, grid_rows, grid_cols);
+    // Create the first session. Prefer LRMUX_INIT_* from `new-server -- cmd`
+    // / fresh `new-session` so we don't leave an empty shell session and
+    // then add a second one for the command.
+    let session_name = boot
+        .session_name
+        .clone()
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "session".to_string())
+        });
+    let mut session = make_bootstrap_session(session_name, grid_rows, grid_cols, boot);
     let window = &mut session.windows[0];
 
     // Send IdentifyAck with grid dimensions (not client dimensions).
@@ -1731,9 +1803,20 @@ fn handshake_first_client(
     });
     proto::send(&mut client, &ack)?;
 
-    // Send full grid snapshot.
-    window.pane.grid.mark_all_dirty();
-    send_grid_update(&mut client, &mut window.pane)?;
+    // Full GridSnapshot (same path as NewWindow / window switch) so the
+    // client resets its outer scroll region and renderer — a bare
+    // GridUpdate left the first pane looking "cursed" vs Ctrl-A c.
+    let (cursor_row, cursor_col, cursor_visible) = window.pane.cursor();
+    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+        rows: window.pane.rows,
+        cols: window.pane.cols,
+        cells: window.pane.snapshot(),
+        cursor_row,
+        cursor_col,
+        cursor_visible,
+    });
+    proto::send(&mut client, &snapshot)?;
+    let _ = window.pane.take_dirty_rows(); // snapshot already has full state
 
     // Send status bar.
     let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
@@ -1869,6 +1952,46 @@ fn accept_new_client(
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Find (session_idx, window_idx) for a pane id.
+fn find_pane_by_id(sessions: &[Session], pane_id: u32) -> Option<(usize, usize)> {
+    for (si, s) in sessions.iter().enumerate() {
+        for (wi, w) in s.windows.iter().enumerate() {
+            if w.pane.id == pane_id {
+                return Some((si, wi));
+            }
+        }
+    }
+    None
+}
+
+/// Ask one attached (non-control) client viewing this window to query its
+/// real TTY for OSC 10/11. First matching viewer wins — one answer is enough.
+fn proxy_osc_color_query(
+    clients: &mut [ClientConn],
+    session_idx: usize,
+    window_idx: usize,
+    pane_id: u32,
+    query: &crate::vt::OscColorQuery,
+) {
+    let msg = proto::encode_server(&ServerMsg::TermOscQuery {
+        pane_id,
+        code: query.code,
+        bell_terminated: query.bell_terminated,
+    });
+    for c in clients.iter_mut() {
+        if c.attach
+            && !c.is_control
+            && c.session_idx == session_idx
+            && c.active_window == window_idx
+        {
+            let _ = client_send(c, &msg);
+            return;
+        }
+    }
+    // No viewer — leave unanswered (app may time out / E1568). Preferable
+    // to inventing a fake palette.
 }
 
 /// Send dirty rows + cursor to clients viewing a specific window in a specific session.
@@ -2371,6 +2494,27 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::ControlCommand { line }
         }
         0x18 => ClientMsg::Refresh,
+        0x19 => {
+            // TermOscReply: pane_id u32 + len u32 + data
+            if data.len() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscReply needs pane_id + length",
+                ));
+            }
+            let pane_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let dlen = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            if data.len() < 8 + dlen {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscReply data truncated",
+                ));
+            }
+            ClientMsg::TermOscReply {
+                pane_id,
+                data: data[8..8 + dlen].to_vec(),
+            }
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
