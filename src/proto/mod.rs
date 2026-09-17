@@ -75,13 +75,24 @@ pub enum ClientMsg {
     },
     /// Request the server's in-memory ring log.
     GetLog,
+    /// Control mode client identifies itself.
+    /// The server will send text notifications instead of grid updates.
+    IdentifyControl { rows: u16, cols: u16 },
+    /// Control mode client sends a tmux-style command line.
+    /// The server parses it using the cmd module and executes it.
+    ControlCommand { line: String },
 }
 
 /// Server → Client messages.
 #[derive(Debug)]
 pub enum ServerMsg {
-    /// Acknowledge identify, send initial grid dimensions.
-    IdentifyAck { rows: u16, cols: u16 },
+    /// Acknowledge identify, send initial grid dimensions, version, and address.
+    IdentifyAck {
+        rows: u16,
+        cols: u16,
+        version: String,
+        address: String,
+    },
     /// Full grid snapshot (sent on first connect, window switch, or after resize).
     GridSnapshot {
         rows: u16,
@@ -100,7 +111,13 @@ pub enum ServerMsg {
     },
     /// Scrollback rows that scrolled off the top since the last update.
     /// Sent before GridUpdate so the client can push them to scrollback.
-    ScrollbackUpdate { rows: Vec<Vec<Cell>> },
+    ScrollbackUpdate {
+        rows: Vec<Vec<Cell>>,
+        /// True when this is a history replay after a GridSnapshot (window
+        /// switch / attach); false for live scroll lines. The client uses
+        /// it to decide whether to scroll the host terminal.
+        replay: bool,
+    },
     /// Child process exited.
     PaneExit { code: u8 },
     /// Error message.
@@ -112,12 +129,18 @@ pub enum ServerMsg {
         active: u16,
         session_count: u16,
     },
-    /// List of session names on this server (response to ListSessions).
-    SessionList { sessions: Vec<String> },
+    /// List of session names + server address (response to ListSessions).
+    SessionList {
+        sessions: Vec<String>,
+        address: String,
+    },
     /// Captured window content (response to CaptureWindow).
     WindowCapture { content: String },
     /// Server ring log (response to GetLog).
     LogContent { lines: Vec<String> },
+    /// Control mode notification: a text line to print to the control client's stdout.
+    /// Format: "%window-add @1", "%output %0 hello", "%session-changed $1 name", etc.
+    ControlNotify { line: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -143,6 +166,8 @@ const C_NEW_WINDOW_IN: u8 = 0x12;
 const C_CAPTURE_WINDOW: u8 = 0x13;
 const C_SEND_KEYS: u8 = 0x14;
 const C_GET_LOG: u8 = 0x15;
+const C_IDENTIFY_CONTROL: u8 = 0x16;
+const C_CONTROL_COMMAND: u8 = 0x17;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -154,6 +179,7 @@ const S_STATUS_BAR: u8 = 0x15;
 const S_SESSION_LIST: u8 = 0x16;
 const S_WINDOW_CAPTURE: u8 = 0x18;
 const S_LOG_CONTENT: u8 = 0x19;
+const S_CONTROL_NOTIFY: u8 = 0x1a;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -311,6 +337,16 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::GetLog => {
             payload.push(C_GET_LOG);
         }
+        ClientMsg::IdentifyControl { rows, cols } => {
+            payload.push(C_IDENTIFY_CONTROL);
+            payload.extend_from_slice(&rows.to_le_bytes());
+            payload.extend_from_slice(&cols.to_le_bytes());
+        }
+        ClientMsg::ControlCommand { line } => {
+            payload.push(C_CONTROL_COMMAND);
+            payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
+            payload.extend_from_slice(line.as_bytes());
+        }
     }
     frame(payload)
 }
@@ -319,10 +355,19 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
 pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
     let mut payload = Vec::new();
     match msg {
-        ServerMsg::IdentifyAck { rows, cols } => {
+        ServerMsg::IdentifyAck {
+            rows,
+            cols,
+            version,
+            address,
+        } => {
             payload.push(S_IDENTIFY_ACK);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
+            payload.extend_from_slice(&(version.len() as u32).to_le_bytes());
+            payload.extend_from_slice(version.as_bytes());
+            payload.extend_from_slice(&(address.len() as u32).to_le_bytes());
+            payload.extend_from_slice(address.as_bytes());
         }
         ServerMsg::GridSnapshot {
             rows,
@@ -362,8 +407,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
         }
-        ServerMsg::ScrollbackUpdate { rows } => {
+        ServerMsg::ScrollbackUpdate { rows, replay } => {
             payload.push(S_SCROLLBACK_UPDATE);
+            payload.push(*replay as u8);
             payload.extend_from_slice(&(rows.len() as u32).to_le_bytes());
             for row in rows {
                 payload.extend_from_slice(&(row.len() as u32).to_le_bytes());
@@ -398,13 +444,15 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&active.to_le_bytes());
             payload.extend_from_slice(&session_count.to_le_bytes());
         }
-        ServerMsg::SessionList { sessions } => {
+        ServerMsg::SessionList { sessions, address } => {
             payload.push(S_SESSION_LIST);
             payload.extend_from_slice(&(sessions.len() as u32).to_le_bytes());
             for name in sessions {
                 payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 payload.extend_from_slice(name.as_bytes());
             }
+            payload.extend_from_slice(&(address.len() as u32).to_le_bytes());
+            payload.extend_from_slice(address.as_bytes());
         }
         ServerMsg::WindowCapture { content } => {
             payload.push(S_WINDOW_CAPTURE);
@@ -418,6 +466,11 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
                 payload.extend_from_slice(line.as_bytes());
             }
+        }
+        ServerMsg::ControlNotify { line } => {
+            payload.push(S_CONTROL_NOTIFY);
+            payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
+            payload.extend_from_slice(line.as_bytes());
         }
     }
     frame(payload)
@@ -623,6 +676,16 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             })
         }
         C_GET_LOG => Ok(ClientMsg::GetLog),
+        C_IDENTIFY_CONTROL => {
+            let rows = read_u16(&mut r)?;
+            let cols = read_u16(&mut r)?;
+            Ok(ClientMsg::IdentifyControl { rows, cols })
+        }
+        C_CONTROL_COMMAND => {
+            let len = read_u32(&mut r)? as usize;
+            let line = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ClientMsg::ControlCommand { line })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -638,7 +701,26 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
         S_IDENTIFY_ACK => {
             let rows = read_u16(&mut r)?;
             let cols = read_u16(&mut r)?;
-            Ok(ServerMsg::IdentifyAck { rows, cols })
+            let version = if r.is_empty() {
+                "unknown".to_string()
+            } else {
+                let len = read_u32(&mut r)? as usize;
+                let s = String::from_utf8_lossy(&r[..len]).into_owned();
+                r = &r[len..];
+                s
+            };
+            let address = if r.is_empty() {
+                "unknown".to_string()
+            } else {
+                let len = read_u32(&mut r)? as usize;
+                String::from_utf8_lossy(&r[..len]).into_owned()
+            };
+            Ok(ServerMsg::IdentifyAck {
+                rows,
+                cols,
+                version,
+                address,
+            })
         }
         S_GRID_SNAPSHOT => {
             let rows = read_u16(&mut r)?;
@@ -683,6 +765,7 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             })
         }
         S_SCROLLBACK_UPDATE => {
+            let replay = read_u8(&mut r)? != 0;
             let row_count = read_u32(&mut r)? as usize;
             let mut rows = Vec::with_capacity(row_count);
             for _ in 0..row_count {
@@ -693,7 +776,7 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 }
                 rows.push(row);
             }
-            Ok(ServerMsg::ScrollbackUpdate { rows })
+            Ok(ServerMsg::ScrollbackUpdate { rows, replay })
         }
         S_PANE_EXIT => {
             let code = read_u8(&mut r)?;
@@ -735,7 +818,13 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 r = &r[len..];
                 sessions.push(String::from_utf8_lossy(&bytes).into_owned());
             }
-            Ok(ServerMsg::SessionList { sessions })
+            let address = if r.is_empty() {
+                "unknown".to_string()
+            } else {
+                let len = read_u32(&mut r)? as usize;
+                String::from_utf8_lossy(&r[..len]).into_owned()
+            };
+            Ok(ServerMsg::SessionList { sessions, address })
         }
         S_WINDOW_CAPTURE => {
             let len = read_u32(&mut r)? as usize;
@@ -751,6 +840,11 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 r = &r[len..];
             }
             Ok(ServerMsg::LogContent { lines })
+        }
+        S_CONTROL_NOTIFY => {
+            let len = read_u32(&mut r)? as usize;
+            let line = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ServerMsg::ControlNotify { line })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

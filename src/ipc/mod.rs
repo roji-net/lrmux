@@ -17,7 +17,9 @@ pub fn socket_path(server_name: &str) -> PathBuf {
 }
 
 /// Bind a Unix socket listener at the given path.
-/// Removes any stale socket file first. Creates the parent directory.
+/// Only removes the socket file if it is genuinely stale (connect fails).
+/// Never unlinks a socket that has a live listener — that would orphan a
+/// running server and let a second server steal the path.
 pub fn listen(path: &Path) -> io::Result<UnixListener> {
     // Create parent directory with 0700 permissions.
     if let Some(parent) = path.parent() {
@@ -26,15 +28,27 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(parent, perms)?;
     }
-    // Remove stale socket file if it exists.
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    // Set umask to 077 so the socket file gets 0600 permissions.
+    // Try binding first. If the path exists, this fails with EADDRINUSE.
     let old_umask = unsafe { libc::umask(0o077) };
     let listener = UnixListener::bind(path);
     unsafe { libc::umask(old_umask) };
-    listener
+    match listener {
+        Ok(l) => Ok(l),
+        Err(e) => {
+            // Only remove the file if it's truly stale — a socket file that
+            // refuses connections means no live listener owns it. If connect
+            // succeeds, a live server owns this path; don't touch it.
+            if path.exists() && UnixStream::connect(path).is_err() {
+                std::fs::remove_file(path)?;
+                let old_umask = unsafe { libc::umask(0o077) };
+                let listener = UnixListener::bind(path);
+                unsafe { libc::umask(old_umask) };
+                listener
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Connect to a server at the given socket path.

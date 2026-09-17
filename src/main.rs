@@ -18,6 +18,7 @@ mod pty;
 mod server;
 mod statusbar;
 mod term;
+mod version;
 mod vt;
 
 use std::io;
@@ -59,6 +60,8 @@ fn main() {
 enum CliAction {
     /// Default: show the selector (or auto-join if exactly one server/session).
     Default,
+    /// `lrmux -CC [-t <target>]`: tmux control mode for iTerm2 integration.
+    ControlMode { target: Option<String> },
     /// `lrmux -- <cmd>`: create a new window running <cmd> (non-interactive when nested).
     RunCommand(String),
     /// `session-selector` / `ss`: force the interactive selector (no auto-join).
@@ -70,20 +73,24 @@ enum CliAction {
         command: Option<String>,
         detached: bool,
     },
-    /// `attach-session -t <target>`: attach to an existing session.
-    AttachSession { target: Option<String> },
+    /// `attach-session [-s <server>] [{-t <target> | <target>}]`
+    /// target: [server][:][session].
+    AttachSession {
+        server: Option<String>,
+        session: Option<String>,
+    },
     /// `select-session -t <name>`: switch the interactive client to a session.
     SelectSession(String),
     /// `kill-session -t <name>`: kill a session.
     KillSession(Option<String>),
-    /// `new-server -s <name>`: start a new server with the given name.
-    NewServer(String),
+    /// `new-server -s <name> [-CC]`: start a new server, optionally in iTerm2 control mode.
+    NewServer { name: String, control: bool },
     /// `start-server -s <name> [--tcp addr]`: start a headless server.
     StartServer { name: String, tcp: Option<String> },
     /// `list-servers`: list all running servers.
     ListServers,
-    /// `list-sessions`: list sessions on a server.
-    ListSessions,
+    /// `list-sessions [server]`: list sessions (all servers, or one).
+    ListSessions(Option<String>),
     /// `list-windows -t <target>`: list windows in a session.
     ListWindows(Option<String>),
     /// `kill-server -t <name>`: kill a named server.
@@ -109,6 +116,8 @@ enum CliAction {
     SelectWindow(cmd::Target),
     /// `rename-window -t <target> <name>`
     RenameWindow { target: cmd::Target, name: String },
+    /// `versions`: show client and all server versions.
+    Versions,
     /// `--help` / `-h`: show usage.
     Help,
 }
@@ -125,7 +134,7 @@ fn print_help() {
          lrmux                       Attach to a session (selector if multiple exist)\n    \
          lrmux -- <cmd> [args]       Create a new window running <cmd> and attach\n    \
          lrmux new-session -s <name> [-c <cwd>] [-d] [-- <cmd>]\n    \
-         lrmux attach-session -t <session>\n    \
+         lrmux attach-session [-s <server>] ([-t <[server:][session]>] | <[server:][session]>)\n    \
          lrmux select-session -t <name>\n    \
          lrmux kill-session -t <name>\n    \
          lrmux new-window -t <target> -n <name> [-c <cwd>] [-- <cmd>]\n    \
@@ -134,13 +143,18 @@ fn print_help() {
          lrmux rename-window -t <target> <name>\n    \
          lrmux send-keys -t <target> <keys> [-q]\n    \
          lrmux capture-pane -t <target> [-p]\n    \
-         lrmux list-sessions\n    \
+         lrmux list-sessions [-s <server>]\n    \
          lrmux list-windows -t <session>\n    \
          lrmux list-servers\n    \
-         lrmux kill-server -t <name>\n    \
-         lrmux new-server -s <name>\n    \
+         lrmux kill-server -s <name>\n    \
+         lrmux new-server -s <name> [-CC]\n    \
          lrmux start-server -s <name> [--tcp <addr>]\n    \
          lrmux session-selector      Force the interactive session selector\n    \
+         lrmux versions              Show client and all running server versions
+    \
+         lrmux -CC [-s <server>]     tmux control mode (for iTerm2 integration)
+    \
+         lrmux attach -CC -s <server>  Attach to a server in iTerm2 control mode\n    \
          lrmux --help, -h            Show this help message\n\
          \n\
          ALIASES:\n    \
@@ -228,10 +242,27 @@ fn parse_args() -> CliAction {
     }
 
     let subcmd = args.get(1).map(|s| s.as_str());
-    let subcmd_args = &args[2..];
+    let subcmd_args = if args.len() > 2 { &args[2..] } else { &[] };
+
+    // `-h`/`--help` after any subcommand shows the general help
+    // (except after `--`, where args belong to the wrapped command).
+    if subcmd != Some("--") && subcmd_args.iter().any(|a| a == "-h" || a == "--help") {
+        return CliAction::Help;
+    }
 
     match subcmd {
         Some("--help") | Some("-h") => CliAction::Help,
+        Some("-CC") | Some("control-mode") | Some("control") => {
+            let parsed = cmd::parse_flags(subcmd_args);
+            CliAction::ControlMode {
+                target: parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .or_else(|| parsed.get("t"))
+                    .or_else(|| parsed.get("target"))
+                    .map(|s| s.to_string()),
+            }
+        }
         Some("--") => {
             // `lrmux -- <cmd> [args]` — run a command in a new window.
             let cmd = args[2..].join(" ");
@@ -245,11 +276,54 @@ fn parse_args() -> CliAction {
         Some("new-session") | Some("new") => parse_new_session(subcmd_args),
         Some("attach-session") | Some("attach") => {
             let parsed = cmd::parse_flags(subcmd_args);
-            CliAction::AttachSession {
-                target: parsed
+            if parsed.has("CC") {
+                CliAction::ControlMode {
+                    target: parsed
+                        .get("s")
+                        .or_else(|| parsed.get("server"))
+                        .or_else(|| parsed.get("t"))
+                        .or_else(|| parsed.get("target"))
+                        .map(|s| s.to_string()),
+                }
+            } else {
+                // -s / --server sets the server explicitly.
+                // -t / --target or the first positional arg is [server:][session].
+                let server = parsed.get("s").or_else(|| parsed.get("server"));
+                let target = parsed
                     .get("t")
                     .or_else(|| parsed.get("target"))
-                    .map(|s| s.to_string()),
+                    .or_else(|| parsed.positional.first().map(|s| s.as_str()));
+
+                let (srv, sess) = if let Some(srv) = server {
+                    // -s means server only; any other value is a session name.
+                    (Some(srv.to_string()), target.map(|t| t.to_string()))
+                } else if let Some(t) = target {
+                    if let Some((srv, sess)) = t.split_once(':') {
+                        (
+                            if srv.is_empty() {
+                                None
+                            } else {
+                                Some(srv.to_string())
+                            },
+                            if sess.is_empty() {
+                                None
+                            } else {
+                                Some(sess.to_string())
+                            },
+                        )
+                    } else if ipc::server_exists(&socket_path(t)) {
+                        (Some(t.to_string()), None)
+                    } else {
+                        (None, Some(t.to_string()))
+                    }
+                } else {
+                    (None, None)
+                };
+
+                CliAction::AttachSession {
+                    server: srv,
+                    session: sess,
+                }
             }
         }
         Some("select-session") => {
@@ -278,11 +352,23 @@ fn parse_args() -> CliAction {
                 .or_else(|| parsed.get("server"))
                 .map(|s| s.to_string())
                 .unwrap_or_else(ipc::auto_server_name);
-            CliAction::NewServer(name)
+            CliAction::NewServer {
+                name,
+                control: parsed.has("CC"),
+            }
         }
         Some("start-server") => parse_start_server(subcmd_args),
         Some("list-servers") | Some("ls-servers") => CliAction::ListServers,
-        Some("list-sessions") | Some("ls-sessions") | Some("ls") => CliAction::ListSessions,
+        Some("list-sessions") | Some("ls-sessions") | Some("ls") => {
+            let parsed = cmd::parse_flags(subcmd_args);
+            CliAction::ListSessions(
+                parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .map(|s| s.to_string())
+                    .or_else(|| parsed.positional.first().cloned()),
+            )
+        }
         Some("list-windows") | Some("lsw") => {
             let parsed = cmd::parse_flags(subcmd_args);
             CliAction::ListWindows(
@@ -295,8 +381,8 @@ fn parse_args() -> CliAction {
         Some("kill-server") => {
             let parsed = cmd::parse_flags(subcmd_args);
             let name = parsed
-                .get("t")
-                .or_else(|| parsed.get("target"))
+                .get("s")
+                .or_else(|| parsed.get("server"))
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "default".to_string());
             CliAction::KillServer(name)
@@ -326,6 +412,7 @@ fn parse_args() -> CliAction {
             }
         }
         Some("send-keys") | Some("send") => parse_send_keys(subcmd_args),
+        Some("versions") | Some("version") => CliAction::Versions,
         _ => CliAction::Default,
     }
 }
@@ -503,6 +590,60 @@ fn run() -> io::Result<()> {
     let nested = std::env::var("LRMUX").is_ok();
     let nested_server = std::env::var("LRMUX_SERVER").unwrap_or_else(|_| "default".to_string());
     if nested {
+        match &action {
+            CliAction::AttachSession {
+                server: Some(srv), ..
+            } if srv != &nested_server => {
+                eprintln!(
+                    "lrmux: cannot attach to server '{srv}' from inside lrmux; \
+                     detach first (Ctrl-A d)"
+                );
+                return Ok(());
+            }
+            CliAction::AttachSession { session: None, .. } => {
+                // No session requested — nothing to switch to. Treat as a new window.
+                // (This also covers `lrmux attach -s <current_server>`.)
+            }
+            CliAction::AttachSession {
+                session: Some(sess),
+                ..
+            } => {
+                // Can't attach interactively from inside — the outer client
+                // owns the terminal. A session switch on the nested server is ok.
+                if sess.is_empty() {
+                    eprintln!("lrmux: already attached to server '{nested_server}'");
+                    return Ok(());
+                }
+                // Validate the session exists before claiming a switch.
+                if let Ok((_, sessions)) = query_session_names(&nested_server)
+                    && !sessions.iter().any(|n| n == sess)
+                {
+                    eprintln!("lrmux: no session '{sess}' on server '{nested_server}'");
+                    return Ok(());
+                }
+                let sock = socket_path(&nested_server);
+                let mut stream = ipc::connect(&sock)?;
+                let msg = proto::encode_client(&ClientMsg::Identify {
+                    rows: 24,
+                    cols: 80,
+                    attach: false,
+                });
+                proto::send(&mut stream, &msg)?;
+                match proto::decode_server(&mut stream) {
+                    Ok(ServerMsg::IdentifyAck { .. }) => {}
+                    _ => {
+                        eprintln!("lrmux: failed to connect to server");
+                        return Ok(());
+                    }
+                }
+                let msg = proto::encode_client(&ClientMsg::SelectSession { name: sess.clone() });
+                proto::send(&mut stream, &msg)?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                eprintln!("lrmux: switched to session '{sess}'");
+                return Ok(());
+            }
+            _ => {}
+        }
         match action {
             CliAction::Default | CliAction::RunCommand(_) | CliAction::AttachSession { .. } => {
                 // Create a new window on the parent's server, non-interactive.
@@ -615,7 +756,26 @@ fn run() -> io::Result<()> {
                 eprintln!("lrmux: switched to session '{name}'");
                 return Ok(());
             }
-            CliAction::NewServer(_) | CliAction::SessionSelector => {
+            CliAction::NewServer { name, control } => {
+                // Starting a server doesn't need a terminal — only the
+                // attach does. Fork it and return; it can be attached to
+                // from outside lrmux (or via the selector).
+                let sock = socket_path(&name);
+                if ipc::server_exists(&sock) {
+                    eprintln!("lrmux: server '{name}' is already running");
+                    return Ok(());
+                }
+                if control {
+                    eprintln!("lrmux: cannot use -CC from inside lrmux; detach first");
+                    return Ok(());
+                }
+                eprintln!("lrmux: starting server '{name}' on {}...", sock.display());
+                fork_server(&sock, None, false)?;
+                wait_for_server(&sock)?;
+                eprintln!("lrmux: server '{name}' ready (attach from outside lrmux)");
+                return Ok(());
+            }
+            CliAction::SessionSelector => {
                 eprintln!(
                     "lrmux: this command needs an interactive terminal.\n\
                      \n\
@@ -629,12 +789,12 @@ fn run() -> io::Result<()> {
                      Ctrl-A d    Detach\n  \
                      Ctrl-A ?    Show keybindings\n\n\
                      Non-interactive subcommands still work:\n  \
-                     lrmux list-sessions\n  \
+                     lrmux list-sessions [-s <server>]\n  \
                      lrmux list-servers\n  \
                      lrmux new-window -t <target> [-- cmd]\n  \
                      lrmux capture-pane -t <target>\n  \
                      lrmux send-keys -t <target> <keys>\n  \
-                     lrmux kill-server -t <name>\n  \
+                     lrmux kill-server -s <name>\n  \
                      lrmux --help"
                 );
                 return Ok(());
@@ -649,6 +809,11 @@ fn run() -> io::Result<()> {
             print_help();
             Ok(())
         }
+        CliAction::Versions => {
+            print_versions();
+            Ok(())
+        }
+        CliAction::ControlMode { target } => run_control_mode(target.as_deref()),
         CliAction::NewSession {
             name,
             cwd,
@@ -701,17 +866,43 @@ fn run() -> io::Result<()> {
                 }
             }
         }
-        CliAction::AttachSession { target } => {
-            let sock = socket_path("default");
-            let session = target.map(|s| s.to_string());
-            match client::run(&sock, None, session, None, None) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+        CliAction::AttachSession { server, session } => {
+            // The parser already resolved [server][:][session].
+            let server = server.unwrap_or_else(|| "default".to_string());
+            let sock = socket_path(&server);
+            if !ipc::server_exists(&sock) {
+                return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "no server running; start one with `lrmux` first",
-                )),
-                Err(e) => Err(e),
+                    format!(
+                        "server '{server}' not running; start it with `lrmux new-server -s {server}`"
+                    ),
+                ));
             }
+            // Validate the requested session exists before attaching —
+            // otherwise SelectSession would fail silently and we'd land
+            // on an arbitrary session.
+            let (_, sessions) = query_session_names(&server).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("server '{server}' is not responding ({e})"),
+                )
+            })?;
+            if let Some(ref s) = session
+                && !sessions.iter().any(|n| n == s)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no session '{s}' on server '{server}'"),
+                ));
+            }
+            // A fresh non-headless server has no sessions yet — create one
+            // so the attach isn't a blank screen.
+            let new_session = if sessions.is_empty() && session.is_none() {
+                Some(None)
+            } else {
+                None
+            };
+            client::run(&sock, new_session, session, None, None)
         }
         CliAction::SelectSession(name) => {
             // Non-interactive: send SelectSession to the default server.
@@ -755,12 +946,33 @@ fn run() -> io::Result<()> {
             // Server exists: create a new window with the command and attach.
             client::run(&sock, None, None, Some(cmd), None)
         }
-        CliAction::NewServer(name) => start_new_server(&name, None),
+        CliAction::NewServer { name, control } => {
+            if control {
+                let sock = socket_path(&name);
+                if ipc::server_exists(&sock) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("server '{name}' is already running"),
+                    ));
+                }
+                unsafe {
+                    let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                    if devnull >= 0 {
+                        libc::dup2(devnull, libc::STDERR_FILENO);
+                        libc::close(devnull);
+                    }
+                }
+                start_headless_server(&name, None)?;
+                crate::client::control::run(&sock)
+            } else {
+                start_new_server(&name, None)
+            }
+        }
         CliAction::StartServer { name, tcp } => start_headless_server(&name, tcp.as_deref()),
         CliAction::Default => run_default(),
         CliAction::SessionSelector => run_session_selector(),
         CliAction::ListServers => list_servers(),
-        CliAction::ListSessions => list_sessions(),
+        CliAction::ListSessions(server) => list_sessions(server.as_deref()),
         CliAction::ListWindows(_target) => {
             // TODO: implement list-windows
             eprintln!("lrmux: list-windows not yet implemented");
@@ -817,9 +1029,6 @@ fn run_default() -> io::Result<()> {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                if sock.exists() {
-                    let _ = std::fs::remove_file(&sock);
-                }
                 fork_server(&sock, None, false)?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
@@ -849,9 +1058,6 @@ fn run_session_selector() -> io::Result<()> {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                if sock.exists() {
-                    let _ = std::fs::remove_file(&sock);
-                }
                 fork_server(&sock, None, false)?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
@@ -874,11 +1080,8 @@ fn start_new_server(name: &str, new_session: Option<Option<String>>) -> io::Resu
     }
 
     eprintln!("lrmux: starting server '{name}' on {}...", sock.display());
-    // Remove any stale socket file before forking so wait_for_server()
-    // doesn't see the old socket and race ahead of the new server.
-    if sock.exists() {
-        let _ = std::fs::remove_file(&sock);
-    }
+    // No pre-removal of the socket file: ipc::listen() only unlinks genuinely
+    // stale sockets, and wait_for_server() waits for a real connection.
     fork_server(&sock, None, false)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: server '{name}' ready.");
@@ -905,14 +1108,54 @@ fn start_headless_server(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
     if let Some(ref addr) = tcp_addr {
         eprintln!("lrmux: TCP listener: {addr}");
     }
-    if sock.exists() {
-        let _ = std::fs::remove_file(&sock);
-    }
     fork_server(&sock, tcp_addr, true)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: headless server '{name}' ready.");
     eprintln!("lrmux: connect with `lrmux` or use CLI commands (send-keys, capture-window, etc.)");
     Ok(())
+}
+
+/// Run iTerm2 control mode against a target server.
+/// Default target means the default server (auto-start a headless one if missing).
+fn run_control_mode(target: Option<&str>) -> io::Result<()> {
+    // CRITICAL: No output to stdout/stderr except DCS + % notifications.
+    // iTerm2 parses everything on the PTY as tmux control protocol.
+    // Redirect stderr to /dev/null so server startup messages don't leak.
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+        }
+    }
+
+    let server = resolve_control_target(target)?;
+    let sock = socket_path(&server);
+    if !ipc::server_exists(&sock) {
+        if server == "default" {
+            // Start a headless default server silently.
+            fork_server(&sock, None, true)?;
+            wait_for_server(&sock)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "server '{server}' not running; start it with `lrmux new-server -s {server}`"
+                ),
+            ));
+        }
+    }
+    crate::client::control::run(&sock)
+}
+
+/// Resolve a -t target string to a server name for control mode.
+/// `foo` → `foo` if it is a running server, otherwise error.
+/// `foo:bar` or `foo:` → `foo`; `:bar` or empty → `default`.
+fn resolve_control_target(target: Option<&str>) -> io::Result<String> {
+    let t = target.unwrap_or("default");
+    let (srv, _) = t.split_once(':').unwrap_or((t, ""));
+    let srv = if srv.is_empty() { "default" } else { srv };
+    Ok(srv.to_string())
 }
 
 /// List all running servers.
@@ -937,26 +1180,153 @@ fn list_servers() -> io::Result<()> {
     Ok(())
 }
 
-/// List sessions on a server.
-fn list_sessions() -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
+/// Query a server's session names and address via a lightweight connection.
+/// Times out after 2s — a wedged server accepts but never responds.
+fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
+    let mut stream = connect_to_server(server)?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::SessionList { sessions }) => {
-            if sessions.is_empty() {
-                eprintln!("(no sessions)");
-            } else {
-                for s in &sessions {
-                    println!("{s}");
-                }
-            }
-            Ok(())
-        }
+        Ok(ServerMsg::SessionList { sessions, address }) => Ok((address, sessions)),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "expected SessionList",
         )),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(io::Error::new(e.kind(), "timed out"))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// List sessions. With a server argument, list that server's sessions as
+/// `session @ <address>`. Without one, list sessions across all running
+/// servers in `server:session @ <address>` format.
+fn list_sessions(server: Option<&str>) -> io::Result<()> {
+    if let Some(name) = server {
+        let (address, sessions) = query_session_names(name)?;
+        if sessions.is_empty() {
+            eprintln!("(no sessions)");
+        } else {
+            for s in &sessions {
+                println!("{s} @ {address}");
+            }
+        }
+        return Ok(());
+    }
+
+    // All servers: discover sockets in /tmp/lrmux-<UID>/.
+    let uid = unsafe { libc::getuid() };
+    let dir = format!("/tmp/lrmux-{uid}");
+    let mut servers: Vec<String> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(&dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if ipc::server_exists(&path)
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                servers.push(name.to_string());
+            }
+        }
+    }
+    servers.sort();
+    let multi = servers.len() > 1;
+    let mut any = false;
+    for name in &servers {
+        let (address, sessions) = match query_session_names(name) {
+            Ok((a, s)) => (a, s),
+            Err(e) => {
+                eprintln!("lrmux: server '{name}' is not responding ({e})");
+                continue;
+            }
+        };
+        for s in &sessions {
+            any = true;
+            if multi {
+                println!("{name}:{s} @ {address}");
+            } else {
+                println!("{s} @ {address}");
+            }
+        }
+    }
+    if !any {
+        eprintln!("(no sessions)");
+    }
+    Ok(())
+}
+
+/// Whether to emit ANSI color in CLI output.
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Print the client version and the versions of all running servers.
+fn print_versions() {
+    let color = use_color();
+    let reset = if color { "\x1b[0m" } else { "" };
+    let cyan = if color { "\x1b[36m" } else { "" };
+    let green = if color { "\x1b[32m" } else { "" };
+    let yellow = if color { "\x1b[33m" } else { "" };
+    let red = if color { "\x1b[31m" } else { "" };
+    let dim = if color { "\x1b[2m" } else { "" };
+
+    println!("{cyan}client{reset}: {}", crate::version::VERSION);
+
+    let uid = unsafe { libc::getuid() };
+    let dir = format!("/tmp/lrmux-{uid}");
+    let mut servers: Vec<String> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(&dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if ipc::server_exists(&path)
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                servers.push(name.to_string());
+            }
+        }
+    }
+    servers.sort();
+    if servers.is_empty() {
+        eprintln!("{dim}(no servers running){reset}");
+        return;
+    }
+
+    println!();
+    println!("{green}servers found{reset}");
+    println!("{dim}-------------{reset}");
+
+    for name in &servers {
+        match query_server_version(name) {
+            Ok((version, address)) => {
+                println!("{yellow}{name}{reset} @ {cyan}{address}{reset}: {version}")
+            }
+            Err(e) => eprintln!("{red}lrmux:{reset} server '{name}' is not responding ({e})"),
+        }
+    }
+}
+
+/// Query a running server for its version string and address.
+fn query_server_version(server: &str) -> io::Result<(String, String)> {
+    let mut stream = connect_to_server(server)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let identify = proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+    });
+    proto::send(&mut stream, &identify)?;
+    match proto::decode_server(&mut stream) {
+        Ok(ServerMsg::IdentifyAck {
+            version, address, ..
+        }) => Ok((version, address)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected IdentifyAck",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(io::Error::new(e.kind(), "timed out"))
+        }
         Err(e) => Err(e),
     }
 }
@@ -1150,8 +1520,11 @@ fn fork_server(sock: &Path, tcp_addr: Option<&str>, headless: bool) -> io::Resul
 /// Just checks for socket file existence — the kernel will queue
 /// the client's connect() until the server calls accept().
 fn wait_for_server(sock: &Path) -> io::Result<()> {
-    for _ in 0..100 {
-        if sock.exists() {
+    // Poll until the socket accepts connections — a stale socket file that
+    // merely exists must not satisfy this wait (connect on it fails with
+    // ECONNREFUSED until the new server rebinds).
+    for _ in 0..500 {
+        if ipc::server_exists(sock) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(10));
