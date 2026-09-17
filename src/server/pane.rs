@@ -1,6 +1,7 @@
 // Pane: a rectangular region with a PTY running a child process, plus a grid.
 
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::grid::{Cell, Grid};
 use crate::pty::{Pty, PtySize, default_shell_argv};
@@ -8,8 +9,12 @@ use crate::vt;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use std::ffi::CString;
 
+/// Global pane ID counter (tmux uses %N format).
+static PANE_ID: AtomicU32 = AtomicU32::new(0);
+
 /// A single pane: PTY + grid + VT parser.
 pub struct Pane {
+    pub id: u32,
     pub pty: Pty,
     pub grid: Grid,
     pub vt_parser: vte::Parser,
@@ -20,6 +25,9 @@ pub struct Pane {
     /// Exit code of the child process (set when exited becomes true).
     /// Negative values indicate the child was killed by a signal (e.g. -9 for SIGKILL).
     pub exit_code: Option<i32>,
+    /// Input bytes waiting to be written to the PTY master when it becomes writable.
+    /// Prevents partial escape sequences when the child is slow to drain stdin.
+    pub pending_input: Vec<u8>,
 }
 
 impl Pane {
@@ -53,6 +61,7 @@ impl Pane {
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {
+            id: PANE_ID.fetch_add(1, Ordering::Relaxed),
             pty,
             grid,
             vt_parser,
@@ -60,7 +69,13 @@ impl Pane {
             cols,
             exited: false,
             exit_code: None,
+            pending_input: Vec::new(),
         }
+    }
+
+    /// Format the pane ID as tmux-style: %N
+    pub fn id_str(&self) -> String {
+        format!("%{}", self.id)
     }
 
     /// Get the PTY master fd (for poll). Returns -1 if the child has exited.
@@ -72,28 +87,42 @@ impl Pane {
         }
     }
 
-    /// Read PTY output, parse into grid. Returns true if the child is still alive.
-    pub fn process_pty_output(&mut self) -> io::Result<bool> {
+    /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes).
+    /// raw_bytes is the unprocessed output from the PTY (for control mode forwarding).
+    pub fn process_pty_output(&mut self) -> io::Result<(bool, Vec<u8>)> {
         if self.exited {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
-        let mut buf = [0u8; 8192];
+        // Drain the PTY until EAGAIN so a burst becomes a single grid
+        // update — one 8KB read per poll event would generate a frame per
+        // chunk and flood slow clients past their socket buffer cap.
+        // Cap at 4MB per event so an endless producer can't starve the
+        // event loop (poll refires while data remains).
+        const MAX_DRAIN: usize = 4 * 1024 * 1024;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 65536];
         let fd = self.pty_fd();
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if n > 0 {
-            let n = n as usize;
-            vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
-            Ok(true)
-        } else if n == 0 {
-            Ok(false)
-        } else {
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n > 0 {
+                let n = n as usize;
+                raw.extend_from_slice(&buf[..n]);
+                vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
+                if raw.len() >= MAX_DRAIN {
+                    return Ok((true, raw));
+                }
+                continue;
+            }
+            if n == 0 {
+                return Ok((false, raw));
+            }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                Ok(true)
+                return Ok((true, raw));
             } else if err.raw_os_error() == Some(libc::EIO) {
-                Ok(false)
+                return Ok((false, raw));
             } else {
-                Err(err)
+                return Err(err);
             }
         }
     }
@@ -152,21 +181,75 @@ impl Pane {
     }
 
     /// Write input bytes to the PTY (keystrokes from client).
-    pub fn write_input(&self, data: &[u8]) -> io::Result<()> {
-        let fd = self.pty_fd();
-        let mut written = 0;
-        while written < data.len() {
-            let w = unsafe {
-                libc::write(
-                    fd,
-                    data[written..].as_ptr() as *const _,
-                    (data.len() - written) as _,
-                )
-            };
-            if w < 0 {
-                return Err(io::Error::last_os_error());
+    /// The master fd is nonblocking. If the child is slow to drain stdin,
+    /// the remaining bytes are queued in `pending_input` and flushed by the
+    /// event loop when the PTY becomes writable. This keeps escape sequences
+    /// intact (e.g., arrow keys) instead of splitting them across writes.
+    pub fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
+        self.pending_input.extend_from_slice(data);
+        self.flush_pending_input()?;
+        // `flush_pending_input` holds an incomplete ESC sequence until more
+        // bytes arrive (so CSI can be written atomically). A write_input of
+        // a lone ESC (Esc key) would otherwise sit forever — flush it now.
+        // Control-mode send-keys coalescing writes full sequences in one
+        // call, so this path does not re-split arrow keys.
+        if self.pending_input.len() == 1 && self.pending_input[0] == 0x1b {
+            let fd = self.pty_fd();
+            if fd >= 0 {
+                let w = unsafe { libc::write(fd, self.pending_input.as_ptr() as *const _, 1) };
+                if w > 0 {
+                    self.pending_input.clear();
+                } else if w < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::WouldBlock {
+                        self.pending_input.clear();
+                        return Err(err);
+                    }
+                }
             }
-            written += w as usize;
+        }
+        Ok(())
+    }
+
+    /// Try to drain `pending_input` to the PTY master.
+    /// Returns Ok when the buffer is empty or the fd is not yet writable.
+    ///
+    /// Never ends a write in the middle of an ANSI/CSI escape sequence: if
+    /// the buffer starts with an incomplete ESC sequence, wait for more bytes
+    /// or POLLOUT (EAGAIN with 0 bytes written is fine). ASCII runs still go
+    /// out in bulk.
+    pub fn flush_pending_input(&mut self) -> io::Result<()> {
+        let fd = self.pty_fd();
+        if fd < 0 || self.pending_input.is_empty() {
+            return Ok(());
+        }
+        while !self.pending_input.is_empty() {
+            let want = input_write_len(&self.pending_input);
+            if want == 0 {
+                // Incomplete ESC/CSI at the head — wait for more input.
+                return Ok(());
+            }
+            let w = unsafe { libc::write(fd, self.pending_input.as_ptr() as *const _, want as _) };
+            if w < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                self.pending_input.clear();
+                return Err(err);
+            }
+            if w == 0 {
+                return Ok(());
+            }
+            let n = w as usize;
+            // If the kernel accepted a mid-sequence prefix, still drain what
+            // was written (can't un-write); prefer small complete units so
+            // this is rare.
+            if n >= self.pending_input.len() {
+                self.pending_input.clear();
+            } else {
+                self.pending_input.drain(..n);
+            }
         }
         Ok(())
     }
@@ -301,5 +384,56 @@ impl Pane {
                     .collect()
             })
             .collect()
+    }
+}
+
+/// How many leading bytes of `buf` are safe to write without splitting an
+/// ANSI escape sequence. Returns 0 if the buffer starts with an incomplete
+/// ESC sequence (caller should wait for more data / POLLOUT).
+fn input_write_len(buf: &[u8]) -> usize {
+    let mut pos = 0;
+    while pos < buf.len() {
+        if buf[pos] != 0x1b {
+            // Bulk ASCII until the next ESC (or end of buffer).
+            let rest = &buf[pos..];
+            pos += rest.iter().position(|&b| b == 0x1b).unwrap_or(rest.len());
+            continue;
+        }
+        match ansi_input_seq_len(&buf[pos..]) {
+            Some(n) => pos += n,
+            None => break,
+        }
+    }
+    pos
+}
+
+/// Length of a complete ANSI input escape sequence at the start of `buf`,
+/// or None if more bytes are needed.
+///
+/// Recognizes CSI (`ESC [ ... final 0x40-0x7E`), SS3 (`ESC O X`), and
+/// other two-byte ESC sequences. A lone ESC waits for at least one more
+/// byte so split send-keys (`ESC` then `[` then `D`) can coalesce.
+fn ansi_input_seq_len(buf: &[u8]) -> Option<usize> {
+    if buf.is_empty() || buf[0] != 0x1b {
+        return None;
+    }
+    if buf.len() < 2 {
+        return None;
+    }
+    match buf[1] {
+        b'[' => {
+            // CSI: parameters/intermediates until a final byte 0x40-0x7E.
+            for (i, &b) in buf.iter().enumerate().skip(2) {
+                if (0x40..=0x7e).contains(&b) {
+                    return Some(i + 1);
+                }
+            }
+            None
+        }
+        b'O' => {
+            // SS3: ESC O X
+            if buf.len() >= 3 { Some(3) } else { None }
+        }
+        _ => Some(2), // ESC + one more
     }
 }

@@ -1,5 +1,6 @@
 // Client process: raw mode, input relay, prefix detection, output render.
 
+pub mod control;
 pub mod copy_mode;
 pub mod render;
 pub mod selector;
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::grid::{Cell, Grid};
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
+use crate::version;
 
 /// Prefix key: Ctrl-A (0x01).
 const PREFIX: u8 = 0x01;
@@ -66,6 +68,7 @@ pub fn run(
     new_session: Option<Option<String>>,
     select_session: Option<String>,
     command: Option<String>,
+    cwd: Option<String>,
 ) -> io::Result<()> {
     // Connect to the server.
     let mut stream = ipc::connect(socket_path)?;
@@ -96,9 +99,19 @@ pub fn run(
     });
     proto::send(&mut stream, &identify)?;
 
-    // Wait for IdentifyAck to get grid dimensions.
-    let (grid_rows, grid_cols) = match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::IdentifyAck { rows, cols }) => (rows as usize, cols as usize),
+    // Wait for IdentifyAck to get grid dimensions and server version.
+    let (grid_rows, grid_cols, server_version) = match proto::decode_server(&mut stream) {
+        Ok(ServerMsg::IdentifyAck {
+            rows,
+            cols,
+            version,
+            address: _,
+        }) => {
+            if version != "unknown" && version != version::VERSION {
+                eprintln!("\rlrmux: WARNING — server is running a different version: {version}");
+            }
+            (rows as usize, cols as usize, version)
+        }
         Ok(ServerMsg::Error { msg }) => {
             restore_terminal();
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg));
@@ -148,9 +161,11 @@ pub fn run(
     // If requested, create a new session on the server right after handshake.
     // Send the client's CWD so the new session opens in the right directory.
     if let Some(name) = new_session {
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        let cwd = cwd.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        });
         let msg = proto::encode_client(&ClientMsg::NewSession {
             name,
             cwd,
@@ -172,6 +187,10 @@ pub fn run(
         proto::send(&mut stream, &msg)?;
     }
 
+    // Handshake done — the relay loop drains the socket until EAGAIN, so
+    // it must be nonblocking or the drain read would freeze the client.
+    stream.set_nonblocking(true)?;
+
     // Clear screen and do initial render.
     {
         let mut stdout = io::stdout();
@@ -188,11 +207,6 @@ pub fn run(
     let mut copy_mode: Option<copy_mode::CopyMode> = None;
     // Internal paste buffer (for Prefix ] paste).
     let mut paste_buffer = String::new();
-    // When true, skip \x1b[NS terminal scroll for the next ScrollbackUpdate.
-    // Set by GridSnapshot (window/session switch) because the scrollback
-    // replayed there is history, not new scroll-off — emitting \x1b[NS
-    // would scroll the just-rendered content off the screen.
-    let mut skip_terminal_scroll = false;
     // Reason for exiting the relay loop, printed after terminal restoration.
     let mut exit_reason: Option<String> = None;
 
@@ -445,7 +459,7 @@ pub fn run(
                         last_window,
                     )?;
                     if show_help {
-                        show_help_overlay();
+                        show_help_overlay(&server_version);
                         // Invalidate the renderer so the screen is fully redrawn.
                         renderer.invalidate();
                         // Re-establish the scroll region and re-render.
@@ -581,26 +595,43 @@ pub fn run(
 
         // Server → grid → renderer → stdout
         if fds[1].revents & libc::POLLIN != 0 {
-            let mut buf = [0u8; 8192];
-            let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n > 0 {
-                server_buf.extend_from_slice(&buf[..n as usize]);
+            // Drain the socket fully (bounded) and render once per batch —
+            // a burst arrives as many frames in one read, and rendering per
+            // frame is what makes the client fall behind.
+            let mut buf = [0u8; 65536];
+            let mut total = 0usize;
+            // 0 = EOF, -1 = EAGAIN or error — checked after parsing.
+            let mut last: isize = -1;
+            loop {
+                let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n > 0 {
+                    total += n as usize;
+                    server_buf.extend_from_slice(&buf[..n as usize]);
+                    if total < 4 * 1024 * 1024 {
+                        continue;
+                    }
+                    // Keep the event loop responsive; poll refires.
+                    break;
+                }
+                last = n;
+                break;
+            }
+            if total > 0 {
+                let mut needs_render = false;
                 while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
                     match msg {
-                        ServerMsg::ScrollbackUpdate { rows } => {
+                        ServerMsg::ScrollbackUpdate { rows, replay } => {
                             // Push to internal scrollback (for copy mode).
                             let n = rows.len();
                             for row in rows {
                                 grid.scrollback.push(row);
                             }
                             // Scroll the terminal to push content into the
-                            // terminal's native scrollback buffer.
-                            // Skip in copy mode (terminal is showing copy view).
-                            // Also skip when this scrollback is a replay of the
-                            // window's history (after GridSnapshot) — emitting
-                            // \x1b[NS here would scroll the just-rendered content
-                            // off the screen, leaving it blank.
-                            if n > 0 && copy_mode.is_none() && !skip_terminal_scroll {
+                            // terminal's native scrollback buffer — but only
+                            // for live scroll. Replay chunks (history after a
+                            // GridSnapshot) would scroll the just-rendered
+                            // content off screen, leaving it blank.
+                            if n > 0 && copy_mode.is_none() && !replay {
                                 let mut stdout = io::stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
@@ -611,9 +642,6 @@ pub fn run(
                                 grid.mark_all_dirty();
                                 renderer.invalidate();
                             }
-                            // Reset the flag — only the first ScrollbackUpdate
-                            // after a GridSnapshot should be skipped.
-                            skip_terminal_scroll = false;
                         }
                         ServerMsg::GridUpdate {
                             dirty,
@@ -627,22 +655,7 @@ pub fn run(
                             grid.cursor_row = cursor_row as usize;
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
-                            if let Some(ref cm) = copy_mode {
-                                // In copy mode: re-render the copy mode view.
-                                let view_rows = term_rows.saturating_sub(1);
-                                let mut stdout = io::stdout();
-                                cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
-                            } else {
-                                let mut stdout = io::stdout();
-                                renderer.render(&mut stdout, &mut grid)?;
-                                render_status_bar(
-                                    &mut stdout,
-                                    &status_text,
-                                    term_rows,
-                                    term_cols,
-                                    &grid,
-                                )?;
-                            }
+                            needs_render = true;
                         }
                         ServerMsg::GridSnapshot {
                             rows,
@@ -652,11 +665,6 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                         } => {
-                            // The server sends ScrollbackUpdate right after
-                            // GridSnapshot to replay the window's history.
-                            // We must NOT emit \x1b[NS for that replay — it
-                            // would scroll the just-rendered content off screen.
-                            skip_terminal_scroll = true;
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
                             renderer.resize(rows as usize, cols as usize);
@@ -710,6 +718,7 @@ pub fn run(
                             windows,
                             active,
                             session_count: sc,
+                            high_output: h,
                         } => {
                             // Track last window for Ctrl-A Ctrl-A toggle.
                             let new_active = Some(active as u8);
@@ -720,7 +729,13 @@ pub fn run(
                             current_session = session.clone();
                             current_window_count = windows.len();
                             session_count = sc as usize;
-                            status_text = format_status_bar(&session, &windows, active as usize);
+                            status_text = format_status_bar(
+                                &session,
+                                &windows,
+                                active as usize,
+                                &server_version,
+                                h,
+                            );
                             let mut stdout = io::stdout();
                             if let Some(ref msg) = flash_msg {
                                 render_flash_status_bar(
@@ -746,7 +761,10 @@ pub fn run(
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
-                        ServerMsg::SessionList { sessions } => {
+                        ServerMsg::SessionList {
+                            sessions,
+                            address: _,
+                        } => {
                             if pending_session_chooser {
                                 pending_session_chooser = false;
                                 if let Some(name) = show_session_chooser(&sessions) {
@@ -778,16 +796,34 @@ pub fn run(
                             exit_reason = Some(format!("server error: {msg}"));
                             break;
                         }
+                        ServerMsg::ControlNotify { .. } => {
+                            // Control mode notifications are only for control clients.
+                            // The interactive client ignores them.
+                        }
                     }
                 }
-            } else if n == 0 {
+                // Render once per socket batch instead of once per frame —
+                // during a burst many GridUpdates arrive in a single read.
+                if needs_render && exit_reason.is_none() {
+                    if let Some(ref cm) = copy_mode {
+                        let view_rows = term_rows.saturating_sub(1);
+                        let mut stdout = io::stdout();
+                        cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                    } else {
+                        let mut stdout = io::stdout();
+                        renderer.render(&mut stdout, &mut grid)?;
+                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                    }
+                }
+            } else if last == 0 {
                 // Server closed the connection (EOF).
                 let sock_path = socket_path.to_string_lossy();
                 if !std::path::Path::new(&*sock_path).exists() {
                     exit_reason = Some("server shut down".to_string());
                 } else {
+                    let log_hint = server_log_path(socket_path);
                     exit_reason = Some(format!(
-                        "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                        "disconnected from server (socket still present — server may have crashed, or this client was dropped for backpressure). Check log at {log_hint}"
                     ));
                 }
                 break;
@@ -811,8 +847,9 @@ pub fn run(
             if !std::path::Path::new(&*sock_path).exists() {
                 exit_reason = Some("server shut down".to_string());
             } else {
+                let log_hint = server_log_path(socket_path);
                 exit_reason = Some(format!(
-                    "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                    "disconnected from server (socket still present — server may have crashed, or this client was dropped for backpressure). Check log at {log_hint}"
                 ));
             }
             break;
@@ -827,6 +864,23 @@ pub fn run(
         eprintln!("lrmux: {reason}");
     }
     Ok(())
+}
+
+/// Log file for a server socket at `/tmp/lrmux-<UID>/<name>` lives at
+/// `/tmp/lrmux-<UID>/logs/<name>.log` (not `<socket>.log`).
+fn server_log_path(socket_path: &std::path::Path) -> String {
+    let name = socket_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    match socket_path.parent() {
+        Some(dir) => dir
+            .join("logs")
+            .join(format!("{name}.log"))
+            .display()
+            .to_string(),
+        None => format!("{name}.log"),
+    }
 }
 
 /// Process input bytes through the prefix-key state machine.
@@ -989,6 +1043,11 @@ fn process_prefix(
                     // '\' → show server ring log overlay.
                     b'\\' => {
                         send_cmd(stream, &ClientMsg::GetLog)?;
+                    }
+                    // 'r' → refresh the screen with a fresh snapshot from the server.
+                    b'r' => {
+                        send_cmd(stream, &ClientMsg::Refresh)?;
+                        flash = Some("refreshing...".to_string());
                     }
                     // '?' → show keybindings help overlay.
                     b'?' => {
@@ -1155,7 +1214,13 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 /// Format the status bar text with colors.
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
 /// The session name is shown first, then the window list.
-fn format_status_bar(session: &str, windows: &[String], active: usize) -> String {
+fn format_status_bar(
+    session: &str,
+    windows: &[String],
+    active: usize,
+    server_version: &str,
+    high_output: bool,
+) -> String {
     // Blue background + white text for inactive windows.
     const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
     // Active window: bold bright yellow on blue.
@@ -1163,17 +1228,34 @@ fn format_status_bar(session: &str, windows: &[String], active: usize) -> String
     // Session name: bold bright cyan on blue.
     const SESSION: &str = "\x1b[1;44;96m"; // bold, bg blue, bright cyan
     const RESET: &str = "\x1b[0m";
+    const WARN: &str = "\x1b[1;44;31m"; // bold red on blue
+
+    let server_hash = server_version.rsplit('-').next().unwrap_or(server_version);
+    let mismatch = server_version != version::VERSION;
+    let version_marker = if mismatch {
+        format!("{WARN}!{RESET}")
+    } else {
+        String::new()
+    };
+    let burst_marker = if high_output {
+        format!("{WARN}[BURST]{RESET} ")
+    } else {
+        String::new()
+    };
 
     let mut parts: Vec<String> = Vec::new();
     for (i, name) in windows.iter().enumerate() {
         if i == active {
-            parts.push(format!("{}{}:{}*{}", ACTIVE, i, name, BAR));
+            parts.push(format!("{}{}:{}*{}{}", ACTIVE, i, name, BAR, burst_marker));
         } else {
             parts.push(format!("{}:{}", i, name));
         }
     }
     format!(
-        "{}lrmux | {}{} | {}{}",
+        "{}lrmux {}{}{} | {}{} | {}{}",
+        BAR,
+        version_marker,
+        server_hash,
         BAR,
         SESSION,
         session,
@@ -1558,7 +1640,7 @@ fn show_session_chooser(sessions: &[String]) -> Option<String> {
 
 /// Show the keybindings help as a temporary overlay.
 /// Waits for any key to dismiss.
-fn show_help_overlay() {
+fn show_help_overlay(server_version: &str) {
     use std::io::Read;
     let mut stdout = io::stdout();
     let (rows, _cols) = terminal::get_size();
@@ -1568,6 +1650,13 @@ fn show_help_overlay() {
 
     let title = "lrmux keybindings (press any key to dismiss)";
     write!(stdout, "\x1b[1;36m{title}\x1b[0m\r\n").ok();
+    write!(
+        stdout,
+        "  client: \x1b[33m{}\x1b[0m  server: \x1b[33m{}\x1b[0m\r\n",
+        version::VERSION,
+        server_version
+    )
+    .ok();
     write!(stdout, "\r\n").ok();
 
     let bindings = [
@@ -1586,6 +1675,7 @@ fn show_help_overlay() {
         ("Ctrl-A [", "Enter copy mode"),
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),
+        ("Ctrl-A r", "Refresh screen"),
         ("Ctrl-A d / Ctrl-D", "Detach"),
         ("Ctrl-A \\", "Show server log"),
         ("Ctrl-A ?", "Show this help"),
