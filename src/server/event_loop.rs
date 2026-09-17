@@ -5,6 +5,7 @@
 // Grid updates are sent only to clients viewing the relevant window.
 // A status bar (1 row) is reserved at the bottom of the client terminal.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 
 use crate::ipc;
@@ -25,7 +26,38 @@ struct ClientConn {
     active_window: usize,
     /// Whether this is an interactive (attached) client or a short-lived CLI client.
     attach: bool,
+    /// Whether this is a control mode client (tmux -CC).
+    /// Control clients receive text notifications instead of grid updates.
+    is_control: bool,
+    /// Buffered outbound data. Client sockets are non-blocking: when a
+    /// client stops reading, sends accumulate here and are flushed on
+    /// POLLOUT. If the buffer exceeds CLIENT_OUTBUF_CAP the client is
+    /// disconnected — a stalled client must never freeze the event loop.
+    outbuf: Vec<u8>,
+    /// Command sequence counter for control-mode %begin/%end blocks.
+    /// tmux numbers each command response; iTerm2 expects real values.
+    control_seq: u64,
+    /// Disconnect this client once its outbuf has fully drained.
+    /// Used by control-mode `detach-client`: tmux exits the client after
+    /// sending the response, so the lrmux -CC process can terminate and
+    /// iTerm2 sees the detach.
+    close_when_idle: bool,
+    /// Backpressure: when output arrives faster than this client drains,
+    /// incremental grid/scrollback updates are skipped once outbuf passes
+    /// CLIENT_SUPPRESS_HIGH. The server grid is authoritative, so instead
+    /// of disconnecting we freeze the client and send a fresh snapshot +
+    /// scrollback replay once outbuf drains below CLIENT_SUPPRESS_LOW.
+    suppressed: bool,
 }
+
+/// Maximum bytes buffered for a slow client before disconnecting it.
+const CLIENT_OUTBUF_CAP: usize = 8 * 1024 * 1024;
+/// Outbuf level at which incremental updates to a normal client are
+/// suspended (well below the hard cap — the client freezes instead of
+/// being disconnected).
+const CLIENT_SUPPRESS_HIGH: usize = 2 * 1024 * 1024;
+/// Outbuf level at which a suppressed client is resynced with a snapshot.
+const CLIENT_SUPPRESS_LOW: usize = 256 * 1024;
 
 impl ClientConn {
     fn new(stream: crate::ipc::ConnStream, attach: bool) -> Self {
@@ -37,8 +69,56 @@ impl ClientConn {
             session_idx: 0,
             active_window: 0,
             attach,
+            is_control: false,
+            outbuf: Vec::new(),
+            control_seq: 0,
+            close_when_idle: false,
+            suppressed: false,
         }
     }
+}
+
+/// Queue bytes for a client and flush what can be written without blocking.
+/// Returns false if the client should be disconnected (write error, or the
+/// buffer grew past CLIENT_OUTBUF_CAP because the client stopped reading).
+fn client_send(client: &mut ClientConn, bytes: &[u8]) -> bool {
+    client.outbuf.extend_from_slice(bytes);
+    if client.outbuf.len() > CLIENT_OUTBUF_CAP {
+        crate::log::warn(&format!(
+            "client fd {} outbuf exceeded {CLIENT_OUTBUF_CAP} bytes, disconnecting",
+            client.fd
+        ));
+        return false;
+    }
+    flush_client_outbuf(client)
+}
+
+/// Write as much buffered data to the client socket as possible without
+/// blocking. Returns false on write error (client should be disconnected).
+/// Leftover data stays in outbuf and is retried when POLLOUT fires.
+fn flush_client_outbuf(client: &mut ClientConn) -> bool {
+    while !client.outbuf.is_empty() {
+        let n = unsafe {
+            libc::send(
+                client.fd,
+                client.outbuf.as_ptr() as *const _,
+                client.outbuf.len(),
+                0,
+            )
+        };
+        if n > 0 {
+            client.outbuf.drain(..n as usize);
+        } else if n == 0 {
+            return false;
+        } else {
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => return true,
+                _ => return false,
+            }
+        }
+    }
+    true
 }
 
 /// Run the server event loop.
@@ -92,8 +172,19 @@ pub fn run(
     }
     let listener_fds: Vec<i32> = listeners.iter().map(|l| l.as_raw_fd()).collect();
 
+    // Client sockets are non-blocking in the main loop: a slow or hung
+    // client must never stall the event loop. Outbound data goes through
+    // each client's outbuf and is flushed on POLLOUT.
+    for c in &mut clients {
+        let _ = c.stream.set_nonblocking(true);
+    }
+
     // Periodic state save counter (save every ~1000 iterations ≈ 10s).
     let mut iter_count: u32 = 0;
+
+    // Set by control-mode `kill-server` — break out of the loop and run
+    // the normal graceful shutdown (SIGHUP children, save state, cleanup).
+    let mut shutdown = false;
 
     loop {
         // Build pollfd array: listeners + all window PTY fds + all client fds.
@@ -123,7 +214,15 @@ pub fn run(
         for c in &clients {
             fds.push(libc::pollfd {
                 fd: c.fd,
-                events: libc::POLLIN,
+                // POLLOUT is needed while outbuf has pending data, and also
+                // for suppressed clients — the level-triggered writable
+                // event is what triggers their snapshot resync.
+                events: libc::POLLIN
+                    | if c.outbuf.is_empty() && !c.suppressed {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
                 revents: 0,
             });
         }
@@ -159,6 +258,7 @@ pub fn run(
                             &mut clients,
                             &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
                         );
+                        shutdown_flush(&mut clients);
                         ipc::cleanup(socket_path);
                         return Ok(());
                     }
@@ -184,11 +284,16 @@ pub fn run(
                 }
                 let session = &mut sessions[si];
                 let pane = &mut session.windows[wi].pane;
+                let pane_id = pane.id;
                 match pane.process_pty_output() {
-                    Ok(true) => {
+                    Ok((true, raw)) => {
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
+                        // Forward raw output to control clients viewing this window.
+                        if !raw.is_empty() {
+                            forward_output_to_control_clients(&mut clients, si, wi, pane_id, &raw);
+                        }
                     }
-                    Ok(false) => {
+                    Ok((false, _)) => {
                         // Child exited — reap and defer the removal.
                         let exit_code = pane.reap_child().unwrap_or(0);
                         pty_exits.push((si, wi, exit_code));
@@ -225,16 +330,23 @@ pub fn run(
             ));
             // Treat 0 and 130 (128+SIGINT, common when exiting shells
             // with Ctrl-D after a Ctrl-C) and -2 (direct SIGINT signal)
-            // as success — auto-close the window.
-            if exit_code == 0 || exit_code == 130 || exit_code == -2 {
+            // as success — auto-close the window. When a control client
+            // (iTerm2) is attached to this session, use tmux semantics:
+            // the window closes on ANY exit code (remain-on-exit off).
+            let control_attached = clients.iter().any(|c| c.is_control && c.session_idx == si);
+            if exit_code == 0 || exit_code == 130 || exit_code == -2 || control_attached {
                 // Exit code 0: auto-close the window.
+                let wid = session.windows[wi].id_str();
                 session.windows.remove(wi);
+                // Tell control clients (iTerm2) the window is gone.
+                broadcast_control_notify(&mut clients, &format!("%window-close {}", wid));
                 if session.windows.is_empty() {
                     // Last window in this session closed — remove the session.
                     crate::log::info(&format!(
                         "last window in session '{session_name}' closed, removing session"
                     ));
                     sessions.remove(si);
+                    broadcast_control_notify(&mut clients, "%sessions-changed");
                     if sessions.is_empty() {
                         // Last session closed — shut down the server.
                         crate::log::info("last session closed, shutting down server");
@@ -242,6 +354,7 @@ pub fn run(
                             &mut clients,
                             &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
                         );
+                        shutdown_flush(&mut clients);
                         ipc::cleanup(socket_path);
                         return Ok(());
                     }
@@ -485,6 +598,7 @@ pub fn run(
                                                         code: 0,
                                                     }),
                                                 );
+                                                shutdown_flush(&mut clients);
                                                 ipc::cleanup(socket_path);
                                                 return Ok(());
                                             }
@@ -664,6 +778,7 @@ pub fn run(
                                                     code: 0,
                                                 }),
                                             );
+                                            shutdown_flush(&mut clients);
                                             ipc::cleanup(socket_path);
                                             return Ok(());
                                         }
@@ -696,8 +811,9 @@ pub fn run(
                                             sessions.iter().map(|s| s.name.clone()).collect();
                                         let msg = proto::encode_server(&ServerMsg::SessionList {
                                             sessions: names,
+                                            address: crate::server::server_address().to_string(),
                                         });
-                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
+                                        let _ = client_send(&mut clients[client_idx], &msg);
                                     }
                                     ClientMsg::KillServer => {
                                         eprintln!("lrmux: KillServer received, shutting down.");
@@ -705,6 +821,7 @@ pub fn run(
                                             &mut clients,
                                             &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
                                         );
+                                        shutdown_flush(&mut clients);
                                         ipc::cleanup(socket_path);
                                         eprintln!("lrmux: server stopped.");
                                         return Ok(());
@@ -775,7 +892,7 @@ pub fn run(
                                         let msg = proto::encode_server(&ServerMsg::WindowCapture {
                                             content: content.unwrap_or_default(),
                                         });
-                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
+                                        let _ = client_send(&mut clients[client_idx], &msg);
                                     }
                                     ClientMsg::SendKeys {
                                         session,
@@ -844,7 +961,52 @@ pub fn run(
                                         let lines = crate::log::get_ring_log();
                                         let msg =
                                             proto::encode_server(&ServerMsg::LogContent { lines });
-                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
+                                        let _ = client_send(&mut clients[client_idx], &msg);
+                                    }
+                                    ClientMsg::IdentifyControl { rows, cols } => {
+                                        // Control mode client: mark as control
+                                        // and emit the initial state right away,
+                                        // like real tmux -CC does after the DCS.
+                                        clients[client_idx].is_control = true;
+                                        clients[client_idx].attach = false;
+                                        // Send IdentifyAck with the requested grid size.
+                                        let msg = proto::encode_server(&ServerMsg::IdentifyAck {
+                                            rows,
+                                            cols,
+                                            version: crate::version::VERSION.to_string(),
+                                            address: crate::server::server_address().to_string(),
+                                        });
+                                        let _ = client_send(&mut clients[client_idx], &msg);
+                                        send_control_initial_state(
+                                            &mut clients[client_idx],
+                                            &sessions,
+                                        );
+                                    }
+                                    ClientMsg::ControlCommand { line } => {
+                                        // Parse and execute a tmux-style command.
+                                        let mut pending_affinities = None;
+                                        if handle_control_command(
+                                            &mut clients[client_idx],
+                                            &mut sessions,
+                                            &line,
+                                            socket_path,
+                                            &mut pending_affinities,
+                                        ) {
+                                            shutdown = true;
+                                        }
+                                        if let Some((si, value)) = pending_affinities
+                                            && migrate_affinity_sessions(
+                                                &mut sessions,
+                                                si,
+                                                &value,
+                                                &mut clients,
+                                            )
+                                        {
+                                            broadcast_control_notify(
+                                                &mut clients,
+                                                "%sessions-changed",
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1048,6 +1210,28 @@ pub fn run(
                 }
                 to_remove.push(client_idx);
             }
+            // Client socket writable → drain its outbound buffer.
+            if pf.revents & libc::POLLOUT != 0
+                && client_idx < clients.len()
+                && !to_remove.contains(&client_idx)
+            {
+                if !flush_client_outbuf(&mut clients[client_idx]) {
+                    to_remove.push(client_idx);
+                } else if clients[client_idx].suppressed
+                    && clients[client_idx].outbuf.len() <= CLIENT_SUPPRESS_LOW
+                {
+                    // The client caught up — resync it with a fresh snapshot
+                    // + scrollback replay instead of disconnecting.
+                    clients[client_idx].suppressed = false;
+                    crate::log::info(&format!(
+                        "client fd {} caught up after output burst, resyncing",
+                        clients[client_idx].fd
+                    ));
+                    if !need_snapshot.contains(&client_idx) {
+                        need_snapshot.push(client_idx);
+                    }
+                }
+            }
         }
 
         // Send snapshots + status bar to clients that need them.
@@ -1069,6 +1253,14 @@ pub fn run(
             }
         }
 
+        // Clients flagged close_when_idle (control-mode detach) are removed
+        // once their outbound buffer has fully drained.
+        for (ci, c) in clients.iter().enumerate() {
+            if c.close_when_idle && c.outbuf.is_empty() && !to_remove.contains(&ci) {
+                to_remove.push(ci);
+            }
+        }
+
         // Broadcast status bar to all clients if session/window list changed.
         if need_status_bar_all {
             broadcast_status_bar(&mut clients, &sessions);
@@ -1085,8 +1277,8 @@ pub fn run(
             }
         }
 
-        // If no sessions and no clients, exit.
-        if sessions.is_empty() && clients.is_empty() {
+        // If no sessions and no clients, or kill-server was requested, exit.
+        if shutdown || (sessions.is_empty() && clients.is_empty()) {
             break;
         }
 
@@ -1173,19 +1365,62 @@ fn default_session_name(sessions: &[Session]) -> String {
 /// Render a pane's grid as plain text (for capture-window).
 /// Each row is trimmed of trailing whitespace and joined with newlines.
 fn render_grid_text(pane: &crate::server::pane::Pane) -> String {
+    render_pane_text(pane, false, false)
+}
+
+/// Render a pane (optionally including scrollback) as text.
+/// `with_escapes` (`capture-pane -e`) emits SGR sequences preserving
+/// colors and attributes; `include_scrollback` (`capture-pane -S -<n>`)
+/// prepends the scrollback history so iTerm2 can rebuild its buffer.
+fn render_pane_text(
+    pane: &crate::server::pane::Pane,
+    with_escapes: bool,
+    include_scrollback: bool,
+) -> String {
     let rows = pane.rows as usize;
     let cols = pane.cols as usize;
-    let mut lines = Vec::with_capacity(rows);
-    for row in 0..rows {
+    let scrollback = if include_scrollback {
+        pane.scrollback_rows()
+    } else {
+        Vec::new()
+    };
+    let mut lines = Vec::with_capacity(scrollback.len() + rows);
+    fn emit_row(
+        lines: &mut Vec<String>,
+        r: &[crate::grid::cell::Cell],
+        cols: usize,
+        with_escapes: bool,
+    ) {
         let mut line = String::with_capacity(cols);
-        if let Some(r) = pane.grid.row(row) {
-            for c in r.iter().take(cols) {
-                let ch = if c.ch == '\0' { ' ' } else { c.ch };
-                line.push(ch);
+        let mut last: Option<(
+            crate::grid::cell::Color,
+            crate::grid::cell::Color,
+            crate::grid::cell::Attr,
+        )> = None;
+        let mut styled = false;
+        for c in r.iter().take(cols) {
+            if with_escapes && last != Some((c.fg, c.bg, c.attrs)) {
+                crate::client::render::emit_sgr(&mut line, c.fg, c.bg, c.attrs);
+                last = Some((c.fg, c.bg, c.attrs));
+                styled = true;
             }
+            line.push(if c.ch == '\0' { ' ' } else { c.ch });
         }
-        // Trim trailing whitespace.
-        lines.push(line.trim_end().to_string());
+        let mut line = line.trim_end().to_string();
+        if styled {
+            line.push_str("\x1b[0m");
+        }
+        lines.push(line);
+    }
+    for r in &scrollback {
+        emit_row(&mut lines, r, cols, with_escapes);
+    }
+    for row in 0..rows {
+        if let Some(r) = pane.grid.row(row) {
+            emit_row(&mut lines, r, cols, with_escapes);
+        } else {
+            lines.push(String::new());
+        }
     }
     // Trim trailing empty lines.
     while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
@@ -1219,7 +1454,7 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
     let mut i = 0;
     while i < clients.len() {
         let si = clients[i].session_idx;
-        if si >= sessions.len() {
+        if si >= sessions.len() || clients[i].is_control {
             i += 1;
             continue;
         }
@@ -1229,7 +1464,7 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
             active: clients[i].active_window as u16,
             session_count: sessions.len() as u16,
         });
-        if proto::send(&mut clients[i].stream, &msg).is_err() {
+        if !client_send(&mut clients[i], &msg) {
             clients.remove(i);
         } else {
             i += 1;
@@ -1240,7 +1475,7 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
 /// Send a status bar update to a single client (using its session + active window).
 fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
     let si = client.session_idx;
-    if si >= sessions.len() {
+    if si >= sessions.len() || client.is_control {
         return;
     }
     let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
@@ -1249,13 +1484,17 @@ fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
         active: client.active_window as u16,
         session_count: sessions.len() as u16,
     });
-    let _ = proto::send(&mut client.stream, &msg);
+    let _ = client_send(client, &msg);
 }
 
 /// Send a full grid snapshot of a client's active window to that client.
 fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io::Result<()> {
     let si = client.session_idx;
     let aw = client.active_window;
+    if client.is_control {
+        // Control clients don't consume binary grid frames.
+        return Ok(());
+    }
     if si >= sessions.len() || aw >= sessions[si].windows.len() {
         return Ok(());
     }
@@ -1271,18 +1510,28 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
         cursor_col,
         cursor_visible,
     });
-    if proto::send(&mut client.stream, &snapshot).is_err() {
+    if !client_send(client, &snapshot) {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "client gone",
         ));
     }
 
-    // Then send scrollback so the client can populate the fresh grid's history.
+    // Then send scrollback so the client can populate the fresh grid's
+    // history. Chunk it — a full 10k-row buffer at wide sizes encodes to
+    // tens of MB in one frame, blowing the client outbuf cap.
     let sb_rows = pane.scrollback_rows();
-    if !sb_rows.is_empty() {
-        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate { rows: sb_rows });
-        let _ = proto::send(&mut client.stream, &sb_msg);
+    for chunk in sb_rows.chunks(500) {
+        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate {
+            rows: chunk.to_vec(),
+            replay: true,
+        });
+        if !client_send(client, &sb_msg) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "client gone",
+            ));
+        }
     }
     Ok(())
 }
@@ -1307,12 +1556,18 @@ fn handshake_first_client(
     stream: crate::ipc::ConnStream,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = stream;
+    // Bound the handshake read: a client that connects and stays silent
+    // must not stall server startup forever.
+    let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
 
     let (client_rows, client_cols) = match proto::decode_client(&mut client) {
         Ok(ClientMsg::Identify { rows, cols, .. }) => (rows, cols),
         Ok(ClientMsg::ListSessions) => {
             // Respond with empty session list (no sessions yet) and signal retry.
-            let msg = proto::encode_server(&ServerMsg::SessionList { sessions: vec![] });
+            let msg = proto::encode_server(&ServerMsg::SessionList {
+                sessions: vec![],
+                address: crate::server::server_address().to_string(),
+            });
             let _ = proto::send(&mut client, &msg);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1356,6 +1611,8 @@ fn handshake_first_client(
     let ack = proto::encode_server(&ServerMsg::IdentifyAck {
         rows: grid_rows,
         cols: grid_cols,
+        version: crate::version::VERSION.to_string(),
+        address: crate::server::server_address().to_string(),
     });
     proto::send(&mut client, &ack)?;
 
@@ -1391,13 +1648,20 @@ fn accept_new_client(
     match listener.accept() {
         Ok(mut stream) => {
             stream.set_nonblocking(false)?;
+            // Bound the handshake read: a client that connects and stays
+            // silent must not freeze the whole event loop.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
 
-            let attach = match proto::decode_client(&mut stream) {
-                Ok(ClientMsg::Identify { attach: a, .. }) => a,
+            let (attach, is_control) = match proto::decode_client(&mut stream) {
+                Ok(ClientMsg::Identify { attach: a, .. }) => (a, false),
+                Ok(ClientMsg::IdentifyControl { .. }) => (false, true),
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
                     let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
-                    let msg = proto::encode_server(&ServerMsg::SessionList { sessions: names });
+                    let msg = proto::encode_server(&ServerMsg::SessionList {
+                        sessions: names,
+                        address: crate::server::server_address().to_string(),
+                    });
                     let _ = proto::send(&mut stream, &msg);
                     return Ok(());
                 }
@@ -1423,6 +1687,8 @@ fn accept_new_client(
             let ack = proto::encode_server(&ServerMsg::IdentifyAck {
                 rows: grid_rows,
                 cols: grid_cols,
+                version: crate::version::VERSION.to_string(),
+                address: crate::server::server_address().to_string(),
             });
             if proto::send(&mut stream, &ack).is_err() {
                 return Ok(());
@@ -1467,11 +1733,20 @@ fn accept_new_client(
             let mut conn = ClientConn::new(stream, attach);
             conn.session_idx = session_idx;
             conn.active_window = active;
+            conn.is_control = is_control;
             crate::log::info(&format!(
                 "client connected: session_idx={session_idx}, window={active}, total clients={}",
                 clients.len() + 1
             ));
+            // Non-blocking from here on: sends go through the client's
+            // outbuf so a stalled client can't freeze the event loop.
+            let _ = conn.stream.set_nonblocking(true);
             clients.push(conn);
+            // Like real tmux -CC, emit the initial state right away —
+            // silence after the DCS makes iTerm2 think tmux is hung.
+            if is_control {
+                send_control_initial_state(clients.last_mut().unwrap(), sessions);
+            }
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(e),
@@ -1486,18 +1761,30 @@ fn send_grid_update_to_window_viewers(
     window_idx: usize,
     pane: &mut crate::server::pane::Pane,
 ) -> io::Result<()> {
-    // Take pending scrollback rows and send them first.
+    // Take pending scrollback rows and send them first. Chunk them — a
+    // burst that scrolls thousands of lines at once would otherwise build
+    // a single frame larger than the client outbuf cap and get the client
+    // disconnected.
     let scrolled = pane.take_pending_scrollback();
-    if !scrolled.is_empty() {
-        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate { rows: scrolled });
+    for chunk in scrolled.chunks(500) {
+        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate {
+            rows: chunk.to_vec(),
+            replay: false,
+        });
         let mut i = 0;
         while i < clients.len() {
             if clients[i].session_idx == session_idx
                 && clients[i].active_window == window_idx
-                && proto::send(&mut clients[i].stream, &sb_msg).is_err()
+                && !clients[i].is_control
             {
-                clients.remove(i);
-                continue;
+                if clients[i].suppressed || clients[i].outbuf.len() > CLIENT_SUPPRESS_HIGH {
+                    // Client is behind: skip incremental updates and resync
+                    // with a snapshot once its outbuf drains.
+                    clients[i].suppressed = true;
+                } else if !client_send(&mut clients[i], &sb_msg) {
+                    clients.remove(i);
+                    continue;
+                }
             }
             i += 1;
         }
@@ -1518,8 +1805,14 @@ fn send_grid_update_to_window_viewers(
     });
     let mut i = 0;
     while i < clients.len() {
-        if clients[i].session_idx == session_idx && clients[i].active_window == window_idx {
-            if proto::send(&mut clients[i].stream, &msg).is_err() {
+        if clients[i].session_idx == session_idx
+            && clients[i].active_window == window_idx
+            && !clients[i].is_control
+        {
+            if clients[i].suppressed || clients[i].outbuf.len() > CLIENT_SUPPRESS_HIGH {
+                clients[i].suppressed = true;
+                i += 1;
+            } else if !client_send(&mut clients[i], &msg) {
                 clients.remove(i);
             } else {
                 i += 1;
@@ -1535,7 +1828,7 @@ fn send_grid_update_to_window_viewers(
 fn broadcast_to_all(clients: &mut Vec<ClientConn>, msg: &[u8]) {
     let mut i = 0;
     while i < clients.len() {
-        if proto::send(&mut clients[i].stream, msg).is_err() {
+        if !client_send(&mut clients[i], msg) {
             clients.remove(i);
         } else {
             i += 1;
@@ -1930,6 +2223,36 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             }
         }
         0x15 => ClientMsg::GetLog,
+        0x16 => {
+            // IdentifyControl: rows (u16) + cols (u16)
+            if data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "IdentifyControl needs 4 bytes",
+                ));
+            }
+            let rows = u16::from_le_bytes([data[0], data[1]]);
+            let cols = u16::from_le_bytes([data[2], data[3]]);
+            ClientMsg::IdentifyControl { rows, cols }
+        }
+        0x17 => {
+            // ControlCommand: 4-byte length + string
+            if data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "ControlCommand needs 4-byte length",
+                ));
+            }
+            let clen = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if data.len() < 4 + clen {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "ControlCommand data truncated",
+                ));
+            }
+            let line = String::from_utf8_lossy(&data[4..4 + clen]).into_owned();
+            ClientMsg::ControlCommand { line }
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1973,4 +2296,1375 @@ fn accept_from_any(listeners: &[crate::ipc::ConnListener]) -> io::Result<crate::
         io::ErrorKind::UnexpectedEof,
         "no listener ready",
     ))
+}
+
+// ── Control mode support ────────────────────────────────────────────
+
+/// Forward raw PTY output to all control clients viewing the given window.
+/// The output is escaped and sent as %output notifications.
+fn forward_output_to_control_clients(
+    clients: &mut [ClientConn],
+    si: usize,
+    wi: usize,
+    pane_id: u32,
+    raw: &[u8],
+) {
+    let pane_id_str = format!("%{}", pane_id);
+    let _ = (si, wi);
+    // Chunk large bursts into multiple %output lines — a single escaped
+    // notification for a multi-MB read could exceed the client outbuf cap.
+    for chunk in raw.chunks(256 * 1024) {
+        let line = format!("%output {} {}", pane_id_str, escape_output(chunk));
+        for client in clients.iter_mut() {
+            // iTerm2 routes %output by pane id to the right tab, so send to
+            // every control client — a window may live in a session other
+            // than the client's attached session (affinity migration maps
+            // each iTerm2 window to its own lrmux session).
+            if client.is_control {
+                send_control_notify(client, &line);
+            }
+        }
+    }
+}
+
+/// Send a control notification line to a control client.
+fn send_control_notify(client: &mut ClientConn, line: &str) {
+    let msg = proto::encode_server(&ServerMsg::ControlNotify {
+        line: line.to_string(),
+    });
+    let _ = client_send(client, &msg);
+}
+
+/// Send a control notification line to every control client.
+fn broadcast_control_notify(clients: &mut [ClientConn], line: &str) {
+    for c in clients.iter_mut() {
+        if c.is_control {
+            send_control_notify(c, line);
+        }
+    }
+}
+
+/// On server shutdown, send `%exit` to control clients and give every
+/// client a short window to drain its outbuf before the socket closes.
+/// Without the drain, a queued `%exit`/`PaneExit` is lost when the fd
+/// closes — iTerm2 then keeps writing queued tmux commands (e.g.
+/// `refresh-client -B ...`) into the shell the control session ran in.
+fn shutdown_flush(clients: &mut [ClientConn]) {
+    for c in clients.iter_mut() {
+        if c.is_control {
+            send_control_notify(c, "%exit");
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    loop {
+        let mut pending = false;
+        for c in clients.iter_mut() {
+            if !c.outbuf.is_empty() {
+                let _ = flush_client_outbuf(c);
+                pending |= !c.outbuf.is_empty();
+            }
+        }
+        if !pending || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Build a default @affinities value: one class per session containing all
+/// of that session's window ids, in the `ids;` format iTerm2 writes.
+/// Returned only when no real value was ever stored — once iTerm2 sends a
+/// `set @affinities`, its value takes precedence.
+fn synthesize_affinities(sessions: &[Session]) -> String {
+    sessions
+        .iter()
+        .filter(|s| !s.windows.is_empty())
+        .map(|s| {
+            s.windows
+                .iter()
+                .map(|w| w.id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                + ";"
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Decode an iTerm2-encoded user option value: `<prefix>` + hex of UTF-8.
+/// e.g. `a_312c32` → "1,2". Returns the value unchanged if not encoded.
+fn decode_iterm_encoded(value: &str, prefix: &str) -> String {
+    let Some(hex) = value.strip_prefix(prefix) else {
+        return value.to_string();
+    };
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect();
+    bytes
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| value.to_string())
+}
+
+/// Reconcile sessions with iTerm2 affinity classes.
+///
+/// iTerm2 groups tmux windows into "affinity classes" — one class per macOS
+/// window (each member becomes a tab) — and persists them in the session
+/// user option `@affinities` as `a_<hex>`. Decoded, the value is a
+/// space-separated list of `id1,id2,...,GUID;opts` classes.
+///
+/// lrmux maps one iTerm2 window to one session, so a tmux window that lands
+/// in a class of its own (⌘N, "new OS window") is moved into a new session;
+/// conversely, a window dragged into another class joins that class's
+/// session, and sessions left empty are removed.
+///
+/// Returns true if any window changed session (callers should emit
+/// %sessions-changed).
+fn migrate_affinity_sessions(
+    sessions: &mut Vec<Session>,
+    _target_si: usize,
+    raw_value: &str,
+    clients: &mut [ClientConn],
+) -> bool {
+    let raw = decode_iterm_encoded(raw_value, "a_");
+    // Classes in written order; keep only numeric tokens (window ids —
+    // GUIDs contain '-' and letters).
+    let classes: Vec<Vec<u32>> = raw
+        .split(' ')
+        .map(|cls| {
+            cls.split(';')
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                .filter_map(|t| t.parse::<u32>().ok())
+                .collect()
+        })
+        .filter(|c: &Vec<u32>| !c.is_empty())
+        .collect();
+    if classes.is_empty() {
+        return false;
+    }
+
+    // window id -> (session idx, window idx)
+    let mut win_loc: HashMap<u32, (usize, usize)> = HashMap::new();
+    for (si, s) in sessions.iter().enumerate() {
+        for (wi, w) in s.windows.iter().enumerate() {
+            win_loc.insert(w.id, (si, wi));
+        }
+    }
+
+    // Assign each class to the session of its first member that doesn't
+    // already own a class; if all member sessions own earlier classes, the
+    // class gets a brand-new session. Then move any member windows whose
+    // session isn't the class owner into it.
+    let mut used: HashMap<usize, ()> = HashMap::new(); // session idx already owns a class
+    let mut moves: Vec<(u32, usize, usize)> = Vec::new(); // (window id, from si, to si)
+    for ids in &classes {
+        let members: Vec<(u32, usize, usize)> = ids
+            .iter()
+            .filter_map(|id| win_loc.get(id).map(|&(si, wi)| (*id, si, wi)))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let owner_si = match members
+            .iter()
+            .map(|m| m.1)
+            .find(|si| !used.contains_key(si))
+        {
+            Some(si) => si,
+            None => {
+                let (si0, wi0) = (members[0].1, members[0].2);
+                let base = sessions[si0].windows[wi0].name.clone();
+                let name = ensure_unique_session_name(&base, sessions);
+                sessions.push(Session::new_empty(name));
+                sessions.len() - 1
+            }
+        };
+        used.insert(owner_si, ());
+        for (id, si, _wi) in members {
+            if si != owner_si {
+                moves.push((id, si, owner_si));
+            }
+        }
+    }
+    if moves.is_empty() {
+        return false;
+    }
+
+    crate::log::info(&format!(
+        "affinities: moving windows {:?} between sessions",
+        moves.iter().map(|m| m.0).collect::<Vec<_>>()
+    ));
+
+    // Apply moves: remove from source sessions (highest window idx first)
+    // and push into destination sessions.
+    let mut detached: Vec<(u32, usize, Window)> = Vec::new();
+    for (id, from_si, to_si) in &moves {
+        if let Some(pos) = sessions[*from_si].windows.iter().position(|w| w.id == *id) {
+            let w = sessions[*from_si].windows.remove(pos);
+            detached.push((*id, *to_si, w));
+        }
+    }
+    for (_, to_si, w) in detached {
+        sessions[to_si].windows.push(w);
+    }
+
+    // Remove sessions left without windows (fix up client session_idx).
+    let empty: Vec<usize> = (0..sessions.len())
+        .filter(|&si| sessions[si].windows.is_empty())
+        .collect();
+    for si in empty.into_iter().rev() {
+        crate::log::info(&format!(
+            "session '{}' emptied by affinity migration, removing",
+            sessions[si].name
+        ));
+        sessions.remove(si);
+        for c in clients.iter_mut() {
+            if c.session_idx == si {
+                c.session_idx = 0;
+                c.active_window = 0;
+            } else if c.session_idx > si {
+                c.session_idx -= 1;
+            }
+        }
+    }
+    true
+}
+
+/// Escape binary data for %output notifications (tmux control mode format).
+/// Characters < 0x20 and backslash are replaced with \nnn octal escapes.
+/// Bytes >= 0x20 are kept raw, then decoded as UTF-8 — building the string
+/// char-by-char would double-encode multibyte sequences (byte 0xe2 became
+/// U+00E2 → 0xc3 0xa2, turning ➜ into mojibake).
+fn escape_output(data: &[u8]) -> String {
+    let mut out = Vec::with_capacity(data.len());
+    for &b in data {
+        if b < 0x20 || b == b'\\' {
+            out.extend_from_slice(format!("\\{:03o}", b).as_bytes());
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Current unix time in seconds (for %begin/%end blocks).
+fn unix_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Send a %begin/%end response block with a real timestamp, an
+/// incrementing command sequence number, and the given flags.
+/// iTerm2's TmuxGateway requires flags&1 on responses to client-issued
+/// commands: with flags=0 it treats the block as server-originated and
+/// never pops its command queue, so callbacks (e.g. version detection)
+/// never run and no windows open.
+fn control_respond_flags(client: &mut ClientConn, lines: &[&str], flags: u8) {
+    client.control_seq += 1;
+    let ts = unix_ts();
+    let seq = client.control_seq;
+    send_control_notify(client, &format!("%begin {ts} {seq} {flags}"));
+    for l in lines {
+        send_control_notify(client, l);
+    }
+    send_control_notify(client, &format!("%end {ts} {seq} {flags}"));
+}
+
+/// Response to a client-issued command (flags=1).
+fn control_respond(client: &mut ClientConn, lines: &[&str]) {
+    control_respond_flags(client, lines, 1);
+}
+
+/// Send initial state notifications to a control client.
+/// Mirrors what real `tmux -CC` emits right after the DCS: an empty
+/// %begin/%end block, then %window-add for each window, then
+/// %sessions-changed / %session-changed. Sending these immediately is
+/// required — iTerm2 treats silence after the DCS as a hung tmux.
+fn send_control_initial_state(client: &mut ClientConn, sessions: &[Session]) {
+    // Empty %begin/%end block, like tmux emits first. Server-originated,
+    // so flags=0 — iTerm2 uses this first block to kick off its command
+    // queue and does not expect a queued command for it.
+    control_respond_flags(client, &[], 0);
+
+    if sessions.is_empty() {
+        return;
+    }
+
+    let session = &sessions[client.session_idx];
+
+    // %window-add for each window in the current session (tmux order).
+    for window in &session.windows {
+        send_control_notify(client, &format!("%window-add {}", window.id_str()));
+    }
+
+    send_control_notify(client, "%sessions-changed");
+    send_control_notify(
+        client,
+        &format!("%session-changed {} {}", session.id_str(), session.name),
+    );
+
+    // Per-window metadata: name + layout.
+    for window in &session.windows {
+        send_control_notify(
+            client,
+            &format!("%window-renamed {} {}", window.id_str(), window.name),
+        );
+        // %layout-change @N <checksum>,<width>x<height>,<x>,<y>,<pane-id>
+        // width=columns, height=rows (iTerm2's TmuxLayoutParser expects this).
+        let layout = window_layout_str(window);
+        send_control_notify(
+            client,
+            &format!("%layout-change {} {}", window.id_str(), layout),
+        );
+    }
+}
+
+/// Extract the -F format argument from a command line.
+/// Handles `-F "..."`, `-F '...'`, and `-F ...` forms, anywhere in args
+/// (iTerm2 sends e.g. `list-panes -t "%1" -F "..."`).
+fn extract_format_arg(args: &str) -> Option<String> {
+    // Find a whitespace-delimited token that is exactly "-F"; the format
+    // is the next token (possibly quoted, possibly containing spaces).
+    let bytes = args.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip whitespace.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Find end of this token (respecting quotes).
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        let token = &args[start..end];
+        if token == "-F" {
+            // Next token is the format string.
+            let mut j = end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return None;
+            }
+            if bytes[j] == b'"' || bytes[j] == b'\'' {
+                let q = bytes[j];
+                if let Some(close) = args[j + 1..].find(q as char) {
+                    return Some(args[j + 1..j + 1 + close].to_string());
+                }
+                return Some(args[j + 1..].to_string());
+            }
+            let mut k = j;
+            while k < bytes.len() && !bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            return Some(args[j..k].to_string());
+        }
+        i = end;
+    }
+    None
+}
+
+/// Expand a tmux -F format string for a session/window.
+/// Supports #{...} variables used by iTerm2 plus common ones, and \t / \n escapes.
+fn expand_format(
+    fmt: &str,
+    session: Option<&Session>,
+    window: Option<&Window>,
+    socket_path: &std::path::Path,
+) -> String {
+    let mut out = String::with_capacity(fmt.len() * 2);
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else if c == '#' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut var = String::new();
+            for c in chars.by_ref() {
+                if c == '}' {
+                    break;
+                }
+                var.push(c);
+            }
+            out.push_str(&format_var(&var, session, window, socket_path));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// tmux layout string for a single-pane window:
+/// <checksum>,<width>x<height>,<x>,<y>,<pane-id>
+/// iTerm2's TmuxLayoutParser expects width=columns first, height=rows second.
+fn window_layout_str(window: &Window) -> String {
+    format!(
+        "beef,{}x{},0,0,{}",
+        window.pane.cols, window.pane.rows, window.pane.id
+    )
+}
+
+/// Resolve a single #{...} format variable.
+fn format_var(
+    var: &str,
+    session: Option<&Session>,
+    window: Option<&Window>,
+    socket_path: &std::path::Path,
+) -> String {
+    match var {
+        "socket_path" => socket_path.to_string_lossy().into_owned(),
+        "pid" => std::process::id().to_string(),
+        "version" => "3.4".to_string(),
+        "session_id" => session.map(|s| s.id_str()).unwrap_or_default(),
+        "session_name" => session.map(|s| s.name.clone()).unwrap_or_default(),
+        "session_windows" => session
+            .map(|s| s.windows.len().to_string())
+            .unwrap_or_default(),
+        "window_id" => window.map(|w| w.id_str()).unwrap_or_default(),
+        "window_name" => window.map(|w| w.name.clone()).unwrap_or_default(),
+        "window_index" => session
+            .and_then(|s| window.and_then(|w| s.windows.iter().position(|x| x.id == w.id)))
+            .map(|i| i.to_string())
+            .unwrap_or_default(),
+        "window_width" | "window_height" => window
+            .map(|w| {
+                if var == "window_width" {
+                    w.pane.cols.to_string()
+                } else {
+                    w.pane.rows.to_string()
+                }
+            })
+            .unwrap_or_default(),
+        "pane_id" => window
+            .map(|w| format!("%{}", w.pane.id))
+            .unwrap_or_default(),
+        "pane_width" => window.map(|w| w.pane.cols.to_string()).unwrap_or_default(),
+        "pane_height" => window.map(|w| w.pane.rows.to_string()).unwrap_or_default(),
+        "pane_pid" => window
+            .map(|w| w.pane.pty.child_pid.to_string())
+            .unwrap_or_default(),
+        "window_panes" => "1".to_string(),
+        "pane_active" | "window_active" | "session_attached" => "1".to_string(),
+        "window_layout" | "window_visible_layout" => {
+            window.map(window_layout_str).unwrap_or_default()
+        }
+        "window_flags" => "*".to_string(),
+        "pane_border_status" | "pane-border-status" => "off".to_string(),
+        // Fields requested by iTerm2's TmuxStateParser via
+        // `list-panes -F "key=#{key}..."`. Values we don't track are
+        // reported as 0 — iTerm2 parses them as booleans/ints.
+        "alternate_on"
+        | "insert_flag"
+        | "keypad_cursor_flag"
+        | "keypad_flag"
+        | "wrap_flag"
+        | "mouse_standard_flag"
+        | "mouse_button_flag"
+        | "mouse_any_flag"
+        | "mouse_utf8_flag"
+        | "mouse_sgr_flag"
+        | "bracket_paste_flag"
+        | "pane_key_mode" => "0".to_string(),
+        "cursor_flag" => window
+            .map(|w| {
+                if w.pane.grid.cursor_visible {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            })
+            .unwrap_or_else(|| "1".to_string()),
+        "cursor_x" => window
+            .map(|w| w.pane.grid.cursor_col.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        "cursor_y" => window
+            .map(|w| w.pane.grid.cursor_row.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        "alternate_saved_x" | "alternate_saved_y" => "0".to_string(),
+        "scroll_region_upper" => "0".to_string(),
+        "scroll_region_lower" => window
+            .map(|w| (w.pane.rows - 1).to_string())
+            .unwrap_or_default(),
+        "pane_tabs" => window.map(|w| w.pane.cols.to_string()).unwrap_or_default(),
+        _ => {
+            // Conditional format: #{?condition,true-value,false-value}
+            if let Some(rest) = var.strip_prefix('?') {
+                let parts: Vec<&str> = rest.splitn(3, ',').collect();
+                if parts.len() == 3 {
+                    let truthy = !format_var(parts[0], session, window, socket_path).is_empty()
+                        && format_var(parts[0], session, window, socket_path) != "0";
+                    return if truthy {
+                        parts[1].to_string()
+                    } else {
+                        parts[2].to_string()
+                    };
+                }
+            }
+            String::new()
+        }
+    }
+}
+
+/// Split a control-mode line into individual commands on unquoted `;`
+/// separators (tmux command-list syntax). iTerm2 batches whole init
+/// sequences this way (`sendCommandList` joins dicts with "; "), and each
+/// sub-command must produce its own %begin/%end block — one per queued
+/// commandDict.
+fn split_command_list(line: &str) -> Vec<&str> {
+    let mut cmds = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if !in_single => i += 1, // skip escaped char
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b';' if !in_single && !in_double => {
+                let part = line[start..i].trim();
+                if !part.is_empty() {
+                    cmds.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = line[start..].trim();
+    if !tail.is_empty() {
+        cmds.push(tail);
+    }
+    cmds
+}
+
+/// Handle a tmux-style command line from a control-mode client.
+/// The line may be a `;`-separated command list; each sub-command gets its
+/// own %begin/%end block. Returns true if the server should shut down.
+fn handle_control_command(
+    client: &mut ClientConn,
+    sessions: &mut Vec<Session>,
+    line: &str,
+    socket_path: &std::path::Path,
+    pending_affinities: &mut Option<(usize, String)>,
+) -> bool {
+    crate::log::log(crate::log::Level::Info, &format!("control cmd: {}", line));
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    for cmd in split_command_list(line) {
+        if handle_single_control_command(client, sessions, cmd, socket_path, pending_affinities) {
+            return true;
+        }
+    }
+    false
+}
+
+fn handle_single_control_command(
+    client: &mut ClientConn,
+    sessions: &mut Vec<Session>,
+    line: &str,
+    socket_path: &std::path::Path,
+    pending_affinities: &mut Option<(usize, String)>,
+) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    // Split into command name and args.
+    let parts: Vec<&str> = line.splitn(2, ' ').collect();
+    let cmd_name = crate::cmd::canonical_name(parts[0]);
+    let args_str = parts.get(1).unwrap_or(&"");
+
+    // Helper: send a %begin/%end response with optional output lines.
+    let respond = |client: &mut ClientConn, lines: &[&str]| control_respond(client, lines);
+
+    match cmd_name {
+        "refresh-client" => {
+            // iTerm2 sends: refresh-client -fpause-after=0,wait-exit
+            //               refresh-client -C <cols>,<rows>   (client size)
+            //               refresh-client -C @N:<cols>x<rows> (per-window)
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            if let Some(sz) = parsed.get("C").or_else(|| parsed.get("size")) {
+                // Parse "@N:WxH" or "W,H".
+                let (win_target, dims) = match sz.split_once(':') {
+                    Some((w, d)) => (Some(w.to_string()), d.to_string()),
+                    None => (None, sz.to_string()),
+                };
+                let (cols, rows) = dims
+                    .split_once('x')
+                    .or_else(|| dims.split_once(','))
+                    .map(|(a, b)| (a.parse::<u16>(), b.parse::<u16>()))
+                    .map(|(a, b)| (a.ok(), b.ok()))
+                    .unwrap_or((None, None));
+                if let (Some(cols), Some(rows)) = (cols, rows) {
+                    let loc = resolve_target(sessions, client, win_target.as_deref());
+                    if let Some((si, wi)) = loc {
+                        let window = &mut sessions[si].windows[wi];
+                        if cols > 0
+                            && rows > 0
+                            && (window.pane.cols != cols || window.pane.rows != rows)
+                        {
+                            window.pane.resize(rows, cols);
+                            send_control_notify(
+                                client,
+                                &format!(
+                                    "%layout-change {} {}",
+                                    window.id_str(),
+                                    window_layout_str(window)
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            respond(client, &[]);
+        }
+        "show-option" | "show-options" => {
+            // iTerm2 queries various options. Respond with empty/default values.
+            // Examples: show-option -g -v status, show-option -q -g -v focus-events
+            //           show-options -v -s default-terminal, show-options -g message-style
+            //           show -v -q -t $N @affinities (session user options)
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            // Last positional starting with '@' = session user option.
+            let user_opt = parsed
+                .positional
+                .iter()
+                .find(|a| a.starts_with('@'))
+                .map(|s| s.to_string());
+            if let Some(key) = user_opt {
+                let si = resolve_session_target(sessions, client, t.as_deref());
+                let stored = si
+                    .and_then(|i| sessions.get(i))
+                    .and_then(|s| s.options.get(&key))
+                    .cloned();
+                // Without saved affinities iTerm2 opens every window in its
+                // own OS window. Synthesize one class per session so each
+                // session's windows open as tabs of a single OS window —
+                // matching the lrmux session↔window model.
+                let val = stored.unwrap_or_else(|| {
+                    if key == "@affinities" {
+                        synthesize_affinities(sessions)
+                    } else {
+                        String::new()
+                    }
+                });
+                if val.is_empty() {
+                    respond(client, &[]);
+                } else {
+                    respond(client, &[val.as_str()]);
+                }
+            } else if args_str.contains("default-terminal") {
+                respond(client, &["screen-256color"]);
+            } else if args_str.contains("focus-events") {
+                respond(client, &["off"]);
+            } else if args_str.contains("status") {
+                respond(client, &["on"]);
+            } else {
+                respond(client, &[]);
+            }
+        }
+        "set-option" => {
+            // iTerm2 sends: set -t $N @affinities "...", set -t $N @hidden ...
+            // Store session user options so they survive reattach.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            if parsed.positional.len() >= 2 && parsed.positional[0].starts_with('@') {
+                let key = parsed.positional[0].clone();
+                let val = unquote(&parsed.positional[1]).to_string();
+                if let Some(si) = resolve_session_target(sessions, client, t.as_deref())
+                    && let Some(s) = sessions.get_mut(si)
+                {
+                    s.options.insert(key.clone(), val.clone());
+                    if key == "@affinities" {
+                        // iTerm2 assigns each OS window an affinity class of
+                        // window ids; windows in a new class belong to a new
+                        // session (handled by the caller, which owns `clients`).
+                        *pending_affinities = Some((si, val));
+                    }
+                }
+            }
+            respond(client, &[]);
+        }
+        "show-window-options" => {
+            // iTerm2 queries: show-window-options -g aggressive-resize
+            //                  show-window-options pane-border-format
+            respond(client, &[]);
+        }
+        "list-sessions" => {
+            // iTerm2 sends: list-sessions -F "<format>"
+            let lines: Vec<String> = if let Some(fmt) = extract_format_arg(args_str) {
+                sessions
+                    .iter()
+                    .map(|s| expand_format(&fmt, Some(s), None, socket_path))
+                    .collect()
+            } else {
+                sessions
+                    .iter()
+                    .map(|s| format!("{}: {} (1 windows) [{}x{}]", s.id_str(), s.name, 24, 80))
+                    .collect()
+            };
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            respond(client, &refs);
+        }
+        "list-windows" => {
+            // iTerm2 sends: list-windows -F "#{socket_path}", -F "#{pid}", etc.
+            //               list-windows -F "<window TSV>" -t "$N" (per-session)
+            // Without -t, return windows of ALL sessions: lrmux maps each
+            // iTerm2 window to its own session, and iTerm2 groups the listed
+            // windows into OS windows via their saved affinities.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let targets: Vec<&Session> = match t.as_deref() {
+                Some(t) => resolve_session_target(sessions, client, Some(t))
+                    .and_then(|si| sessions.get(si))
+                    .into_iter()
+                    .collect(),
+                None => sessions.iter().collect(),
+            };
+            let mut lines: Vec<String> = Vec::new();
+            if let Some(fmt) = extract_format_arg(args_str) {
+                for session in &targets {
+                    for w in &session.windows {
+                        lines.push(expand_format(&fmt, Some(session), Some(w), socket_path));
+                    }
+                }
+            } else {
+                for session in &targets {
+                    for (i, w) in session.windows.iter().enumerate() {
+                        lines.push(format!(
+                            "{}: {} [{}x{}] (0 panes) {}",
+                            i,
+                            w.name,
+                            24,
+                            80,
+                            w.id_str()
+                        ));
+                    }
+                }
+            }
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            respond(client, &refs);
+        }
+        "list-panes" => {
+            // iTerm2 sends: list-panes -t "%N" -F "key=#{key}..." (per-pane
+            // state dump when opening a window — cursor pos, modes, etc.)
+            //               list-panes -s -t $N -F "#{pane_id}" (all panes
+            //               in session $N)
+            // The -t target MUST resolve to the requested pane — iTerm2
+            // filters the state dump by pane_id and discards mismatches.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let session_wide = parsed.get("s").is_some() || args.iter().any(|a| a == "-s");
+
+            if session_wide {
+                // -s: list all panes in the target session (or client's).
+                let si = resolve_session_target(sessions, client, t.as_deref());
+                let lines: Vec<String> = match si.and_then(|i| sessions.get(i)) {
+                    Some(s) => {
+                        if let Some(fmt) = extract_format_arg(args_str) {
+                            s.windows
+                                .iter()
+                                .map(|w| expand_format(&fmt, Some(s), Some(w), socket_path))
+                                .collect()
+                        } else {
+                            s.windows
+                                .iter()
+                                .enumerate()
+                                .map(|(i, w)| {
+                                    format!(
+                                        "{}: [{}x{}] [history 0/0] %{}",
+                                        i, w.pane.cols, w.pane.rows, w.pane.id
+                                    )
+                                })
+                                .collect()
+                        }
+                    }
+                    None => Vec::new(),
+                };
+                let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                respond(client, &refs);
+            } else {
+                let (session, window) = match resolve_target(sessions, client, t.as_deref()) {
+                    Some((si, wi)) => (
+                        sessions.get(si),
+                        sessions.get(si).and_then(|s| s.windows.get(wi)),
+                    ),
+                    None => (None, None),
+                };
+                let lines: Vec<String> =
+                    if let (Some(fmt), Some(w)) = (extract_format_arg(args_str), window) {
+                        vec![expand_format(&fmt, session, Some(w), socket_path)]
+                    } else if let Some(w) = window {
+                        vec![format!(
+                            "0: [{}x{}] [history 0/0] %{} (active)",
+                            w.pane.cols, w.pane.rows, w.pane.id
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                respond(client, &refs);
+            }
+        }
+        "capture-pane" => {
+            // iTerm2 sends: capture-pane -peqJN -t "%N" -S -<n> (history)
+            //               capture-pane -p -P -C -t "%N" (pending output)
+            // -e requests SGR escapes (colors/attrs), -S -<n> includes scrollback.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            // -P asks only for output received since the last %output send.
+            // We forward all pane output as %output immediately, so there is
+            // never pending output — returning the grid here would make
+            // iTerm2 append the whole screen as duplicate B&W history.
+            if args.iter().any(|a| {
+                a.len() >= 2 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains('P')
+            }) {
+                respond(client, &[]);
+                return false;
+            }
+            let with_escapes = args.iter().any(|a| {
+                a.len() >= 2
+                    && a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a[1..]
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_alphabetic())
+                        .unwrap_or(false)
+                    && a[1..].contains('e')
+            });
+            let include_scrollback = args.iter().enumerate().any(|(i, a)| {
+                let v = if a == "-S" {
+                    args.get(i + 1).map(|s| s.as_str())
+                } else {
+                    a.strip_prefix("-S")
+                };
+                v.map(|v| v == "-" || v.parse::<i64>().map(|n| n < 0).unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let window = resolve_target(sessions, client, t.as_deref())
+                .and_then(|(si, wi)| sessions.get(si).and_then(|s| s.windows.get(wi)));
+            let text = window
+                .map(|w| render_pane_text(&w.pane, with_escapes, include_scrollback))
+                .unwrap_or_default();
+            let lines: Vec<&str> = if text.is_empty() {
+                Vec::new()
+            } else {
+                text.lines().collect()
+            };
+            respond(client, &lines);
+        }
+        "display-message" => {
+            // iTerm2 sends: display-message -p "#{version}", "#{pid}", and
+            //   display -p -F "<window TSV>" -t @N  (window opener query)
+            // Resolve -t so the format expands for the requested window.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let (session, window) = match resolve_target(sessions, client, t.as_deref()) {
+                Some((si, wi)) => (
+                    sessions.get(si),
+                    sessions.get(si).and_then(|s| s.windows.get(wi)),
+                ),
+                None => (
+                    sessions.get(client.session_idx),
+                    sessions
+                        .get(client.session_idx)
+                        .and_then(|s| s.windows.get(client.active_window)),
+                ),
+            };
+            if let Some(fmt) = extract_format_arg(args_str) {
+                let text = expand_format(&fmt, session, window, socket_path);
+                respond(client, &[&text]);
+            } else if args_str.contains("#{") {
+                // -p "<format>" without -F
+                if let Some(start) = args_str.find('"') {
+                    if let Some(end) = args_str.rfind('"') {
+                        if end > start {
+                            let fmt = &args_str[start + 1..end];
+                            let session = sessions.get(client.session_idx);
+                            let window = session.and_then(|s| s.windows.get(client.active_window));
+                            let text = expand_format(fmt, session, window, socket_path);
+                            respond(client, &[&text]);
+                        } else {
+                            respond(client, &[]);
+                        }
+                    } else {
+                        respond(client, &[]);
+                    }
+                } else {
+                    respond(client, &[]);
+                }
+            } else {
+                respond(client, &[]);
+            }
+        }
+        "list-keys" => {
+            // iTerm2 sends: list-keys (to get key bindings)
+            respond(client, &[]);
+        }
+        "copy-mode" => {
+            // iTerm2 sends: copy-mode -q
+            respond(client, &[]);
+        }
+        "new-session" => {
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let name = parsed
+                .get("s")
+                .or_else(|| parsed.get("session"))
+                .map(|s| s.to_string());
+            let cwd = parsed
+                .get("c")
+                .or_else(|| parsed.get("cwd"))
+                .map(|s| s.to_string());
+
+            // Create the session. Default name: basename of -c if given
+            // (matches lrmux's cwd-derived session naming), else "session".
+            let session_name = name
+                .map(|n| unquote(&n).to_string())
+                .or_else(|| {
+                    cwd.as_deref().and_then(|c| {
+                        std::path::Path::new(unquote(c))
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                    })
+                })
+                .unwrap_or_else(|| "session".to_string());
+            let session_name = ensure_unique_session_name(&session_name, sessions);
+
+            let new_session = if let Some(ref c) = cwd {
+                Session::new_in_cwd(session_name, 24, 80, unquote(c))
+            } else {
+                Session::new(session_name, 24, 80)
+            };
+            let sid = new_session.id_str();
+            let sname = new_session.name.clone();
+            sessions.push(new_session);
+            let si = sessions.len() - 1;
+            client.session_idx = si;
+
+            send_control_notify(client, "%sessions-changed");
+            send_control_notify(client, &format!("%session-changed {} {}", sid, sname));
+            let win = &sessions[si].windows[0];
+            send_control_notify(client, &format!("%window-add {}", win.id_str()));
+            send_control_notify(
+                client,
+                &format!("%window-renamed {} {}", win.id_str(), win.name),
+            );
+
+            respond(client, &[]);
+        }
+        "send-keys" => {
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            // Parse send-keys flags manually: -H (hex args), -l (literal),
+            // -t <target>. Combined forms like "-lt" come from iTerm2.
+            let mut hex_mode = false;
+            let mut target_str: Option<String> = None;
+            let mut positionals: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a.starts_with('-') && a.len() > 1 {
+                    let flags = &a[1..];
+                    if flags == "t" || flags.ends_with('t') && flags.len() > 1 {
+                        // -t or -Xt: takes next arg as target.
+                        if i + 1 < args.len() {
+                            target_str = Some(args[i + 1].clone());
+                            i += 1;
+                        }
+                    }
+                    if flags.contains('H') {
+                        hex_mode = true;
+                    }
+                } else {
+                    positionals.push(a.clone());
+                }
+                i += 1;
+            }
+            let keys = if hex_mode {
+                // -H: each positional is hex-encoded bytes ("0d", "0d0a").
+                let mut out = Vec::new();
+                for h in &positionals {
+                    let h = h.trim();
+                    let mut j = 0;
+                    while j + 1 < h.len() + 1 && j + 2 <= h.len() {
+                        if let Ok(b) = u8::from_str_radix(&h[j..j + 2], 16) {
+                            out.push(b);
+                        }
+                        j += 2;
+                    }
+                }
+                out
+            } else {
+                parse_tmux_keys_for_control(&positionals)
+            };
+
+            // Resolve -t: "%N" is a pane id, "@N" a window id, otherwise a
+            // session name. Default = client's current window.
+            let loc = resolve_target(sessions, client, target_str.as_deref());
+            let Some((si, wi)) = loc else {
+                respond(client, &[]);
+                return false;
+            };
+
+            // Write keys to the PTY.
+            let window = &mut sessions[si].windows[wi];
+            if !window.pane.exited {
+                let _ = window.pane.write_input(&keys);
+            }
+
+            respond(client, &[]);
+        }
+        "kill-server" => {
+            respond(client, &[]);
+            send_control_notify(client, "%exit");
+            // Signal the event loop to shut down gracefully (SIGHUP
+            // children, save state, remove the socket) instead of
+            // exit(0), which would orphan shells and skip cleanup.
+            return true;
+        }
+        "new-window" => {
+            // iTerm2 sends: new-window -PF '#{window_id}' -c '#{pane_current_path}'
+            // -P means "print": the response must contain the new window id
+            // (@N), which iTerm2 registers in _pendingWindows to open the tab.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let print = parsed.get("P").is_some()
+                || args.iter().any(|a| a.contains('P') && a.starts_with('-'));
+
+            // Create a new window in the -t session ("$N" or "$N:+"), else
+            // the client's session.
+            let si = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|t| {
+                    let t = unquote(t);
+                    let t = t.split(':').next().unwrap_or(t);
+                    t.to_string()
+                })
+                .and_then(|t| resolve_session_target(sessions, client, Some(&t)))
+                .unwrap_or(client.session_idx);
+            let mut wid_str = String::new();
+            if si < sessions.len() {
+                let session = &mut sessions[si];
+                let (rows, cols) = session
+                    .windows
+                    .first()
+                    .map(|w| (w.pane.rows, w.pane.cols))
+                    .unwrap_or((24, 80));
+                let win = Window::new(rows, cols, "shell".to_string());
+                wid_str = win.id_str();
+                let wname = win.name.clone();
+                let layout = window_layout_str(&win);
+                session.windows.push(win);
+                send_control_notify(client, &format!("%window-add {}", wid_str));
+                send_control_notify(client, &format!("%window-renamed {} {}", wid_str, wname));
+                send_control_notify(client, &format!("%layout-change {} {}", wid_str, layout));
+            }
+            if print && !wid_str.is_empty() {
+                respond(client, &[wid_str.as_str()]);
+            } else {
+                respond(client, &[]);
+            }
+        }
+        "kill-window" | "kill-pane" => {
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            if let Some((si, wi)) = resolve_target(sessions, client, t.as_deref())
+                && si < sessions.len()
+                && wi < sessions[si].windows.len()
+            {
+                // SIGHUP the child, then remove the window.
+                let window = &mut sessions[si].windows[wi];
+                if !window.pane.exited {
+                    unsafe {
+                        libc::kill(window.pane.pty.child_pid.into(), libc::SIGHUP);
+                    }
+                }
+                let wid = window.id_str();
+                sessions[si].windows.remove(wi);
+                send_control_notify(client, &format!("%window-close {}", wid));
+                // Fix up this client's active_window if needed.
+                if client.session_idx == si && client.active_window >= sessions[si].windows.len() {
+                    client.active_window = sessions[si].windows.len().saturating_sub(1);
+                }
+            }
+            respond(client, &[]);
+        }
+        "select-window" | "select-pane" => {
+            // Track the client's active window so send-keys, list-panes,
+            // capture-pane etc. target the pane iTerm2 is showing.
+            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            if let Some((si, wi)) = resolve_target(sessions, client, t.as_deref()) {
+                client.session_idx = si;
+                client.active_window = wi;
+            }
+            respond(client, &[]);
+        }
+        "rename-window" => {
+            // For now, just acknowledge.
+            respond(client, &[]);
+        }
+        "detach-client" => {
+            // Real tmux -CC on detach: %begin/%end (flags=1), then %exit,
+            // then the client process exits. %client-detached is only sent
+            // to *other* control clients.
+            respond(client, &[]);
+            send_control_notify(client, "%exit");
+            client.close_when_idle = true;
+        }
+        _ => {
+            // Unknown command — respond with empty %begin/%end (not error)
+            // so iTerm2 doesn't give up and exit tmux mode.
+            respond(client, &[]);
+        }
+    }
+    false
+}
+
+/// Parse tmux-style key names into byte sequences (for control mode send-keys).
+/// Reuses the same logic as main.rs::parse_tmux_keys.
+fn parse_tmux_keys_for_control(parts: &[String]) -> Vec<u8> {
+    let mut result = Vec::new();
+    for part in parts {
+        match part.as_str() {
+            "Enter" | "Return" => result.push(b'\r'),
+            "Tab" => result.push(b'\t'),
+            "Escape" | "Esc" => result.push(0x1b),
+            "Space" => result.push(b' '),
+            "BS" | "BSpace" => result.push(0x7f),
+            "Up" => result.extend_from_slice(b"\x1b[A"),
+            "Down" => result.extend_from_slice(b"\x1b[B"),
+            "Right" => result.extend_from_slice(b"\x1b[C"),
+            "Left" => result.extend_from_slice(b"\x1b[D"),
+            "Home" => result.extend_from_slice(b"\x1b[H"),
+            "End" => result.extend_from_slice(b"\x1b[F"),
+            "PageUp" | "PgUp" => result.extend_from_slice(b"\x1b[5~"),
+            "PageDown" | "PgDn" => result.extend_from_slice(b"\x1b[6~"),
+            "F1" => result.extend_from_slice(b"\x1bOP"),
+            "F2" => result.extend_from_slice(b"\x1bOQ"),
+            "F3" => result.extend_from_slice(b"\x1bOR"),
+            "F4" => result.extend_from_slice(b"\x1bOS"),
+            "F5" => result.extend_from_slice(b"\x1b[15~"),
+            "F6" => result.extend_from_slice(b"\x1b[17~"),
+            "F7" => result.extend_from_slice(b"\x1b[18~"),
+            "F8" => result.extend_from_slice(b"\x1b[19~"),
+            "F9" => result.extend_from_slice(b"\x1b[20~"),
+            "F10" => result.extend_from_slice(b"\x1b[21~"),
+            "F11" => result.extend_from_slice(b"\x1b[23~"),
+            "F12" => result.extend_from_slice(b"\x1b[24~"),
+            _ if part.starts_with("C-") && part.len() == 3 => {
+                let key = part.as_bytes()[2];
+                if key.is_ascii_uppercase() {
+                    result.push(key - b'A' + 1);
+                } else if key.is_ascii_lowercase() {
+                    result.push(key - b'a' + 1);
+                } else if key == b'@' {
+                    result.push(0x00);
+                } else if key == b'[' {
+                    result.push(0x1b);
+                } else if key == b'\\' {
+                    result.push(0x1c);
+                } else if key == b']' {
+                    result.push(0x1d);
+                } else if key == b'^' {
+                    result.push(0x1e);
+                } else if key == b'_' {
+                    result.push(0x1f);
+                } else if key == b'?' {
+                    result.push(0x7f);
+                } else {
+                    result.extend_from_slice(part.as_bytes());
+                }
+            }
+            _ if part.starts_with("M-") && part.len() == 3 => {
+                result.push(0x1b);
+                result.push(part.as_bytes()[2]);
+            }
+            // Hex key code: tmux accepts 0xNN (iTerm2 sends e.g. 0x7f for
+            // Backspace and 0x20 for Space).
+            _ if part.starts_with("0x") || part.starts_with("0X") => {
+                if let Ok(b) = u8::from_str_radix(&part[2..], 16) {
+                    result.push(b);
+                } else {
+                    result.extend_from_slice(part.as_bytes());
+                }
+            }
+            _ => {
+                result.extend_from_slice(part.as_bytes());
+            }
+        }
+    }
+    result
+}
+
+/// Find a session by name (or return the first if name is None).
+fn find_session(sessions: &[Session], name: &Option<String>) -> Option<usize> {
+    match name {
+        Some(n) => sessions
+            .iter()
+            .position(|s| s.name == *n || s.id_str() == *n),
+        None => Some(0),
+    }
+}
+
+/// Find a window by index (or return the first if index is None).
+fn find_window(session: &Session, index: &Option<String>) -> Option<usize> {
+    match index {
+        Some(i) => {
+            if let Some(id) = i.strip_prefix('@') {
+                // Window id @N.
+                session
+                    .windows
+                    .iter()
+                    .position(|w| w.id_str() == *i || w.id.to_string() == id)
+                    .or_else(|| i.parse::<usize>().ok())
+            } else {
+                i.parse::<usize>().ok()
+            }
+        }
+        None => Some(0),
+    }
+}
+
+/// Strip one layer of surrounding quotes — iTerm2 sends -t "%1" / -t @5
+/// with literal quotes that must not confuse target parsing.
+fn unquote(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Resolve a tmux -t target to (session_idx, window_idx).
+/// "%N" = pane id (searched across sessions), "@N" = window id,
+/// "$N" = session id, "name"/"name:idx"/"idx" = session/window.
+/// None = the client's current session and active window.
+fn resolve_target(
+    sessions: &[Session],
+    client: &ClientConn,
+    target: Option<&str>,
+) -> Option<(usize, usize)> {
+    let t = unquote(target.unwrap_or(""));
+    if t.is_empty() {
+        let si = client.session_idx;
+        let wi = client.active_window.min(
+            sessions
+                .get(si)
+                .map(|s| s.windows.len().saturating_sub(1))
+                .unwrap_or(0),
+        );
+        return Some((si, wi));
+    }
+    if let Some(pid) = t.strip_prefix('%') {
+        // Pane id: find the window containing it.
+        let pid = pid.parse::<u32>().ok()?;
+        for (si, s) in sessions.iter().enumerate() {
+            for (wi, w) in s.windows.iter().enumerate() {
+                if w.pane.id == pid {
+                    return Some((si, wi));
+                }
+            }
+        }
+        return None;
+    }
+    if t.starts_with('@') {
+        for (si, s) in sessions.iter().enumerate() {
+            if let Some(wi) = find_window(s, &Some(t.to_string())) {
+                return Some((si, wi));
+            }
+        }
+        return None;
+    }
+    if t.starts_with('$') {
+        // Session id: its first window.
+        let si = resolve_session_target(sessions, client, Some(t))?;
+        if sessions[si].windows.is_empty() {
+            return None;
+        }
+        return Some((si, 0));
+    }
+    let parsed = crate::cmd::Target::parse(t);
+    let si = find_session(sessions, &parsed.session).or(Some(client.session_idx))?;
+    let wi = find_window(&sessions[si], &parsed.window)?;
+    Some((si, wi))
+}
+
+/// Resolve a session target: "$N" = session id, "name" = session name,
+/// None = the client's current session.
+fn resolve_session_target(
+    sessions: &[Session],
+    client: &ClientConn,
+    target: Option<&str>,
+) -> Option<usize> {
+    match unquote(target.unwrap_or("")) {
+        "" => Some(client.session_idx),
+        t if t.starts_with('$') => {
+            let id = t.strip_prefix('$')?.parse::<u32>().ok()?;
+            sessions.iter().position(|s| s.id == id)
+        }
+        t => find_session(sessions, &Some(t.to_string())),
+    }
 }

@@ -1,5 +1,6 @@
 // Session: a collection of windows; the unit of detach/attach.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::server::window::Window;
@@ -13,6 +14,10 @@ pub struct Session {
     pub id: u32,
     pub name: String,
     pub windows: Vec<Window>,
+    /// User options (@name) set via `set -t $N @k v` — iTerm2 stores
+    /// @affinities, @hidden, @tab_colors etc. here to reconstruct tab
+    /// groupings across reattach.
+    pub options: HashMap<String, String>,
 }
 
 impl Session {
@@ -22,6 +27,7 @@ impl Session {
             id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
             name,
             windows: vec![window],
+            options: HashMap::new(),
         }
     }
 
@@ -31,6 +37,18 @@ impl Session {
             id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
             name,
             windows: vec![window],
+            options: HashMap::new(),
+        }
+    }
+
+    /// A session with no windows — used when iTerm2 affinities move a
+    /// window into a new session (each OS window maps to a session).
+    pub fn new_empty(name: String) -> Self {
+        Self {
+            id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            name,
+            windows: Vec::new(),
+            options: HashMap::new(),
         }
     }
 

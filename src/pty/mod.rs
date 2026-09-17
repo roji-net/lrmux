@@ -71,6 +71,14 @@ impl Pty {
                 unsafe {
                     std::env::remove_var("LRMUX");
                     std::env::remove_var("LRMUX_SERVER");
+                    // The master must be nonblocking: the event loop drains
+                    // it until EAGAIN after each POLLIN, and a blocking read
+                    // would freeze the whole server once the buffer empties.
+                    libc::fcntl(
+                        master.as_raw_fd(),
+                        libc::F_SETFL,
+                        libc::fcntl(master.as_raw_fd(), libc::F_GETFL) | libc::O_NONBLOCK,
+                    );
                 }
                 Pty {
                     master,

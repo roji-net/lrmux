@@ -83,28 +83,42 @@ impl Pane {
         }
     }
 
-    /// Read PTY output, parse into grid. Returns true if the child is still alive.
-    pub fn process_pty_output(&mut self) -> io::Result<bool> {
+    /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes).
+    /// raw_bytes is the unprocessed output from the PTY (for control mode forwarding).
+    pub fn process_pty_output(&mut self) -> io::Result<(bool, Vec<u8>)> {
         if self.exited {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
-        let mut buf = [0u8; 8192];
+        // Drain the PTY until EAGAIN so a burst becomes a single grid
+        // update — one 8KB read per poll event would generate a frame per
+        // chunk and flood slow clients past their socket buffer cap.
+        // Cap at 4MB per event so an endless producer can't starve the
+        // event loop (poll refires while data remains).
+        const MAX_DRAIN: usize = 4 * 1024 * 1024;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 65536];
         let fd = self.pty_fd();
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if n > 0 {
-            let n = n as usize;
-            vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
-            Ok(true)
-        } else if n == 0 {
-            Ok(false)
-        } else {
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n > 0 {
+                let n = n as usize;
+                raw.extend_from_slice(&buf[..n]);
+                vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
+                if raw.len() >= MAX_DRAIN {
+                    return Ok((true, raw));
+                }
+                continue;
+            }
+            if n == 0 {
+                return Ok((false, raw));
+            }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                Ok(true)
+                return Ok((true, raw));
             } else if err.raw_os_error() == Some(libc::EIO) {
-                Ok(false)
+                return Ok((false, raw));
             } else {
-                Err(err)
+                return Err(err);
             }
         }
     }
@@ -163,9 +177,13 @@ impl Pane {
     }
 
     /// Write input bytes to the PTY (keystrokes from client).
+    /// The master fd is nonblocking: on EAGAIN (child not reading) wait
+    /// briefly with poll, bounded so a stalled child can't freeze the
+    /// event loop.
     pub fn write_input(&self, data: &[u8]) -> io::Result<()> {
         let fd = self.pty_fd();
         let mut written = 0;
+        let mut waited_ms = 0;
         while written < data.len() {
             let w = unsafe {
                 libc::write(
@@ -175,7 +193,18 @@ impl Pane {
                 )
             };
             if w < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock && waited_ms < 100 {
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, 10) };
+                    waited_ms += 10;
+                    continue;
+                }
+                return Err(err);
             }
             written += w as usize;
         }
