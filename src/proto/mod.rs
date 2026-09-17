@@ -81,6 +81,8 @@ pub enum ClientMsg {
     /// Control mode client sends a tmux-style command line.
     /// The server parses it using the cmd module and executes it.
     ControlCommand { line: String },
+    /// Request a fresh grid snapshot from the server.
+    Refresh,
 }
 
 /// Server → Client messages.
@@ -128,6 +130,7 @@ pub enum ServerMsg {
         windows: Vec<String>,
         active: u16,
         session_count: u16,
+        high_output: bool,
     },
     /// List of session names + server address (response to ListSessions).
     SessionList {
@@ -168,6 +171,7 @@ const C_SEND_KEYS: u8 = 0x14;
 const C_GET_LOG: u8 = 0x15;
 const C_IDENTIFY_CONTROL: u8 = 0x16;
 const C_CONTROL_COMMAND: u8 = 0x17;
+const C_REFRESH: u8 = 0x18;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -347,6 +351,9 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
             payload.extend_from_slice(line.as_bytes());
         }
+        ClientMsg::Refresh => {
+            payload.push(C_REFRESH);
+        }
     }
     frame(payload)
 }
@@ -432,6 +439,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             windows,
             active,
             session_count,
+            high_output,
         } => {
             payload.push(S_STATUS_BAR);
             payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
@@ -443,6 +451,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             }
             payload.extend_from_slice(&active.to_le_bytes());
             payload.extend_from_slice(&session_count.to_le_bytes());
+            payload.push(*high_output as u8);
         }
         ServerMsg::SessionList { sessions, address } => {
             payload.push(S_SESSION_LIST);
@@ -686,6 +695,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             let line = String::from_utf8_lossy(&r[..len]).into_owned();
             Ok(ClientMsg::ControlCommand { line })
         }
+        C_REFRESH => Ok(ClientMsg::Refresh),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -802,11 +812,13 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             }
             let active = read_u16(&mut r)?;
             let session_count = read_u16(&mut r)?;
+            let high_output = !r.is_empty() && r[0] != 0;
             Ok(ServerMsg::StatusBarUpdate {
                 session,
                 windows,
                 active,
                 session_count,
+                high_output,
             })
         }
         S_SESSION_LIST => {

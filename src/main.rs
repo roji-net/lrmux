@@ -1118,17 +1118,8 @@ fn start_headless_server(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
 /// Run iTerm2 control mode against a target server.
 /// Default target means the default server (auto-start a headless one if missing).
 fn run_control_mode(target: Option<&str>) -> io::Result<()> {
-    // CRITICAL: No output to stdout/stderr except DCS + % notifications.
-    // iTerm2 parses everything on the PTY as tmux control protocol.
-    // Redirect stderr to /dev/null so server startup messages don't leak.
-    unsafe {
-        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if devnull >= 0 {
-            libc::dup2(devnull, libc::STDERR_FILENO);
-            libc::close(devnull);
-        }
-    }
-
+    // Resolve the target and validate the server before silencing stderr,
+    // so that real errors (unknown server) are still visible to the user.
     let server = resolve_control_target(target)?;
     let sock = socket_path(&server);
     if !ipc::server_exists(&sock) {
@@ -1145,6 +1136,18 @@ fn run_control_mode(target: Option<&str>) -> io::Result<()> {
             ));
         }
     }
+
+    // CRITICAL: No output to stdout/stderr except DCS + % notifications.
+    // iTerm2 parses everything on the PTY as tmux control protocol.
+    // Redirect stderr to /dev/null so server startup messages don't leak.
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+        }
+    }
+
     crate::client::control::run(&sock)
 }
 

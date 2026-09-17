@@ -718,6 +718,7 @@ pub fn run(
                             windows,
                             active,
                             session_count: sc,
+                            high_output: h,
                         } => {
                             // Track last window for Ctrl-A Ctrl-A toggle.
                             let new_active = Some(active as u8);
@@ -733,6 +734,7 @@ pub fn run(
                                 &windows,
                                 active as usize,
                                 &server_version,
+                                h,
                             );
                             let mut stdout = io::stdout();
                             if let Some(ref msg) = flash_msg {
@@ -819,8 +821,9 @@ pub fn run(
                 if !std::path::Path::new(&*sock_path).exists() {
                     exit_reason = Some("server shut down".to_string());
                 } else {
+                    let log_hint = server_log_path(socket_path);
                     exit_reason = Some(format!(
-                        "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                        "disconnected from server (socket still present — server may have crashed, or this client was dropped for backpressure). Check log at {log_hint}"
                     ));
                 }
                 break;
@@ -844,8 +847,9 @@ pub fn run(
             if !std::path::Path::new(&*sock_path).exists() {
                 exit_reason = Some("server shut down".to_string());
             } else {
+                let log_hint = server_log_path(socket_path);
                 exit_reason = Some(format!(
-                    "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                    "disconnected from server (socket still present — server may have crashed, or this client was dropped for backpressure). Check log at {log_hint}"
                 ));
             }
             break;
@@ -860,6 +864,23 @@ pub fn run(
         eprintln!("lrmux: {reason}");
     }
     Ok(())
+}
+
+/// Log file for a server socket at `/tmp/lrmux-<UID>/<name>` lives at
+/// `/tmp/lrmux-<UID>/logs/<name>.log` (not `<socket>.log`).
+fn server_log_path(socket_path: &std::path::Path) -> String {
+    let name = socket_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    match socket_path.parent() {
+        Some(dir) => dir
+            .join("logs")
+            .join(format!("{name}.log"))
+            .display()
+            .to_string(),
+        None => format!("{name}.log"),
+    }
 }
 
 /// Process input bytes through the prefix-key state machine.
@@ -1022,6 +1043,11 @@ fn process_prefix(
                     // '\' → show server ring log overlay.
                     b'\\' => {
                         send_cmd(stream, &ClientMsg::GetLog)?;
+                    }
+                    // 'r' → refresh the screen with a fresh snapshot from the server.
+                    b'r' => {
+                        send_cmd(stream, &ClientMsg::Refresh)?;
+                        flash = Some("refreshing...".to_string());
                     }
                     // '?' → show keybindings help overlay.
                     b'?' => {
@@ -1193,6 +1219,7 @@ fn format_status_bar(
     windows: &[String],
     active: usize,
     server_version: &str,
+    high_output: bool,
 ) -> String {
     // Blue background + white text for inactive windows.
     const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
@@ -1210,11 +1237,16 @@ fn format_status_bar(
     } else {
         String::new()
     };
+    let burst_marker = if high_output {
+        format!("{WARN}[BURST]{RESET} ")
+    } else {
+        String::new()
+    };
 
     let mut parts: Vec<String> = Vec::new();
     for (i, name) in windows.iter().enumerate() {
         if i == active {
-            parts.push(format!("{}{}:{}*{}", ACTIVE, i, name, BAR));
+            parts.push(format!("{}{}:{}*{}{}", ACTIVE, i, name, BAR, burst_marker));
         } else {
             parts.push(format!("{}:{}", i, name));
         }
@@ -1643,6 +1675,7 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A [", "Enter copy mode"),
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),
+        ("Ctrl-A r", "Refresh screen"),
         ("Ctrl-A d / Ctrl-D", "Detach"),
         ("Ctrl-A \\", "Show server log"),
         ("Ctrl-A ?", "Show this help"),
