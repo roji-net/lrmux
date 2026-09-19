@@ -28,6 +28,14 @@ pub struct Pane {
     /// Input bytes waiting to be written to the PTY master when it becomes writable.
     /// Prevents partial escape sequences when the child is slow to drain stdin.
     pub pending_input: Vec<u8>,
+    /// Incomplete UTF-8 sequence at the end of the last PTY read, held so
+    /// control-mode `%output` never splits a multi-byte character across
+    /// notifications (which would turn `─` into `�`).
+    pub cc_utf8_pending: Vec<u8>,
+    /// Last known outer-terminal default foreground (OSC 10), if observed.
+    pub default_fg: Option<(u8, u8, u8)>,
+    /// Last known outer-terminal default background (OSC 11), if observed.
+    pub default_bg: Option<(u8, u8, u8)>,
 }
 
 impl Pane {
@@ -44,15 +52,24 @@ impl Pane {
     }
 
     /// Spawn a new pane with a custom command string.
-    /// The command is split by whitespace and executed via the shell.
-    pub fn new_with_command(rows: u16, cols: u16, command: &str) -> Self {
+    ///
+    /// Runs `$SHELL -ci <command>` so interactive rc files (`.zshrc` /
+    /// `.bashrc`) are sourced. Plain `-c` skips them and breaks vim
+    /// truecolor / redraw (confirmed: `zsh -c vi` glitches, `zsh -ci vi`
+    /// does not). After the command exits the shell exits, so the pane
+    /// closes — no `exec` needed. Optional `cwd` sets the child's working
+    /// directory (tmux `new-session -c`).
+    pub fn new_with_command(rows: u16, cols: u16, command: &str, cwd: Option<&str>) -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let cmd = command.trim();
         let argv = vec![
             CString::new(shell).unwrap(),
-            CString::new("-c").unwrap(),
-            CString::new(command).unwrap(),
+            // Combined `-ci` matches the working manual repro (`zsh -ci '…'`).
+            // Separate `-i` `-c` should be equivalent; keep the proven form.
+            CString::new("-ci").unwrap(),
+            CString::new(cmd).unwrap(),
         ];
-        Self::new_with_argv(rows, cols, &argv, None)
+        Self::new_with_argv(rows, cols, &argv, cwd)
     }
 
     /// Spawn a new pane with the given argv and optional working directory.
@@ -70,7 +87,49 @@ impl Pane {
             exited: false,
             exit_code: None,
             pending_input: Vec::new(),
+            cc_utf8_pending: Vec::new(),
+            default_fg: None,
+            default_bg: None,
         }
+    }
+
+    /// Palette learned from proxied OSC 10/11 replies (for HTML capture).
+    pub fn terminal_palette(&self) -> super::capture::TerminalPalette {
+        super::capture::TerminalPalette {
+            fg: self.default_fg,
+            bg: self.default_bg,
+        }
+    }
+
+    /// Record an OSC 10/11 color reply from the outer TTY.
+    pub fn note_osc_color_reply(&mut self, data: &[u8]) {
+        if let Some((code, rgb)) = crate::term::parse_osc_color_reply(data) {
+            match code {
+                10 => self.default_fg = Some(rgb),
+                11 => self.default_bg = Some(rgb),
+                _ => {}
+            }
+        }
+    }
+
+    /// Coalesce `raw` with any incomplete UTF-8 left from the previous read.
+    /// Returns bytes safe to forward as `%output` (no trailing incomplete
+    /// sequence). Leftover incomplete bytes stay in `cc_utf8_pending`.
+    pub fn take_cc_forward_bytes(&mut self, raw: &[u8]) -> Vec<u8> {
+        if self.cc_utf8_pending.is_empty() && raw.is_empty() {
+            return Vec::new();
+        }
+        self.cc_utf8_pending.extend_from_slice(raw);
+        let incomplete = incomplete_utf8_tail_len(&self.cc_utf8_pending);
+        let cut = self.cc_utf8_pending.len() - incomplete;
+        let complete = self.cc_utf8_pending[..cut].to_vec();
+        self.cc_utf8_pending.drain(..cut);
+        complete
+    }
+
+    /// Flush any buffered incomplete UTF-8 (pane exit / final drain).
+    pub fn flush_cc_forward_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.cc_utf8_pending)
     }
 
     /// Format the pane ID as tmux-style: %N
@@ -87,11 +146,12 @@ impl Pane {
         }
     }
 
-    /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes).
+    /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes, osc_queries).
     /// raw_bytes is the unprocessed output from the PTY (for control mode forwarding).
-    pub fn process_pty_output(&mut self) -> io::Result<(bool, Vec<u8>)> {
+    /// osc_queries are OSC 10/11 color probes to proxy to an attached client TTY.
+    pub fn process_pty_output(&mut self) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
         if self.exited {
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), Vec::new()));
         }
         // Drain the PTY until EAGAIN so a burst becomes a single grid
         // update — one 8KB read per poll event would generate a frame per
@@ -100,6 +160,7 @@ impl Pane {
         // event loop (poll refires while data remains).
         const MAX_DRAIN: usize = 4 * 1024 * 1024;
         let mut raw = Vec::new();
+        let mut osc_queries = Vec::new();
         let mut buf = [0u8; 65536];
         let fd = self.pty_fd();
         loop {
@@ -107,20 +168,35 @@ impl Pane {
             if n > 0 {
                 let n = n as usize;
                 raw.extend_from_slice(&buf[..n]);
-                vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
+                if let Ok(path) = std::env::var("LRMUX_VT_DUMP") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = f.write_all(&buf[..n]);
+                    }
+                }
+                let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
+                if !parsed.immediate_replies.is_empty() {
+                    // CPR / DSR / DA — answer from our grid state.
+                    self.write_input(&parsed.immediate_replies)?;
+                }
+                osc_queries.extend(parsed.osc_queries);
                 if raw.len() >= MAX_DRAIN {
-                    return Ok((true, raw));
+                    return Ok((true, raw, osc_queries));
                 }
                 continue;
             }
             if n == 0 {
-                return Ok((false, raw));
+                return Ok((false, raw, osc_queries));
             }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                return Ok((true, raw));
+                return Ok((true, raw, osc_queries));
             } else if err.raw_os_error() == Some(libc::EIO) {
-                return Ok((false, raw));
+                return Ok((false, raw, osc_queries));
             } else {
                 return Err(err);
             }
@@ -172,7 +248,7 @@ impl Pane {
         } else {
             format!("\r\n\x1b[31m[process exited, code {}]\x1b[0m\r\n", code)
         };
-        vt::parse_bytes(&mut self.vt_parser, &mut self.grid, msg.as_bytes());
+        let _ = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, msg.as_bytes());
     }
 
     /// Check if the pane's child has exited.
@@ -430,10 +506,106 @@ fn ansi_input_seq_len(buf: &[u8]) -> Option<usize> {
             }
             None
         }
+        b']' => {
+            // OSC: ESC ] ... BEL or ST (ESC \). Used for term color replies.
+            let mut i = 2;
+            while i < buf.len() {
+                if buf[i] == 0x07 {
+                    return Some(i + 1);
+                }
+                if buf[i] == 0x1b {
+                    if i + 1 < buf.len() && buf[i + 1] == b'\\' {
+                        return Some(i + 2);
+                    }
+                    return None;
+                }
+                i += 1;
+            }
+            None
+        }
         b'O' => {
             // SS3: ESC O X
             if buf.len() >= 3 { Some(3) } else { None }
         }
         _ => Some(2), // ESC + one more
+    }
+}
+
+/// Number of trailing bytes that form an incomplete UTF-8 sequence.
+/// Returns 0 if the buffer ends on a complete character boundary (or with
+/// orphaned continuation bytes that should be escaped, not buffered).
+pub(crate) fn incomplete_utf8_tail_len(data: &[u8]) -> usize {
+    if data.is_empty() {
+        return 0;
+    }
+    // Prefer std's verdict when the only problem is an incomplete suffix.
+    match std::str::from_utf8(data) {
+        Ok(_) => 0,
+        Err(e) if e.error_len().is_none() => data.len() - e.valid_up_to(),
+        Err(_) => {
+            // Invalid mid-stream (or orphaned continuations). Only buffer a
+            // trailing incomplete *starter* sequence; never hold garbage.
+            let len = data.len();
+            let lookback = len.min(3);
+            for i in 1..=lookback {
+                let idx = len - i;
+                let needed = match data[idx] {
+                    0x00..=0x7F => 1,
+                    0xC2..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF4 => 4,
+                    _ => 0, // continuation / invalid
+                };
+                if needed == 0 {
+                    continue;
+                }
+                if needed > i {
+                    return i;
+                }
+                return 0;
+            }
+            0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_tail_empty_and_ascii() {
+        assert_eq!(incomplete_utf8_tail_len(b""), 0);
+        assert_eq!(incomplete_utf8_tail_len(b"hello"), 0);
+    }
+
+    #[test]
+    fn incomplete_tail_box_drawing() {
+        // ─ is E2 94 80
+        assert_eq!(incomplete_utf8_tail_len(&[0xE2, 0x94, 0x80]), 0);
+        assert_eq!(incomplete_utf8_tail_len(&[0xE2]), 1);
+        assert_eq!(incomplete_utf8_tail_len(&[0xE2, 0x94]), 2);
+        assert_eq!(incomplete_utf8_tail_len(&[b'-', 0xE2, 0x94]), 2);
+    }
+
+    #[test]
+    fn take_cc_forward_coalesces_across_reads() {
+        // ─ split as [E2] + [94 80]: first read buffers, second emits the char.
+        let mut pending = vec![0xE2];
+        let incomplete = incomplete_utf8_tail_len(&pending);
+        assert_eq!(incomplete, 1);
+        pending.extend_from_slice(&[0x94, 0x80, b'x']);
+        assert_eq!(incomplete_utf8_tail_len(&pending), 0);
+        assert_eq!(&pending[..], &[0xE2, 0x94, 0x80, b'x']);
+    }
+
+    #[test]
+    fn ansi_input_seq_len_recognizes_osc() {
+        let osc = b"\x1b]11;rgb:0000/0000/0000\x07";
+        assert_eq!(ansi_input_seq_len(osc), Some(osc.len()));
+        // Incomplete OSC waits.
+        assert_eq!(ansi_input_seq_len(b"\x1b]11;rgb:0000"), None);
+        let st = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
+        assert_eq!(ansi_input_seq_len(st), Some(st.len()));
     }
 }

@@ -50,6 +50,8 @@ struct ClientConn {
     /// Control clients stay suppressed until they send a command *after*
     /// draining — auto-resume re-floods iTerm2.
     suppressed: bool,
+    /// Outer TTY default colors (OSC 10/11), probed by the client on attach.
+    palette: super::capture::TerminalPalette,
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
@@ -76,6 +78,7 @@ impl ClientConn {
             control_seq: 0,
             close_when_idle: false,
             suppressed: false,
+            palette: super::capture::TerminalPalette::default(),
         }
     }
 }
@@ -135,15 +138,21 @@ pub fn run(
     socket_path: &std::path::Path,
     headless: bool,
 ) -> io::Result<()> {
+    // Capture once at startup. Probes (ListSessions) and failed first
+    // handshakes must not consume / lose `new-server -- cmd` options.
+    let boot = take_bootstrap();
+
     let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
         // Headless mode: create a default session (24x80) without waiting
         // for the first client. Used by `lrmux start-server` for testing
         // and remote management.
-        let session_name = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "session".to_string());
-        let session = Session::new(session_name, 24, 80);
+        let session_name = boot.session_name.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "session".to_string())
+        });
+        let session = make_bootstrap_session(session_name, 24, 80, &boot);
         crate::log::info("server started in headless mode (24x80)");
         (24u16, 80u16, vec![session], vec![])
     } else {
@@ -153,7 +162,7 @@ pub fn run(
         loop {
             // Accept from any listener (Unix or TCP).
             let stream = accept_from_any(&listeners)?;
-            match handshake_first_client(stream) {
+            match handshake_first_client(stream, &boot) {
                 Ok(result) => break result,
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                     crate::log::info("KillServer during initial handshake, shutting down");
@@ -289,17 +298,32 @@ pub fn run(
                 }
                 let session = &mut sessions[si];
                 let pane = &mut session.windows[wi].pane;
-                let pane_id = pane.id;
                 match pane.process_pty_output() {
-                    Ok((true, raw)) => {
+                    Ok((true, raw, osc_queries)) => {
+                        let pane_id = pane.id;
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         // Forward raw output to control clients viewing this window.
-                        if !raw.is_empty() {
-                            forward_output_to_control_clients(&mut clients, si, wi, pane_id, &raw);
+                        let cc_bytes = pane.take_cc_forward_bytes(&raw);
+                        if !cc_bytes.is_empty() {
+                            forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
+                        }
+                        // Proxy OSC 10/11 color queries to a real attached TTY.
+                        for q in osc_queries {
+                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
                         }
                     }
-                    Ok((false, _)) => {
-                        // Child exited — reap and defer the removal.
+                    Ok((false, raw, osc_queries)) => {
+                        let pane_id = pane.id;
+                        // Child exited — forward any remaining bytes (including
+                        // a flushed incomplete UTF-8 tail) before reaping.
+                        let mut cc_bytes = pane.take_cc_forward_bytes(&raw);
+                        cc_bytes.extend(pane.flush_cc_forward_bytes());
+                        if !cc_bytes.is_empty() {
+                            forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
+                        }
+                        for q in osc_queries {
+                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                        }
                         let exit_code = pane.reap_child().unwrap_or(0);
                         pty_exits.push((si, wi, exit_code));
                     }
@@ -500,6 +524,27 @@ pub fn run(
                                             clients[ci].fd
                                         ));
                                     }
+                                    ClientMsg::TermOscReply { pane_id, data } => {
+                                        // Real TTY answered OSC 10/11 — cache palette + inject.
+                                        if let Some((si, wi)) = find_pane_by_id(&sessions, pane_id)
+                                        {
+                                            sessions[si].windows[wi]
+                                                .pane
+                                                .note_osc_color_reply(&data);
+                                            let _ =
+                                                sessions[si].windows[wi].pane.write_input(&data);
+                                        }
+                                    }
+                                    ClientMsg::TermPalette { fg, bg } => {
+                                        let pal = super::capture::TerminalPalette { fg, bg };
+                                        clients[client_idx].palette = pal;
+                                        seed_pane_palette(
+                                            &mut sessions,
+                                            clients[client_idx].session_idx,
+                                            clients[client_idx].active_window,
+                                            pal,
+                                        );
+                                    }
                                     ClientMsg::Detach => {
                                         to_remove.push(client_idx);
                                         break;
@@ -541,6 +586,11 @@ pub fn run(
                                                 "new window {new_wi} in session '{sname}'"
                                             ));
                                             clients[client_idx].active_window = new_wi;
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -553,6 +603,11 @@ pub fn run(
                                             let aw = clients[client_idx].active_window;
                                             clients[client_idx].active_window =
                                                 (aw + 1) % sessions[si].windows.len();
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -565,6 +620,11 @@ pub fn run(
                                             let len = sessions[si].windows.len();
                                             clients[client_idx].active_window =
                                                 if aw == 0 { len - 1 } else { aw - 1 };
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -576,6 +636,11 @@ pub fn run(
                                             && (index as usize) < sessions[si].windows.len()
                                         {
                                             clients[client_idx].active_window = index as usize;
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -708,6 +773,7 @@ pub fn run(
                                                 grid_cols,
                                                 default_window_name(),
                                                 cmd,
+                                                cwd_full.as_deref(),
                                             );
                                             // Replace the first window (default shell)
                                             // with the command window.
@@ -879,6 +945,7 @@ pub fn run(
                                                     grid_cols,
                                                     default_window_name(),
                                                     cmd,
+                                                    None,
                                                 ),
                                                 None => Window::new(
                                                     grid_rows,
@@ -890,7 +957,14 @@ pub fn run(
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::CaptureWindow { session, window } => {
+                                    ClientMsg::CaptureWindow {
+                                        session,
+                                        window,
+                                        format,
+                                        colors,
+                                        term_fg,
+                                        term_bg,
+                                    } => {
                                         // Find the target session by name, or use the first.
                                         let si = match session {
                                             Some(ref name) => {
@@ -904,6 +978,7 @@ pub fn run(
                                                 }
                                             }
                                         };
+                                        let fmt = super::capture::CaptureFormat::from_u8(format);
                                         let content = if let Some(si) = si {
                                             let wi = match window {
                                                 Some(w) => Some(w as usize),
@@ -912,8 +987,15 @@ pub fn run(
                                             if let Some(wi) = wi
                                                 && wi < sessions[si].windows.len()
                                             {
-                                                Some(render_grid_text(
+                                                let palette = resolve_capture_palette(
+                                                    &sessions, &clients, si, wi, term_fg, term_bg,
+                                                );
+                                                Some(super::capture::render_pane(
                                                     &sessions[si].windows[wi].pane,
+                                                    fmt,
+                                                    colors,
+                                                    false,
+                                                    palette,
                                                 ))
                                             } else {
                                                 None
@@ -1124,6 +1206,7 @@ pub fn run(
                                             grid_cols,
                                             default_window_name(),
                                             cmd,
+                                            None,
                                         ),
                                         None => {
                                             Window::new(grid_rows, grid_cols, default_window_name())
@@ -1179,6 +1262,7 @@ pub fn run(
                                         grid_cols,
                                         default_window_name(),
                                         cmd,
+                                        cwd_full.as_deref(),
                                     );
                                     sessions[new_si].windows[0] = win;
                                 }
@@ -1414,6 +1498,48 @@ fn default_session_name(sessions: &[Session]) -> String {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "session".to_string());
     ensure_unique_session_name(&base, sessions)
+}
+
+/// Bootstrap options passed from the parent via env before `fork_server`.
+struct Bootstrap {
+    command: Option<String>,
+    session_name: Option<String>,
+    cwd: Option<String>,
+}
+
+/// Read and clear `LRMUX_INIT_*` so a later pane spawn does not see them.
+fn take_bootstrap() -> Bootstrap {
+    let command = std::env::var("LRMUX_INIT_COMMAND")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let session_name = std::env::var("LRMUX_INIT_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let cwd = std::env::var("LRMUX_INIT_CWD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    // Safety: server is single-threaded at startup.
+    unsafe {
+        std::env::remove_var("LRMUX_INIT_COMMAND");
+        std::env::remove_var("LRMUX_INIT_SESSION");
+        std::env::remove_var("LRMUX_INIT_CWD");
+    }
+    Bootstrap {
+        command,
+        session_name,
+        cwd,
+    }
+}
+
+fn make_bootstrap_session(name: String, rows: u16, cols: u16, boot: &Bootstrap) -> Session {
+    // `new-server -- cmd` uses `$SHELL -ci …` (see Pane::new_with_command) so
+    // interactive rc files load — plain `-c` skips `.zshrc` and breaks
+    // truecolor for tools like vim. No command → default interactive shell.
+    match (&boot.command, &boot.cwd) {
+        (Some(cmd), cwd) => Session::new_with_command(name, rows, cols, cmd, cwd.as_deref()),
+        (None, Some(cwd)) => Session::new_in_cwd(name, rows, cols, cwd),
+        (None, None) => Session::new(name, rows, cols),
+    }
 }
 
 /// Render a pane's grid as plain text (for capture-window).
@@ -1659,6 +1785,7 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io
 /// The caller should retry by accepting the next connection.
 fn handshake_first_client(
     stream: crate::ipc::ConnStream,
+    boot: &Bootstrap,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = stream;
     // Bound the handshake read: a client that connects and stays silent
@@ -1704,12 +1831,16 @@ fn handshake_first_client(
     let grid_rows = client_rows.saturating_sub(1);
     let grid_cols = client_cols;
 
-    // Create the first session, named after the current directory.
-    let session_name = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "session".to_string());
-    let mut session = Session::new(session_name, grid_rows, grid_cols);
+    // Create the first session. Prefer LRMUX_INIT_* from `new-server -- cmd`
+    // / fresh `new-session` so we don't leave an empty shell session and
+    // then add a second one for the command.
+    let session_name = boot.session_name.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "session".to_string())
+    });
+    let mut session = make_bootstrap_session(session_name, grid_rows, grid_cols, boot);
     let window = &mut session.windows[0];
 
     // Send IdentifyAck with grid dimensions (not client dimensions).
@@ -1721,9 +1852,20 @@ fn handshake_first_client(
     });
     proto::send(&mut client, &ack)?;
 
-    // Send full grid snapshot.
-    window.pane.grid.mark_all_dirty();
-    send_grid_update(&mut client, &mut window.pane)?;
+    // Full GridSnapshot (same path as NewWindow / window switch) so the
+    // client resets its outer scroll region and renderer — a bare
+    // GridUpdate left the first pane looking "cursed" vs Ctrl-A c.
+    let (cursor_row, cursor_col, cursor_visible) = window.pane.cursor();
+    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+        rows: window.pane.rows,
+        cols: window.pane.cols,
+        cells: window.pane.snapshot(),
+        cursor_row,
+        cursor_col,
+        cursor_visible,
+    });
+    proto::send(&mut client, &snapshot)?;
+    let _ = window.pane.take_dirty_rows(); // snapshot already has full state
 
     // Send status bar.
     let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
@@ -1859,6 +2001,127 @@ fn accept_new_client(
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Find (session_idx, window_idx) for a pane id.
+fn find_pane_by_id(sessions: &[Session], pane_id: u32) -> Option<(usize, usize)> {
+    for (si, s) in sessions.iter().enumerate() {
+        for (wi, w) in s.windows.iter().enumerate() {
+            if w.pane.id == pane_id {
+                return Some((si, wi));
+            }
+        }
+    }
+    None
+}
+
+/// Apply an attached client's OSC 10/11 palette onto a pane.
+fn seed_pane_palette(
+    sessions: &mut [Session],
+    session_idx: usize,
+    window_idx: usize,
+    pal: super::capture::TerminalPalette,
+) {
+    if session_idx >= sessions.len() || window_idx >= sessions[session_idx].windows.len() {
+        return;
+    }
+    let pane = &mut sessions[session_idx].windows[window_idx].pane;
+    if let Some(rgb) = pal.fg {
+        pane.default_fg = Some(rgb);
+    }
+    if let Some(rgb) = pal.bg {
+        pane.default_bg = Some(rgb);
+    }
+}
+
+fn seed_client_focus_palette(sessions: &mut [Session], clients: &[ClientConn], client_idx: usize) {
+    let Some(c) = clients.get(client_idx) else {
+        return;
+    };
+    seed_pane_palette(sessions, c.session_idx, c.active_window, c.palette);
+}
+
+/// Palette for HTML capture: pane cache, then viewers of that window, then
+/// any attached client, then an explicit override from the request.
+fn resolve_capture_palette(
+    sessions: &[Session],
+    clients: &[ClientConn],
+    session_idx: usize,
+    window_idx: usize,
+    term_fg: Option<(u8, u8, u8)>,
+    term_bg: Option<(u8, u8, u8)>,
+) -> super::capture::TerminalPalette {
+    let mut pal = sessions
+        .get(session_idx)
+        .and_then(|s| s.windows.get(window_idx))
+        .map(|w| w.pane.terminal_palette())
+        .unwrap_or_default();
+    for c in clients {
+        if c.attach
+            && !c.is_control
+            && c.session_idx == session_idx
+            && c.active_window == window_idx
+        {
+            pal = pal.merge(c.palette);
+        }
+    }
+    for c in clients {
+        if (c.attach || c.is_control) && (c.palette.fg.is_some() || c.palette.bg.is_some()) {
+            pal = pal.merge(c.palette);
+        }
+    }
+    pal.merge(super::capture::TerminalPalette {
+        fg: term_fg,
+        bg: term_bg,
+    })
+}
+
+/// Ask an attached client to query its real TTY for OSC 10/11.
+/// Prefer a viewer of this window; fall back to any attached client
+/// (including control-mode) so we still answer when `active_window` is
+/// briefly wrong or the only client is `-CC`. Leaving these unanswered
+/// triggers vim E1568 and wrong `background` / colorscheme detection.
+fn proxy_osc_color_query(
+    clients: &mut [ClientConn],
+    session_idx: usize,
+    window_idx: usize,
+    pane_id: u32,
+    query: &crate::vt::OscColorQuery,
+) {
+    let msg = proto::encode_server(&ServerMsg::TermOscQuery {
+        pane_id,
+        code: query.code,
+        bell_terminated: query.bell_terminated,
+    });
+    // Pass 1: interactive client viewing this window.
+    for c in clients.iter_mut() {
+        if c.attach
+            && !c.is_control
+            && c.session_idx == session_idx
+            && c.active_window == window_idx
+            && client_send(c, &msg)
+        {
+            return;
+        }
+    }
+    // Pass 2: any interactive attached client (same outer palette for a
+    // local tty client; better than silence).
+    for c in clients.iter_mut() {
+        if c.attach && !c.is_control && client_send(c, &msg) {
+            return;
+        }
+    }
+    // Pass 3: control-mode clients — may still have a usable /dev/tty or
+    // stdout connected to iTerm.
+    for c in clients.iter_mut() {
+        if c.attach && c.is_control && client_send(c, &msg) {
+            return;
+        }
+    }
+    crate::log::info(&format!(
+        "OSC {} query from pane %{pane_id}: no client to proxy to",
+        query.code
+    ));
 }
 
 /// Send dirty rows + cursor to clients viewing a specific window in a specific session.
@@ -2247,11 +2510,60 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                         "CaptureWindow window index truncated",
                     ));
                 }
-                Some(data[off])
+                let w = data[off];
+                off += 1;
+                Some(w)
             } else {
+                off += 1;
                 None
             };
-            ClientMsg::CaptureWindow { session, window }
+            let (format, colors) = if data.len() >= off + 2 {
+                let f = data[off];
+                let c = data[off + 1] != 0;
+                off += 2;
+                (f, c)
+            } else {
+                (0, false)
+            };
+            let (term_fg, term_bg) = if data.get(off) == Some(&1) {
+                off += 1;
+                let fg = if data.get(off) == Some(&1) {
+                    if data.len() < off + 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "CaptureWindow term_fg truncated",
+                        ));
+                    }
+                    let rgb = (data[off + 1], data[off + 2], data[off + 3]);
+                    off += 4;
+                    Some(rgb)
+                } else {
+                    off += 1;
+                    None
+                };
+                let bg = if data.get(off) == Some(&1) {
+                    if data.len() < off + 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "CaptureWindow term_bg truncated",
+                        ));
+                    }
+                    Some((data[off + 1], data[off + 2], data[off + 3]))
+                } else {
+                    None
+                };
+                (fg, bg)
+            } else {
+                (None, None)
+            };
+            ClientMsg::CaptureWindow {
+                session,
+                window,
+                format,
+                colors,
+                term_fg,
+                term_bg,
+            }
         }
         0x14 => {
             // SendKeys: session (1-byte flag + optional name) + window (1-byte flag + optional u8) + 4-byte length + keys
@@ -2361,6 +2673,57 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::ControlCommand { line }
         }
         0x18 => ClientMsg::Refresh,
+        0x19 => {
+            // TermOscReply: pane_id u32 + len u32 + data
+            if data.len() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscReply needs pane_id + length",
+                ));
+            }
+            let pane_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let dlen = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            if data.len() < 8 + dlen {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscReply data truncated",
+                ));
+            }
+            ClientMsg::TermOscReply {
+                pane_id,
+                data: data[8..8 + dlen].to_vec(),
+            }
+        }
+        0x1a => {
+            // TermPalette: optional fg + optional bg
+            let mut off = 0;
+            let fg = if data.get(off) == Some(&1) {
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TermPalette fg truncated",
+                    ));
+                }
+                let rgb = (data[off + 1], data[off + 2], data[off + 3]);
+                off += 4;
+                Some(rgb)
+            } else {
+                off += 1;
+                None
+            };
+            let bg = if data.get(off) == Some(&1) {
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TermPalette bg truncated",
+                    ));
+                }
+                Some((data[off + 1], data[off + 2], data[off + 3]))
+            } else {
+                None
+            };
+            ClientMsg::TermPalette { fg, bg }
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2410,18 +2773,23 @@ fn accept_from_any(listeners: &[crate::ipc::ConnListener]) -> io::Result<crate::
 
 /// Forward raw PTY output to all control clients viewing the given window.
 /// The output is escaped and sent as %output notifications.
-fn forward_output_to_control_clients(
-    clients: &mut [ClientConn],
-    si: usize,
-    wi: usize,
-    pane_id: u32,
-    raw: &[u8],
-) {
+fn forward_output_to_control_clients(clients: &mut [ClientConn], pane_id: u32, raw: &[u8]) {
     let pane_id_str = format!("%{}", pane_id);
-    let _ = (si, wi);
     // Chunk large bursts into multiple %output lines — a single escaped
     // notification for a multi-MB read could exceed the client outbuf cap.
-    for chunk in raw.chunks(256 * 1024) {
+    // Split on UTF-8 character boundaries so a multi-byte glyph is never
+    // torn across notifications (defense in depth alongside pane buffering).
+    let mut offset = 0;
+    while offset < raw.len() {
+        let mut end = (offset + 256 * 1024).min(raw.len());
+        if end < raw.len() {
+            let tail = super::pane::incomplete_utf8_tail_len(&raw[offset..end]);
+            if tail > 0 && tail < end - offset {
+                end -= tail;
+            }
+        }
+        let chunk = &raw[offset..end];
+        offset = end;
         let line = format!("%output {} {}", pane_id_str, escape_output(chunk));
         for client in clients.iter_mut() {
             // iTerm2 routes %output by pane id to the right tab, so send to
@@ -2661,19 +3029,43 @@ fn migrate_affinity_sessions(
 
 /// Escape binary data for %output notifications (tmux control mode format).
 /// Characters < 0x20 and backslash are replaced with \nnn octal escapes.
-/// Bytes >= 0x20 are kept raw, then decoded as UTF-8 — building the string
-/// char-by-char would double-encode multibyte sequences (byte 0xe2 became
-/// U+00E2 → 0xc3 0xa2, turning ➜ into mojibake).
+/// Complete UTF-8 sequences are kept raw. Incomplete or invalid bytes are
+/// also octal-escaped — never replaced with U+FFFD — so a multi-byte
+/// character split across reads still reassembles correctly in iTerm2.
 fn escape_output(data: &[u8]) -> String {
-    let mut out = Vec::with_capacity(data.len());
-    for &b in data {
+    let mut out = String::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
         if b < 0x20 || b == b'\\' {
-            out.extend_from_slice(format!("\\{:03o}", b).as_bytes());
-        } else {
-            out.push(b);
+            out.push_str(&format!("\\{:03o}", b));
+            i += 1;
+            continue;
         }
+        if b < 0x80 {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        let width = match b {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        if width > 0
+            && i + width <= data.len()
+            && let Ok(s) = std::str::from_utf8(&data[i..i + width])
+        {
+            out.push_str(s);
+            i += width;
+            continue;
+        }
+        // Invalid or incomplete — emit as octal so the raw byte survives.
+        out.push_str(&format!("\\{:03o}", b));
+        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Current unix time in seconds (for %begin/%end blocks).
@@ -3359,7 +3751,23 @@ fn handle_single_control_command(
                 respond(client, &[]);
                 return false;
             }
-            let with_escapes = args.iter().any(|a| {
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let include_scrollback = args.iter().enumerate().any(|(i, a)| {
+                let v = if a == "-S" {
+                    args.get(i + 1).map(|s| s.as_str())
+                } else {
+                    a.strip_prefix("-S")
+                };
+                v.map(|v| v == "-" || v.parse::<i64>().map(|n| n < 0).unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            // tmux `-e` = include SGR; `-c` / `--colors` = include styles in
+            // the chosen --format. Without colors, formats emit text only.
+            let tmux_e = args.iter().any(|a| {
                 a.len() >= 2
                     && a.starts_with('-')
                     && !a.starts_with("--")
@@ -3370,24 +3778,27 @@ fn handle_single_control_command(
                         .unwrap_or(false)
                     && a[1..].contains('e')
             });
-            let include_scrollback = args.iter().enumerate().any(|(i, a)| {
-                let v = if a == "-S" {
-                    args.get(i + 1).map(|s| s.as_str())
+            let colors = tmux_e || parsed.has("colors") || parsed.flags.contains_key("c");
+            let format = parsed
+                .get("format")
+                .and_then(|s| super::capture::CaptureFormat::parse(s).ok())
+                .unwrap_or(if tmux_e {
+                    super::capture::CaptureFormat::Ansi
                 } else {
-                    a.strip_prefix("-S")
-                };
-                v.map(|v| v == "-" || v.parse::<i64>().map(|n| n < 0).unwrap_or(false))
-                    .unwrap_or(false)
-            });
-            let parsed = crate::cmd::parse_flags(&args);
-            let t = parsed
-                .get("t")
-                .or_else(|| parsed.get("target"))
-                .map(|s| s.to_string());
+                    super::capture::CaptureFormat::Ascii
+                });
             let window = resolve_target(sessions, client, t.as_deref())
                 .and_then(|(si, wi)| sessions.get(si).and_then(|s| s.windows.get(wi)));
             let text = window
-                .map(|w| render_pane_text(&w.pane, with_escapes, include_scrollback))
+                .map(|w| {
+                    super::capture::render_pane(
+                        &w.pane,
+                        format,
+                        colors,
+                        include_scrollback,
+                        super::capture::TerminalPalette::default(),
+                    )
+                })
                 .unwrap_or_default();
             let lines: Vec<&str> = if text.is_empty() {
                 Vec::new()
@@ -3852,6 +4263,60 @@ fn resolve_target(
     let si = find_session(sessions, &parsed.session).or(Some(client.session_idx))?;
     let wi = find_window(&sessions[si], &parsed.window)?;
     Some((si, wi))
+}
+
+#[cfg(test)]
+mod escape_output_tests {
+    use super::escape_output;
+
+    #[test]
+    fn preserves_box_drawing() {
+        let dash = "─".as_bytes(); // E2 94 80
+        assert_eq!(escape_output(dash), "─");
+        let line = "────────────────────".as_bytes();
+        assert_eq!(escape_output(line), "────────────────────");
+    }
+
+    #[test]
+    fn never_emits_replacement_char() {
+        // Incomplete leading byte of ─ — must be octal, not U+FFFD.
+        let out = escape_output(&[0xE2]);
+        assert!(!out.contains('\u{FFFD}'), "got {out:?}");
+        assert_eq!(out, "\\342");
+
+        let out = escape_output(&[0xE2, 0x94]);
+        assert!(!out.contains('\u{FFFD}'), "got {out:?}");
+        assert_eq!(out, "\\342\\224");
+    }
+
+    #[test]
+    fn split_box_drawing_reassembles_via_octal() {
+        // Simulate two %output payloads after a bad split; concatenating the
+        // decoded escapes yields the original UTF-8 for ─.
+        let a = escape_output(&[0xE2]);
+        let b = escape_output(&[0x94, 0x80]);
+        let mut bytes = Vec::new();
+        for part in [a.as_str(), b.as_str()] {
+            let mut chars = part.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    let o1 = chars.next().unwrap().to_digit(8).unwrap();
+                    let o2 = chars.next().unwrap().to_digit(8).unwrap();
+                    let o3 = chars.next().unwrap().to_digit(8).unwrap();
+                    bytes.push(((o1 << 6) | (o2 << 3) | o3) as u8);
+                } else {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "─");
+    }
+
+    #[test]
+    fn escapes_controls_and_backslash() {
+        assert_eq!(escape_output(b"a\nb\\c"), "a\\012b\\134c");
+    }
 }
 
 /// Resolve a session target: "$N" = session id, "name" = session name,

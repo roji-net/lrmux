@@ -120,7 +120,10 @@ pub fn parse_flags(args: &[String]) -> ParsedCmd {
             } else {
                 // Could be a boolean flag or a flag with value in next arg.
                 // Known boolean flags: d (detach), p (print), q (quiet), P (detached)
-                if matches!(rest, "detach" | "print" | "quiet" | "detached") {
+                if matches!(
+                    rest,
+                    "detach" | "print" | "quiet" | "detached" | "colors" | "clipboard"
+                ) {
                     cmd.flags.insert(rest.to_string(), String::new());
                 } else if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     cmd.flags.insert(rest.to_string(), args[i + 1].clone());
