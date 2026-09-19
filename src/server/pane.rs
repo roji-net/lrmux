@@ -32,6 +32,10 @@ pub struct Pane {
     /// control-mode `%output` never splits a multi-byte character across
     /// notifications (which would turn `─` into `�`).
     pub cc_utf8_pending: Vec<u8>,
+    /// Last known outer-terminal default foreground (OSC 10), if observed.
+    pub default_fg: Option<(u8, u8, u8)>,
+    /// Last known outer-terminal default background (OSC 11), if observed.
+    pub default_bg: Option<(u8, u8, u8)>,
 }
 
 impl Pane {
@@ -84,6 +88,27 @@ impl Pane {
             exit_code: None,
             pending_input: Vec::new(),
             cc_utf8_pending: Vec::new(),
+            default_fg: None,
+            default_bg: None,
+        }
+    }
+
+    /// Palette learned from proxied OSC 10/11 replies (for HTML capture).
+    pub fn terminal_palette(&self) -> super::capture::TerminalPalette {
+        super::capture::TerminalPalette {
+            fg: self.default_fg,
+            bg: self.default_bg,
+        }
+    }
+
+    /// Record an OSC 10/11 color reply from the outer TTY.
+    pub fn note_osc_color_reply(&mut self, data: &[u8]) {
+        if let Some((code, rgb)) = crate::term::parse_osc_color_reply(data) {
+            match code {
+                10 => self.default_fg = Some(rgb),
+                11 => self.default_bg = Some(rgb),
+                _ => {}
+            }
         }
     }
 

@@ -118,8 +118,15 @@ enum CliAction {
     },
     /// `kill-window -t <target>`
     KillWindow(cmd::Target),
-    /// `capture-pane -t <target> -p`: capture the content of a pane.
-    CapturePane { target: cmd::Target, print: bool },
+    /// `capture-pane -t <target> [-p] [-c|--colors] [--format …] [--clipboard] [--file path]`
+    CapturePane {
+        target: cmd::Target,
+        print: bool,
+        colors: bool,
+        format: crate::server::CaptureFormat,
+        clipboard: bool,
+        file: Option<String>,
+    },
     /// `send-keys -t <target> <keys> -q`: send keys to a pane's PTY.
     SendKeys {
         target: cmd::Target,
@@ -159,7 +166,7 @@ fn print_help() {
          lrmux select-window -t <target>\n    \
          lrmux rename-window -t <target> <name>\n    \
          lrmux send-keys -t <target> <keys> [-q]\n    \
-         lrmux capture-pane -t <target> [-p]\n    \
+         lrmux capture-pane -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|markdown] [--clipboard] [--file <path>]\n    \
          lrmux list-sessions [-s <server>]\n    \
          lrmux list-windows -t <session>\n    \
          lrmux list-servers\n    \
@@ -412,9 +419,46 @@ fn parse_args() -> CliAction {
         }
         Some("capture-pane") | Some("capturep") | Some("capture-window") => {
             let parsed = cmd::parse_flags(subcmd_args);
+            // `-c` / `--colors`: include cell styles. Independent of --format.
+            // (Do not treat `-c` as boolean globally — new-session uses `-c` for cwd.)
+            let colors = parsed.has("colors") || parsed.flags.contains_key("c");
+            let format = match parsed.get("format") {
+                Some(s) => match crate::server::CaptureFormat::parse(s) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("lrmux: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                // tmux `-e` ⇒ ansi container with colors
+                None if subcmd_args.iter().any(|a| {
+                    a.len() >= 2
+                        && a.starts_with('-')
+                        && !a.starts_with("--")
+                        && a[1..].contains('e')
+                }) =>
+                {
+                    crate::server::CaptureFormat::Ansi
+                }
+                None => crate::server::CaptureFormat::Ascii,
+            };
+            let colors = colors
+                || subcmd_args.iter().any(|a| {
+                    a.len() >= 2
+                        && a.starts_with('-')
+                        && !a.starts_with("--")
+                        && a[1..].contains('e')
+                });
             CliAction::CapturePane {
                 target: parsed.target(),
                 print: parsed.has("p") || parsed.has("print"),
+                colors,
+                format,
+                clipboard: parsed.has("clipboard"),
+                file: parsed
+                    .get("file")
+                    .or_else(|| parsed.get("o"))
+                    .map(|s| s.to_string()),
             }
         }
         Some("send-keys") | Some("send") => parse_send_keys(subcmd_args),
@@ -1144,7 +1188,14 @@ fn run() -> io::Result<()> {
             eprintln!("lrmux: rename-window not yet implemented");
             Ok(())
         }
-        CliAction::CapturePane { target, print: _ } => cli_capture_window(&target),
+        CliAction::CapturePane {
+            target,
+            print,
+            colors,
+            format,
+            clipboard,
+            file,
+        } => cli_capture_window(&target, format, colors, print, clipboard, file.as_deref()),
         CliAction::SendKeys {
             target,
             keys,
@@ -1580,7 +1631,19 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
 }
 
 /// CLI: capture the content of a pane.
-fn cli_capture_window(target: &cmd::Target) -> io::Result<()> {
+///
+/// Output destinations:
+/// - stdout when there is no `--file`/`--clipboard`, or when `-p`/`--print` is set
+/// - `--file <path>` writes the capture to that file
+/// - `--clipboard` copies via pbcopy / wl-copy / xclip / xsel
+fn cli_capture_window(
+    target: &cmd::Target,
+    format: crate::server::CaptureFormat,
+    colors: bool,
+    print: bool,
+    clipboard: bool,
+    file: Option<&str>,
+) -> io::Result<()> {
     let mut stream = connect_to_server("default")?;
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
@@ -1603,13 +1666,33 @@ fn cli_capture_window(target: &cmd::Target) -> io::Result<()> {
     let msg = proto::encode_client(&ClientMsg::CaptureWindow {
         session: target.session.clone(),
         window,
+        format: format.as_u8(),
+        colors,
+        // Palette comes from the pane (OSC 10/11 answered for that PTY),
+        // not from this CLI's TTY — they can differ.
+        term_fg: None,
+        term_bg: None,
     });
     proto::send(&mut stream, &msg)?;
     // Wait for WindowCapture response.
     loop {
         match proto::decode_server(&mut stream) {
             Ok(ServerMsg::WindowCapture { content }) => {
-                print!("{content}");
+                let to_stdout = print || (file.is_none() && !clipboard);
+                if to_stdout {
+                    print!("{content}");
+                    if !content.ends_with('\n') {
+                        println!();
+                    }
+                }
+                if let Some(path) = file {
+                    std::fs::write(path, &content)?;
+                }
+                if clipboard && !client::copy_mode::copy_to_clipboard(&content) {
+                    return Err(io::Error::other(
+                        "clipboard: no pbcopy/wl-copy/xclip/xsel found",
+                    ));
+                }
                 return Ok(());
             }
             Ok(_) => {

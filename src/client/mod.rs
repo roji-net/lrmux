@@ -129,6 +129,11 @@ pub fn run(
         }
     };
 
+    // Probe outer TTY defaults (OSC 10/11) so the server can paint HTML
+    // captures without waiting for vim to ask. Raw mode is already on —
+    // replies won't echo onto the screen.
+    report_outer_term_palette(&mut stream)?;
+
     // Create the local grid + renderer.
     let mut grid = Grid::new(grid_rows, grid_cols, 10_000);
     let mut renderer = render::Renderer::new(grid_rows, grid_cols);
@@ -1718,31 +1723,30 @@ fn show_help_overlay(server_version: &str) {
     stdout.flush().ok();
 }
 
-/// Query the outer terminal's OSC 10 (fg) or 11 (bg) color via `/dev/tty`.
-/// Returns the full reply sequence (`ESC ] … BEL` or `ESC ] … ST`) on success.
-fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
+/// Query OSC 10/11 on the outer TTY and send `TermPalette` to the server.
+pub(crate) fn report_outer_term_palette(stream: &mut impl Write) -> io::Result<()> {
+    let fg = query_outer_osc_color(10, true)
+        .and_then(|d| crate::term::parse_osc_color_reply(&d))
+        .map(|(_, rgb)| rgb);
+    let bg = query_outer_osc_color(11, true)
+        .and_then(|d| crate::term::parse_osc_color_reply(&d))
+        .map(|(_, rgb)| rgb);
+    if fg.is_none() && bg.is_none() {
+        return Ok(());
+    }
+    let msg = proto::encode_client(&ClientMsg::TermPalette { fg, bg });
+    proto::send(stream, &msg)
+}
+
+/// Query the outer terminal's OSC 10 (fg) or 11 (bg) color.
+///
+/// Tries stdout/stdin first (the fds the interactive client already has on
+/// the user's terminal), then `/dev/tty` as a fallback. A failed query
+/// surfaces as vim E1568 and wrong `background` / colorscheme colors.
+pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
     }
-    let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
-    if fd < 0 {
-        return None;
-    }
-    // Always restore blocking and close on exit.
-    struct TtyFd(i32);
-    impl Drop for TtyFd {
-        fn drop(&mut self) {
-            unsafe {
-                libc::fcntl(
-                    self.0,
-                    libc::F_SETFL,
-                    libc::fcntl(self.0, libc::F_GETFL) & !libc::O_NONBLOCK,
-                );
-                libc::close(self.0);
-            }
-        }
-    }
-    let tty = TtyFd(fd);
 
     let mut query = Vec::with_capacity(16);
     query.extend_from_slice(b"\x1b]");
@@ -1753,21 +1757,136 @@ fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
     } else {
         query.extend_from_slice(b"\x1b\\");
     }
-    let w = unsafe { libc::write(tty.0, query.as_ptr() as *const _, query.len()) };
-    if w < 0 {
+
+    // Prefer the fds we already own; fall back to /dev/tty (needed for -CC
+    // where stdout is the control-mode channel, not a raw terminal).
+    if let Some(reply) = query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query) {
+        return Some(reply);
+    }
+    query_osc_via_dev_tty(&query)
+}
+
+/// Control-mode variant: never write OSC to stdout (that's the tmux control
+/// channel). Only query via `/dev/tty`.
+pub(crate) fn query_outer_osc_color_for_control(
+    code: u8,
+    bell_terminated: bool,
+) -> Option<Vec<u8>> {
+    if code != 10 && code != 11 {
         return None;
+    }
+    let mut query = Vec::with_capacity(16);
+    query.extend_from_slice(b"\x1b]");
+    query.extend_from_slice(code.to_string().as_bytes());
+    query.extend_from_slice(b";?");
+    if bell_terminated {
+        query.push(0x07);
+    } else {
+        query.extend_from_slice(b"\x1b\\");
+    }
+    query_osc_via_dev_tty(&query)
+}
+
+fn query_osc_via_dev_tty(query: &[u8]) -> Option<Vec<u8>> {
+    let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return None;
+    }
+    struct TtyFd(i32);
+    impl Drop for TtyFd {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+    let tty = TtyFd(fd);
+    query_osc_on_fds(tty.0, tty.0, query)
+}
+
+fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>> {
+    // Disable ECHO while waiting for the reply. Interactive clients are
+    // already raw, but control-mode / edge paths can still be cooked — and
+    // an echoed OSC reply paints garbage on the user's screen.
+    let mut saved_termios = None;
+    if unsafe { libc::isatty(read_fd) } != 0 {
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(read_fd) };
+        if let Ok(orig) = nix::sys::termios::tcgetattr(borrowed) {
+            let mut quiet = orig.clone();
+            quiet.local_flags.remove(
+                nix::sys::termios::LocalFlags::ECHO
+                    | nix::sys::termios::LocalFlags::ECHOE
+                    | nix::sys::termios::LocalFlags::ECHOK
+                    | nix::sys::termios::LocalFlags::ECHONL,
+            );
+            if nix::sys::termios::tcsetattr(borrowed, nix::sys::termios::SetArg::TCSANOW, &quiet)
+                .is_ok()
+            {
+                saved_termios = Some(orig);
+            }
+        }
+    }
+    struct RestoreEcho(Option<(i32, nix::sys::termios::Termios)>);
+    impl Drop for RestoreEcho {
+        fn drop(&mut self) {
+            if let Some((fd, ref orig)) = self.0 {
+                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                let _ = nix::sys::termios::tcsetattr(
+                    borrowed,
+                    nix::sys::termios::SetArg::TCSANOW,
+                    orig,
+                );
+            }
+        }
+    }
+    let _echo_guard = RestoreEcho(saved_termios.map(|t| (read_fd, t)));
+
+    // Drain pending input so leftover key bytes aren't mistaken for the reply.
+    let fl = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+    if fl >= 0 {
+        unsafe {
+            libc::fcntl(read_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+    {
+        let mut tmp = [0u8; 256];
+        loop {
+            let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+            if n > 0 {
+                continue;
+            }
+            break;
+        }
+    }
+
+    let w = unsafe { libc::write(write_fd, query.as_ptr() as *const _, query.len()) };
+    if w < 0 {
+        if fl >= 0 {
+            unsafe {
+                libc::fcntl(read_fd, libc::F_SETFL, fl);
+            }
+        }
+        return None;
+    }
+    if write_fd == libc::STDOUT_FILENO {
+        let _ = io::stdout().flush();
     }
 
     let mut buf = Vec::with_capacity(128);
     let mut tmp = [0u8; 256];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
-    loop {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    if fl >= 0 {
+        unsafe {
+            libc::fcntl(read_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+    let result = loop {
         if std::time::Instant::now() >= deadline {
-            return None;
+            break None;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let mut pfd = libc::pollfd {
-            fd: tty.0,
+            fd: read_fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1776,22 +1895,27 @@ fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
         if pret <= 0 {
             continue;
         }
-        let n = unsafe { libc::read(tty.0, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+        let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
         if n <= 0 {
             continue;
         }
         buf.extend_from_slice(&tmp[..n as usize]);
         if let Some(end) = osc_reply_end(&buf) {
-            // Prefer a reply that starts at ESC ]; if leading junk, trim it.
             if let Some(start) = buf.windows(2).position(|w| w == b"\x1b]") {
-                return Some(buf[start..end].to_vec());
+                break Some(buf[start..end].to_vec());
             }
-            return Some(buf[..end].to_vec());
+            break Some(buf[..end].to_vec());
         }
         if buf.len() > 4096 {
-            return None;
+            break None;
+        }
+    };
+    if fl >= 0 {
+        unsafe {
+            libc::fcntl(read_fd, libc::F_SETFL, fl);
         }
     }
+    result
 }
 
 /// End index (exclusive) of a complete OSC reply in `buf`, or None if incomplete.

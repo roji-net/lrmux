@@ -85,6 +85,20 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
     let msg = proto::encode_client(&ClientMsg::IdentifyControl { rows, cols });
     proto::send(&mut stream, &msg)?;
 
+    // Probe outer TTY defaults via /dev/tty (stdout is the control channel).
+    {
+        let fg = crate::client::query_outer_osc_color_for_control(10, true)
+            .and_then(|d| crate::term::parse_osc_color_reply(&d))
+            .map(|(_, rgb)| rgb);
+        let bg = crate::client::query_outer_osc_color_for_control(11, true)
+            .and_then(|d| crate::term::parse_osc_color_reply(&d))
+            .map(|(_, rgb)| rgb);
+        if fg.is_some() || bg.is_some() {
+            let msg = proto::encode_client(&ClientMsg::TermPalette { fg, bg });
+            proto::send(&mut stream, &msg)?;
+        }
+    }
+
     let stream_fd = stream.as_raw_fd();
     set_nonblocking(stream_fd);
 
@@ -260,6 +274,25 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                         }
                         ServerMsg::IdentifyAck { .. } => {
                             // Acknowledged — nothing to do for control mode.
+                        }
+                        ServerMsg::TermOscQuery {
+                            pane_id,
+                            code,
+                            bell_terminated,
+                        } => {
+                            // iTerm2 -CC: stdout is the control channel, so
+                            // query via /dev/tty (handled inside query helper).
+                            if let Some(reply) = crate::client::query_outer_osc_color_for_control(
+                                code,
+                                bell_terminated,
+                            ) {
+                                let msg = proto::encode_client(&ClientMsg::TermOscReply {
+                                    pane_id,
+                                    data: reply,
+                                });
+                                server_outbuf.extend(&msg);
+                                flush_fd(stream_fd, &mut server_outbuf);
+                            }
                         }
                         ServerMsg::Error { msg } => {
                             // Don't print to stderr — iTerm2 would see it on

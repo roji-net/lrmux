@@ -341,6 +341,28 @@ mod tests {
     }
 
     #[test]
+    fn osc_query_forms_detected() {
+        let cases: &[(&[u8], u8)] = &[
+            (b"\x1b]11;?\x07", 11),
+            (b"\x1b]10;?\x07", 10),
+            (b"\x1b]11;?\x1b\\", 11),
+            (b"\x1b]10;?\x1b\\", 10),
+            // some terminals send with empty middle
+            (b"\x1b]11;?\x07\x1b]10;?\x07", 11),
+        ];
+        for (bytes, code) in cases {
+            let mut grid = Grid::new(4, 40, 10);
+            let mut parser = vte::Parser::new();
+            let result = parse_bytes(&mut parser, &mut grid, bytes);
+            assert!(
+                result.osc_queries.iter().any(|q| q.code == *code),
+                "failed to detect OSC {code} in {bytes:?}, got {:?}",
+                result.osc_queries
+            );
+        }
+    }
+
+    #[test]
     fn osc_color_query_proxied_cpr_local() {
         let mut grid = Grid::new(24, 80, 100);
         grid.move_cursor(3, 7);
