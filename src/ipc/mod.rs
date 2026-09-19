@@ -1,12 +1,39 @@
-// IPC: Unix socket and TCP transport.
+// IPC: Unix socket, TCP, TLS transport + UDP discovery.
 
+pub mod discovery;
 pub mod stream;
+pub mod tls;
+pub mod ws;
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub use stream::{ConnListener, ConnStream};
+
+use crate::config::{NetworkConfig, TlsMode};
+
+/// Optional TCP address override from `--tcp host:port`.
+static TCP_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set/clear the global `--tcp` address used by clients and CLI helpers.
+pub fn set_tcp_addr(addr: Option<String>) {
+    *TCP_OVERRIDE.lock().unwrap() = addr;
+}
+
+/// Current `--tcp` override, if any.
+pub fn tcp_addr() -> Option<String> {
+    TCP_OVERRIDE.lock().unwrap().clone()
+}
+
+/// Connect using `--tcp` when set, otherwise the Unix socket at `path`.
+pub fn connect_any(path: &Path) -> io::Result<ConnStream> {
+    if let Some(addr) = tcp_addr() {
+        return connect_tcp(&addr);
+    }
+    connect(path).map(ConnStream::Unix)
+}
 
 /// Compute the socket path for a given server name.
 /// Format: /tmp/lrmux-<UID>/<server-name>
@@ -56,16 +83,60 @@ pub fn connect(path: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(path)
 }
 
-/// Connect to a server via TCP. Returns a ConnStream.
+/// Connect to a server via TCP (optionally wrapping TLS per network policy).
 pub fn connect_tcp(addr: &str) -> io::Result<ConnStream> {
+    connect_tcp_with(addr, &crate::config::global().network)
+}
+
+/// Connect via TCP using an explicit network config (TLS policy / overrides).
+pub fn connect_tcp_with(addr: &str, net: &NetworkConfig) -> io::Result<ConnStream> {
     let stream = std::net::TcpStream::connect(addr)?;
-    Ok(ConnStream::Tcp(stream))
+    let peer = stream.peer_addr().unwrap_or_else(|_| {
+        // Fallback if peer_addr fails — treat as remote (require TLS on auto).
+        "8.8.8.8:1".parse().unwrap()
+    });
+    let want_tls = tls::tls_required(net, peer) || matches!(net.tls, TlsMode::On);
+    if want_tls {
+        if matches!(net.tls, TlsMode::Off) {
+            return Err(io::Error::other(
+                "TLS required for this peer but network.tls = off",
+            ));
+        }
+        let host = tls::host_from_addr(addr);
+        let tls_stream = tls::wrap_client(stream, &host)?;
+        Ok(ConnStream::TlsClient(Box::new(tls_stream)))
+    } else {
+        Ok(ConnStream::Tcp(stream))
+    }
 }
 
 /// Bind a TCP listener at the given address.
 pub fn listen_tcp(addr: &str) -> io::Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(addr)?;
     Ok(listener)
+}
+
+/// Wrap an accepted plain TCP stream in TLS if required by policy/config.
+pub fn maybe_wrap_accepted_tcp(
+    stream: ConnStream,
+    net: &NetworkConfig,
+    server_tls: Option<&std::sync::Arc<rustls::ServerConfig>>,
+) -> io::Result<ConnStream> {
+    let ConnStream::Tcp(tcp) = stream else {
+        return Ok(stream);
+    };
+    let peer = tcp.peer_addr()?;
+    let want_tls = tls::tls_required(net, peer) || matches!(net.tls, TlsMode::On);
+    if !want_tls {
+        return Ok(ConnStream::Tcp(tcp));
+    }
+    let Some(cfg) = server_tls else {
+        return Err(io::Error::other(
+            "TLS required for this peer but server has no TLS cert configured",
+        ));
+    };
+    let tls_stream = tls::wrap_server(tcp, cfg.clone())?;
+    Ok(ConnStream::TlsServer(Box::new(tls_stream)))
 }
 
 /// Check if a server is listening at the given path.
