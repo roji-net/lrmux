@@ -1,10 +1,13 @@
 // Server process: event loop, state, session/window/pane management.
 
+mod capture;
 mod event_loop;
 mod pane;
 mod session;
 mod state;
 mod window;
+
+pub use capture::CaptureFormat;
 
 use std::io;
 use std::path::Path;

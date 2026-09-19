@@ -50,6 +50,8 @@ struct ClientConn {
     /// Control clients stay suppressed until they send a command *after*
     /// draining — auto-resume re-floods iTerm2.
     suppressed: bool,
+    /// Outer TTY default colors (OSC 10/11), probed by the client on attach.
+    palette: super::capture::TerminalPalette,
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
@@ -76,6 +78,7 @@ impl ClientConn {
             control_seq: 0,
             close_when_idle: false,
             suppressed: false,
+            palette: super::capture::TerminalPalette::default(),
         }
     }
 }
@@ -522,12 +525,25 @@ pub fn run(
                                         ));
                                     }
                                     ClientMsg::TermOscReply { pane_id, data } => {
-                                        // Real TTY answered OSC 10/11 — inject into the pane.
+                                        // Real TTY answered OSC 10/11 — cache palette + inject.
                                         if let Some((si, wi)) = find_pane_by_id(&sessions, pane_id)
                                         {
+                                            sessions[si].windows[wi]
+                                                .pane
+                                                .note_osc_color_reply(&data);
                                             let _ =
                                                 sessions[si].windows[wi].pane.write_input(&data);
                                         }
+                                    }
+                                    ClientMsg::TermPalette { fg, bg } => {
+                                        let pal = super::capture::TerminalPalette { fg, bg };
+                                        clients[client_idx].palette = pal;
+                                        seed_pane_palette(
+                                            &mut sessions,
+                                            clients[client_idx].session_idx,
+                                            clients[client_idx].active_window,
+                                            pal,
+                                        );
                                     }
                                     ClientMsg::Detach => {
                                         to_remove.push(client_idx);
@@ -570,6 +586,11 @@ pub fn run(
                                                 "new window {new_wi} in session '{sname}'"
                                             ));
                                             clients[client_idx].active_window = new_wi;
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -582,6 +603,11 @@ pub fn run(
                                             let aw = clients[client_idx].active_window;
                                             clients[client_idx].active_window =
                                                 (aw + 1) % sessions[si].windows.len();
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -594,6 +620,11 @@ pub fn run(
                                             let len = sessions[si].windows.len();
                                             clients[client_idx].active_window =
                                                 if aw == 0 { len - 1 } else { aw - 1 };
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -605,6 +636,11 @@ pub fn run(
                                             && (index as usize) < sessions[si].windows.len()
                                         {
                                             clients[client_idx].active_window = index as usize;
+                                            seed_client_focus_palette(
+                                                &mut sessions,
+                                                &clients,
+                                                client_idx,
+                                            );
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -921,7 +957,14 @@ pub fn run(
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::CaptureWindow { session, window } => {
+                                    ClientMsg::CaptureWindow {
+                                        session,
+                                        window,
+                                        format,
+                                        colors,
+                                        term_fg,
+                                        term_bg,
+                                    } => {
                                         // Find the target session by name, or use the first.
                                         let si = match session {
                                             Some(ref name) => {
@@ -935,6 +978,7 @@ pub fn run(
                                                 }
                                             }
                                         };
+                                        let fmt = super::capture::CaptureFormat::from_u8(format);
                                         let content = if let Some(si) = si {
                                             let wi = match window {
                                                 Some(w) => Some(w as usize),
@@ -943,8 +987,15 @@ pub fn run(
                                             if let Some(wi) = wi
                                                 && wi < sessions[si].windows.len()
                                             {
-                                                Some(render_grid_text(
+                                                let palette = resolve_capture_palette(
+                                                    &sessions, &clients, si, wi, term_fg, term_bg,
+                                                );
+                                                Some(super::capture::render_pane(
                                                     &sessions[si].windows[wi].pane,
+                                                    fmt,
+                                                    colors,
+                                                    false,
+                                                    palette,
                                                 ))
                                             } else {
                                                 None
@@ -1964,8 +2015,72 @@ fn find_pane_by_id(sessions: &[Session], pane_id: u32) -> Option<(usize, usize)>
     None
 }
 
-/// Ask one attached (non-control) client viewing this window to query its
-/// real TTY for OSC 10/11. First matching viewer wins — one answer is enough.
+/// Apply an attached client's OSC 10/11 palette onto a pane.
+fn seed_pane_palette(
+    sessions: &mut [Session],
+    session_idx: usize,
+    window_idx: usize,
+    pal: super::capture::TerminalPalette,
+) {
+    if session_idx >= sessions.len() || window_idx >= sessions[session_idx].windows.len() {
+        return;
+    }
+    let pane = &mut sessions[session_idx].windows[window_idx].pane;
+    if let Some(rgb) = pal.fg {
+        pane.default_fg = Some(rgb);
+    }
+    if let Some(rgb) = pal.bg {
+        pane.default_bg = Some(rgb);
+    }
+}
+
+fn seed_client_focus_palette(sessions: &mut [Session], clients: &[ClientConn], client_idx: usize) {
+    let Some(c) = clients.get(client_idx) else {
+        return;
+    };
+    seed_pane_palette(sessions, c.session_idx, c.active_window, c.palette);
+}
+
+/// Palette for HTML capture: pane cache, then viewers of that window, then
+/// any attached client, then an explicit override from the request.
+fn resolve_capture_palette(
+    sessions: &[Session],
+    clients: &[ClientConn],
+    session_idx: usize,
+    window_idx: usize,
+    term_fg: Option<(u8, u8, u8)>,
+    term_bg: Option<(u8, u8, u8)>,
+) -> super::capture::TerminalPalette {
+    let mut pal = sessions
+        .get(session_idx)
+        .and_then(|s| s.windows.get(window_idx))
+        .map(|w| w.pane.terminal_palette())
+        .unwrap_or_default();
+    for c in clients {
+        if c.attach
+            && !c.is_control
+            && c.session_idx == session_idx
+            && c.active_window == window_idx
+        {
+            pal = pal.merge(c.palette);
+        }
+    }
+    for c in clients {
+        if (c.attach || c.is_control) && (c.palette.fg.is_some() || c.palette.bg.is_some()) {
+            pal = pal.merge(c.palette);
+        }
+    }
+    pal.merge(super::capture::TerminalPalette {
+        fg: term_fg,
+        bg: term_bg,
+    })
+}
+
+/// Ask an attached client to query its real TTY for OSC 10/11.
+/// Prefer a viewer of this window; fall back to any attached client
+/// (including control-mode) so we still answer when `active_window` is
+/// briefly wrong or the only client is `-CC`. Leaving these unanswered
+/// triggers vim E1568 and wrong `background` / colorscheme detection.
 fn proxy_osc_color_query(
     clients: &mut [ClientConn],
     session_idx: usize,
@@ -1978,18 +2093,35 @@ fn proxy_osc_color_query(
         code: query.code,
         bell_terminated: query.bell_terminated,
     });
+    // Pass 1: interactive client viewing this window.
     for c in clients.iter_mut() {
         if c.attach
             && !c.is_control
             && c.session_idx == session_idx
             && c.active_window == window_idx
+            && client_send(c, &msg)
         {
-            let _ = client_send(c, &msg);
             return;
         }
     }
-    // No viewer — leave unanswered (app may time out / E1568). Preferable
-    // to inventing a fake palette.
+    // Pass 2: any interactive attached client (same outer palette for a
+    // local tty client; better than silence).
+    for c in clients.iter_mut() {
+        if c.attach && !c.is_control && client_send(c, &msg) {
+            return;
+        }
+    }
+    // Pass 3: control-mode clients — may still have a usable /dev/tty or
+    // stdout connected to iTerm.
+    for c in clients.iter_mut() {
+        if c.attach && c.is_control && client_send(c, &msg) {
+            return;
+        }
+    }
+    crate::log::info(&format!(
+        "OSC {} query from pane %{pane_id}: no client to proxy to",
+        query.code
+    ));
 }
 
 /// Send dirty rows + cursor to clients viewing a specific window in a specific session.
@@ -2378,11 +2510,60 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                         "CaptureWindow window index truncated",
                     ));
                 }
-                Some(data[off])
+                let w = data[off];
+                off += 1;
+                Some(w)
             } else {
+                off += 1;
                 None
             };
-            ClientMsg::CaptureWindow { session, window }
+            let (format, colors) = if data.len() >= off + 2 {
+                let f = data[off];
+                let c = data[off + 1] != 0;
+                off += 2;
+                (f, c)
+            } else {
+                (0, false)
+            };
+            let (term_fg, term_bg) = if data.get(off) == Some(&1) {
+                off += 1;
+                let fg = if data.get(off) == Some(&1) {
+                    if data.len() < off + 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "CaptureWindow term_fg truncated",
+                        ));
+                    }
+                    let rgb = (data[off + 1], data[off + 2], data[off + 3]);
+                    off += 4;
+                    Some(rgb)
+                } else {
+                    off += 1;
+                    None
+                };
+                let bg = if data.get(off) == Some(&1) {
+                    if data.len() < off + 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "CaptureWindow term_bg truncated",
+                        ));
+                    }
+                    Some((data[off + 1], data[off + 2], data[off + 3]))
+                } else {
+                    None
+                };
+                (fg, bg)
+            } else {
+                (None, None)
+            };
+            ClientMsg::CaptureWindow {
+                session,
+                window,
+                format,
+                colors,
+                term_fg,
+                term_bg,
+            }
         }
         0x14 => {
             // SendKeys: session (1-byte flag + optional name) + window (1-byte flag + optional u8) + 4-byte length + keys
@@ -2512,6 +2693,36 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 pane_id,
                 data: data[8..8 + dlen].to_vec(),
             }
+        }
+        0x1a => {
+            // TermPalette: optional fg + optional bg
+            let mut off = 0;
+            let fg = if data.get(off) == Some(&1) {
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TermPalette fg truncated",
+                    ));
+                }
+                let rgb = (data[off + 1], data[off + 2], data[off + 3]);
+                off += 4;
+                Some(rgb)
+            } else {
+                off += 1;
+                None
+            };
+            let bg = if data.get(off) == Some(&1) {
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TermPalette bg truncated",
+                    ));
+                }
+                Some((data[off + 1], data[off + 2], data[off + 3]))
+            } else {
+                None
+            };
+            ClientMsg::TermPalette { fg, bg }
         }
         _ => {
             return Err(io::Error::new(
@@ -3540,7 +3751,23 @@ fn handle_single_control_command(
                 respond(client, &[]);
                 return false;
             }
-            let with_escapes = args.iter().any(|a| {
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let include_scrollback = args.iter().enumerate().any(|(i, a)| {
+                let v = if a == "-S" {
+                    args.get(i + 1).map(|s| s.as_str())
+                } else {
+                    a.strip_prefix("-S")
+                };
+                v.map(|v| v == "-" || v.parse::<i64>().map(|n| n < 0).unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            // tmux `-e` = include SGR; `-c` / `--colors` = include styles in
+            // the chosen --format. Without colors, formats emit text only.
+            let tmux_e = args.iter().any(|a| {
                 a.len() >= 2
                     && a.starts_with('-')
                     && !a.starts_with("--")
@@ -3551,24 +3778,27 @@ fn handle_single_control_command(
                         .unwrap_or(false)
                     && a[1..].contains('e')
             });
-            let include_scrollback = args.iter().enumerate().any(|(i, a)| {
-                let v = if a == "-S" {
-                    args.get(i + 1).map(|s| s.as_str())
+            let colors = tmux_e || parsed.has("colors") || parsed.flags.contains_key("c");
+            let format = parsed
+                .get("format")
+                .and_then(|s| super::capture::CaptureFormat::parse(s).ok())
+                .unwrap_or(if tmux_e {
+                    super::capture::CaptureFormat::Ansi
                 } else {
-                    a.strip_prefix("-S")
-                };
-                v.map(|v| v == "-" || v.parse::<i64>().map(|n| n < 0).unwrap_or(false))
-                    .unwrap_or(false)
-            });
-            let parsed = crate::cmd::parse_flags(&args);
-            let t = parsed
-                .get("t")
-                .or_else(|| parsed.get("target"))
-                .map(|s| s.to_string());
+                    super::capture::CaptureFormat::Ascii
+                });
             let window = resolve_target(sessions, client, t.as_deref())
                 .and_then(|(si, wi)| sessions.get(si).and_then(|s| s.windows.get(wi)));
             let text = window
-                .map(|w| render_pane_text(&w.pane, with_escapes, include_scrollback))
+                .map(|w| {
+                    super::capture::render_pane(
+                        &w.pane,
+                        format,
+                        colors,
+                        include_scrollback,
+                        super::capture::TerminalPalette::default(),
+                    )
+                })
                 .unwrap_or_default();
             let lines: Vec<&str> = if text.is_empty() {
                 Vec::new()
