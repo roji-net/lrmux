@@ -61,9 +61,17 @@ pub enum ClientMsg {
     /// Capture the content of a specific window (CLI: capture-window).
     /// If session is None, uses the first session.
     /// If window is None, uses the active window.
+    /// `format`: 0=ascii, 1=ansi, 2=html, 3=markdown.
+    /// `colors`: include fg/bg/attrs when the format supports them.
+    /// Optional `term_fg` / `term_bg` override the pane's cached defaults.
+    /// Prefer leaving these unset so HTML uses the captured pane's palette.
     CaptureWindow {
         session: Option<String>,
         window: Option<u8>,
+        format: u8,
+        colors: bool,
+        term_fg: Option<(u8, u8, u8)>,
+        term_bg: Option<(u8, u8, u8)>,
     },
     /// Send keys to a specific window's PTY (CLI: send-keys).
     /// If session is None, uses the first session.
@@ -83,6 +91,14 @@ pub enum ClientMsg {
     ControlCommand { line: String },
     /// Request a fresh grid snapshot from the server.
     Refresh,
+    /// Reply to a proxied OSC 10/11 color query (bytes from the real TTY).
+    TermOscReply { pane_id: u32, data: Vec<u8> },
+    /// Attached client's own default fg/bg (probed via OSC 10/11 on attach).
+    /// Used so HTML capture has a page background even before vim asks.
+    TermPalette {
+        fg: Option<(u8, u8, u8)>,
+        bg: Option<(u8, u8, u8)>,
+    },
 }
 
 /// Server → Client messages.
@@ -144,6 +160,13 @@ pub enum ServerMsg {
     /// Control mode notification: a text line to print to the control client's stdout.
     /// Format: "%window-add @1", "%output %0 hello", "%session-changed $1 name", etc.
     ControlNotify { line: String },
+    /// Ask the client to query its real TTY for OSC 10/11 and reply with
+    /// `TermOscReply` (so we don't invent palette colors).
+    TermOscQuery {
+        pane_id: u32,
+        code: u8,
+        bell_terminated: bool,
+    },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -172,6 +195,8 @@ const C_GET_LOG: u8 = 0x15;
 const C_IDENTIFY_CONTROL: u8 = 0x16;
 const C_CONTROL_COMMAND: u8 = 0x17;
 const C_REFRESH: u8 = 0x18;
+const C_TERM_OSC_REPLY: u8 = 0x19;
+const C_TERM_PALETTE: u8 = 0x1a;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -184,6 +209,7 @@ const S_SESSION_LIST: u8 = 0x16;
 const S_WINDOW_CAPTURE: u8 = 0x18;
 const S_LOG_CONTENT: u8 = 0x19;
 const S_CONTROL_NOTIFY: u8 = 0x1a;
+const S_TERM_OSC_QUERY: u8 = 0x1b;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -296,7 +322,14 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
                 None => payload.push(0),
             }
         }
-        ClientMsg::CaptureWindow { session, window } => {
+        ClientMsg::CaptureWindow {
+            session,
+            window,
+            format,
+            colors,
+            term_fg,
+            term_bg,
+        } => {
             payload.push(C_CAPTURE_WINDOW);
             match session {
                 Some(s) => {
@@ -312,6 +345,28 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
                     payload.push(*w);
                 }
                 None => payload.push(0),
+            }
+            payload.push(*format);
+            payload.push(if *colors { 1 } else { 0 });
+            // Optional outer-TTY palette (older peers ignore/omit trailing bytes).
+            if term_fg.is_none() && term_bg.is_none() {
+                payload.push(0);
+            } else {
+                payload.push(1);
+                match term_fg {
+                    Some((r, g, b)) => {
+                        payload.push(1);
+                        payload.extend_from_slice(&[*r, *g, *b]);
+                    }
+                    None => payload.push(0),
+                }
+                match term_bg {
+                    Some((r, g, b)) => {
+                        payload.push(1);
+                        payload.extend_from_slice(&[*r, *g, *b]);
+                    }
+                    None => payload.push(0),
+                }
             }
         }
         ClientMsg::SendKeys {
@@ -353,6 +408,29 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::Refresh => {
             payload.push(C_REFRESH);
+        }
+        ClientMsg::TermOscReply { pane_id, data } => {
+            payload.push(C_TERM_OSC_REPLY);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+            payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            payload.extend_from_slice(data);
+        }
+        ClientMsg::TermPalette { fg, bg } => {
+            payload.push(C_TERM_PALETTE);
+            match fg {
+                Some((r, g, b)) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&[*r, *g, *b]);
+                }
+                None => payload.push(0),
+            }
+            match bg {
+                Some((r, g, b)) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&[*r, *g, *b]);
+                }
+                None => payload.push(0),
+            }
         }
     }
     frame(payload)
@@ -480,6 +558,16 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(S_CONTROL_NOTIFY);
             payload.extend_from_slice(&(line.len() as u32).to_le_bytes());
             payload.extend_from_slice(line.as_bytes());
+        }
+        ServerMsg::TermOscQuery {
+            pane_id,
+            code,
+            bell_terminated,
+        } => {
+            payload.push(S_TERM_OSC_QUERY);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+            payload.push(*code);
+            payload.push(if *bell_terminated { 1 } else { 0 });
         }
     }
     frame(payload)
@@ -643,6 +731,12 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             let session = if r.first() == Some(&1) {
                 r = &r[1..];
                 let len = read_u32(&mut r)? as usize;
+                if r.len() < len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "CaptureWindow session name truncated",
+                    ));
+                }
                 let s = String::from_utf8_lossy(&r[..len]).into_owned();
                 r = &r[len..];
                 Some(s)
@@ -651,11 +745,69 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
                 None
             };
             let window = if r.first() == Some(&1) {
-                Some(r[1])
+                if r.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "CaptureWindow window index truncated",
+                    ));
+                }
+                let w = r[1];
+                r = &r[2..];
+                Some(w)
             } else {
+                r = &r[1..];
                 None
             };
-            Ok(ClientMsg::CaptureWindow { session, window })
+            // Optional trailing format/colors (older clients omit → ascii, no colors).
+            let (format, colors) = if r.len() >= 2 {
+                let f = r[0];
+                let c = r[1] != 0;
+                r = &r[2..];
+                (f, c)
+            } else {
+                (0, false)
+            };
+            // Optional outer-TTY palette (OSC 10/11).
+            let (term_fg, term_bg) = if r.first() == Some(&1) {
+                r = &r[1..];
+                let fg = if r.first() == Some(&1) {
+                    if r.len() < 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "CaptureWindow term_fg truncated",
+                        ));
+                    }
+                    let rgb = (r[1], r[2], r[3]);
+                    r = &r[4..];
+                    Some(rgb)
+                } else {
+                    r = &r[1..];
+                    None
+                };
+                let bg = if r.first() == Some(&1) {
+                    if r.len() < 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "CaptureWindow term_bg truncated",
+                        ));
+                    }
+                    let rgb = (r[1], r[2], r[3]);
+                    Some(rgb)
+                } else {
+                    None
+                };
+                (fg, bg)
+            } else {
+                (None, None)
+            };
+            Ok(ClientMsg::CaptureWindow {
+                session,
+                window,
+                format,
+                colors,
+                term_fg,
+                term_bg,
+            })
         }
         C_SEND_KEYS => {
             let session = if r.first() == Some(&1) {
@@ -696,6 +848,46 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::ControlCommand { line })
         }
         C_REFRESH => Ok(ClientMsg::Refresh),
+        C_TERM_OSC_REPLY => {
+            let pane_id = read_u32(&mut r)?;
+            let len = read_u32(&mut r)? as usize;
+            if r.len() < len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscReply truncated",
+                ));
+            }
+            let data = r[..len].to_vec();
+            Ok(ClientMsg::TermOscReply { pane_id, data })
+        }
+        C_TERM_PALETTE => {
+            let fg = if r.first() == Some(&1) {
+                if r.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TermPalette fg truncated",
+                    ));
+                }
+                let rgb = (r[1], r[2], r[3]);
+                r = &r[4..];
+                Some(rgb)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let bg = if r.first() == Some(&1) {
+                if r.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TermPalette bg truncated",
+                    ));
+                }
+                Some((r[1], r[2], r[3]))
+            } else {
+                None
+            };
+            Ok(ClientMsg::TermPalette { fg, bg })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -857,6 +1049,22 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let len = read_u32(&mut r)? as usize;
             let line = String::from_utf8_lossy(&r[..len]).into_owned();
             Ok(ServerMsg::ControlNotify { line })
+        }
+        S_TERM_OSC_QUERY => {
+            let pane_id = read_u32(&mut r)?;
+            if r.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TermOscQuery truncated",
+                ));
+            }
+            let code = r[0];
+            let bell_terminated = r.get(1).copied().unwrap_or(1) != 0;
+            Ok(ServerMsg::TermOscQuery {
+                pane_id,
+                code,
+                bell_terminated,
+            })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

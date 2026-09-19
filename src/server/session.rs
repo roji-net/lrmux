@@ -41,6 +41,30 @@ impl Session {
         }
     }
 
+    /// First session/window runs `command` via `$SHELL -ci`
+    /// (bootstrap for `new-server -- cmd` / `new-session` on a fresh server).
+    pub fn new_with_command(
+        name: String,
+        grid_rows: u16,
+        grid_cols: u16,
+        command: &str,
+        cwd: Option<&str>,
+    ) -> Self {
+        let window = Window::new_with_command(
+            grid_rows,
+            grid_cols,
+            default_window_name_for_command(command),
+            command,
+            cwd,
+        );
+        Self {
+            id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            name,
+            windows: vec![window],
+            options: HashMap::new(),
+        }
+    }
+
     /// A session with no windows — used when iTerm2 affinities move a
     /// window into a new session (each OS window maps to a session).
     pub fn new_empty(name: String) -> Self {
@@ -56,4 +80,14 @@ impl Session {
     pub fn id_str(&self) -> String {
         format!("${}", self.id)
     }
+}
+
+fn default_window_name_for_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|bin| std::path::Path::new(bin).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "shell".to_string())
 }

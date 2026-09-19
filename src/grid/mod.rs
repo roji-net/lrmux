@@ -29,9 +29,9 @@ pub struct Grid {
     /// New scrollback rows not yet sent to clients. Drained by take_pending_scrollback().
     pending_scrollback: Vec<Vec<Cell>>,
     /// Scroll region top (inclusive), 0-indexed.
-    scroll_top: usize,
+    pub scroll_top: usize,
     /// Scroll region bottom (exclusive), 0-indexed.
-    scroll_bottom: usize,
+    pub scroll_bottom: usize,
     /// Whether the next print should wrap to the next line.
     wrap_pending: bool,
     /// Saved cursor position (for DECSC/DECRC).
@@ -284,24 +284,24 @@ impl Grid {
     }
 
     /// Scroll the scroll region down by n lines (e.g., for reverse line feed).
+    /// Content moves down; the top n rows become blank; rows scrolled off the
+    /// bottom are discarded (not added to scrollback).
     pub fn scroll_down(&mut self, n: usize) {
         let n = n.min(self.scroll_bottom - self.scroll_top);
         if n == 0 {
             return;
         }
 
-        // Insert blank rows at the top, then rotate right by n.
+        // Rotate first, then blank the top. Blanking *before* rotate_right
+        // incorrectly leaves the former bottom row at the top — which is
+        // exactly the ghost-text vim Ctrl-B / reverse-scroll bug: vim then
+        // writes a short line over that stale row without EL, leaving the
+        // leftover tail (`====…`, mashed comments, etc.).
+        self.rows[self.scroll_top..self.scroll_bottom].rotate_right(n);
         let blank_row = vec![Cell::blank(); self.cols];
         for i in 0..n {
-            let row_idx = self.scroll_top + i;
-            if row_idx < self.rows.len() {
-                self.rows[row_idx] = blank_row.clone();
-            }
+            self.rows[self.scroll_top + i] = blank_row.clone();
         }
-
-        // Shift rows down: rotate the scroll region right by n.
-        // The blank rows we inserted at the top push existing content down.
-        self.rows[self.scroll_top..self.scroll_bottom].rotate_right(n);
 
         for i in self.scroll_top..self.scroll_bottom {
             self.mark_dirty(i);
@@ -360,6 +360,70 @@ impl Grid {
         for i in cursor..self.scroll_bottom {
             self.mark_dirty(i);
         }
+    }
+
+    /// Insert n blank characters at the cursor, shifting the rest of the
+    /// line right. Characters shifted off the right edge are discarded.
+    /// (ICH — Insert Character, CSI @)
+    pub fn insert_chars(&mut self, n: usize) {
+        let (crow, ccol) = (self.cursor_row, self.cursor_col);
+        let Some(row) = self.rows.get_mut(crow) else {
+            return;
+        };
+        if ccol >= row.len() {
+            return;
+        }
+        let n = n.min(row.len() - ccol);
+        if n == 0 {
+            return;
+        }
+        row[ccol..].rotate_right(n);
+        for cell in &mut row[ccol..ccol + n] {
+            *cell = Cell::blank();
+        }
+        self.wrap_pending = false;
+        self.mark_dirty(crow);
+    }
+
+    /// Delete n characters at the cursor, shifting the rest of the line
+    /// left. Blank cells fill the end of the line.
+    /// (DCH — Delete Character, CSI P)
+    pub fn delete_chars(&mut self, n: usize) {
+        let (crow, ccol) = (self.cursor_row, self.cursor_col);
+        let Some(row) = self.rows.get_mut(crow) else {
+            return;
+        };
+        if ccol >= row.len() {
+            return;
+        }
+        let n = n.min(row.len() - ccol);
+        if n == 0 {
+            return;
+        }
+        row[ccol..].rotate_left(n);
+        let len = row.len();
+        for cell in &mut row[len - n..] {
+            *cell = Cell::blank();
+        }
+        self.wrap_pending = false;
+        self.mark_dirty(crow);
+    }
+
+    /// Erase n characters starting at the cursor (replace with blanks).
+    /// Does not shift the rest of the line.
+    /// (ECH — Erase Character, CSI X)
+    pub fn erase_chars(&mut self, n: usize) {
+        let (crow, ccol) = (self.cursor_row, self.cursor_col);
+        let Some(row) = self.rows.get_mut(crow) else {
+            return;
+        };
+        if ccol >= row.len() {
+            return;
+        }
+        let end = (ccol + n).min(row.len());
+        row[ccol..end].fill(Cell::blank());
+        self.wrap_pending = false;
+        self.mark_dirty(crow);
     }
 
     /// Erase from cursor to end of line.
@@ -547,5 +611,114 @@ impl Grid {
         if let Some((row, col)) = self.saved_cursor {
             self.move_cursor(row, col);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_chars(grid: &Grid, row: usize) -> String {
+        grid.row(row)
+            .unwrap()
+            .iter()
+            .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn fill_row(grid: &mut Grid, row: usize, ch: char) {
+        if let Some(r) = grid.row_mut(row) {
+            for cell in r.iter_mut() {
+                cell.ch = ch;
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_down_blanks_top_not_bottom() {
+        // 5-row grid filled with distinct markers.
+        let mut grid = Grid::new(5, 8, 100);
+        for (i, ch) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+            fill_row(&mut grid, i, *ch);
+        }
+
+        grid.scroll_down(1);
+
+        assert_eq!(row_chars(&grid, 0), "", "top row must be blank");
+        assert_eq!(row_chars(&grid, 1), "AAAAAAAA");
+        assert_eq!(row_chars(&grid, 2), "BBBBBBBB");
+        assert_eq!(row_chars(&grid, 3), "CCCCCCCC");
+        assert_eq!(row_chars(&grid, 4), "DDDDDDDD");
+        // E must be discarded — the old bug left it on row 0.
+    }
+
+    #[test]
+    fn scroll_down_within_region() {
+        let mut grid = Grid::new(5, 4, 100);
+        for (i, ch) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+            fill_row(&mut grid, i, *ch);
+        }
+        // Exclude top and bottom rows (vim-style status/chrome).
+        grid.set_scroll_region(1, 4);
+
+        grid.scroll_down(1);
+
+        assert_eq!(row_chars(&grid, 0), "AAAA"); // outside region unchanged
+        assert_eq!(row_chars(&grid, 1), ""); // blank inserted at region top
+        assert_eq!(row_chars(&grid, 2), "BBBB");
+        assert_eq!(row_chars(&grid, 3), "CCCC");
+        assert_eq!(row_chars(&grid, 4), "EEEE"); // outside region unchanged
+    }
+
+    #[test]
+    fn scroll_up_blanks_bottom() {
+        let mut grid = Grid::new(5, 4, 100);
+        for (i, ch) in ['A', 'B', 'C', 'D', 'E'].iter().enumerate() {
+            fill_row(&mut grid, i, *ch);
+        }
+
+        grid.scroll_up(1);
+
+        assert_eq!(row_chars(&grid, 0), "BBBB");
+        assert_eq!(row_chars(&grid, 4), "");
+    }
+
+    #[test]
+    fn delete_chars_shifts_left() {
+        let mut grid = Grid::new(1, 8, 100);
+        for ch in "hello".chars() {
+            grid.print(ch);
+        }
+        grid.move_cursor(0, 0);
+        grid.delete_chars(1);
+        assert_eq!(row_chars(&grid, 0), "ello");
+        assert_eq!(grid.cursor_col, 0);
+    }
+
+    #[test]
+    fn insert_chars_shifts_right() {
+        let mut grid = Grid::new(1, 8, 100);
+        for ch in "ello".chars() {
+            grid.print(ch);
+        }
+        grid.move_cursor(0, 0);
+        grid.insert_chars(1);
+        // blank + ello
+        assert_eq!(row_chars(&grid, 0), " ello");
+        grid.print('h');
+        assert_eq!(row_chars(&grid, 0), "hello");
+    }
+
+    #[test]
+    fn erase_chars_no_shift() {
+        let mut grid = Grid::new(1, 8, 100);
+        for ch in "hello".chars() {
+            grid.print(ch);
+        }
+        grid.move_cursor(0, 1);
+        grid.erase_chars(2);
+        assert_eq!(row_chars(&grid, 0), "h  lo");
     }
 }
