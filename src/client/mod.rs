@@ -2,18 +2,23 @@
 
 pub mod control;
 pub mod copy_mode;
+pub mod inventory;
 pub mod render;
 pub mod selector;
 pub mod terminal;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::grid::{Cell, Grid};
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
 use crate::version;
+
+/// Flash message produced by network/PSK setup (shown after confirm closes).
+static NETWORK_SETUP_FLASH: Mutex<Option<String>> = Mutex::new(None);
 
 /// Prefix key: Ctrl-A (0x01).
 const PREFIX: u8 = 0x01;
@@ -58,6 +63,10 @@ enum ConfirmState {
     },
     /// "Rename session to:" — editable name prompt.
     RenameSession { input: String },
+    /// Network setup scaffolding: choose generate / set PSK.
+    NetworkSetupMenu,
+    /// Type a PSK then Enter to apply.
+    NetworkSetupSetPsk { input: String },
 }
 
 /// Run the client: connect to server, relay stdin → server, render grid updates.
@@ -70,8 +79,8 @@ pub fn run(
     command: Option<String>,
     cwd: Option<String>,
 ) -> io::Result<()> {
-    // Connect to the server.
-    let mut stream = ipc::connect(socket_path)?;
+    // Connect to the server (Unix socket, or TCP when --tcp is set).
+    let mut stream = ipc::connect_any(socket_path)?;
     let stream_fd = stream.as_raw_fd();
 
     // Enter raw mode on the controlling terminal.
@@ -96,6 +105,7 @@ pub fn run(
         rows,
         cols,
         attach: true,
+        auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &identify)?;
 
@@ -568,6 +578,12 @@ pub fn run(
                     match action {
                         ConfirmAction::Confirmed => {
                             confirm_state = ConfirmState::None;
+                            if let Some(msg) = take_network_setup_flash() {
+                                flash_msg = Some(msg);
+                                flash_deadline = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(8),
+                                );
+                            }
                             let mut stdout = io::stdout();
                             render_status_bar(
                                 &mut stdout,
@@ -608,7 +624,12 @@ pub fn run(
             // 0 = EOF, -1 = EAGAIN or error — checked after parsing.
             let mut last: isize = -1;
             loop {
-                let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                let n = match stream.read(&mut buf) {
+                    Ok(n) => n as isize,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => -1,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => 0,
+                };
                 if n > 0 {
                     total += n as usize;
                     server_buf.extend_from_slice(&buf[..n as usize]);
@@ -822,6 +843,11 @@ pub fn run(
                                 proto::send(&mut stream, &msg)?;
                             }
                         }
+                        ServerMsg::PskUpdated => {
+                            flash_msg = Some("PSK updated on server".to_string());
+                            flash_deadline =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                        }
                     }
                 }
                 // Render once per socket batch instead of once per frame —
@@ -913,7 +939,7 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
 fn process_prefix(
     input: &[u8],
     state: &mut PrefixState,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ipc::ConnStream,
     window_count: usize,
     session_count: usize,
     last_window: Option<u8>,
@@ -1071,6 +1097,10 @@ fn process_prefix(
                         send_cmd(stream, &ClientMsg::Refresh)?;
                         flash = Some("refreshing...".to_string());
                     }
+                    // ',' → network / PSK setup (scaffolding; fullscreen editor later).
+                    b',' => {
+                        confirm = Some(ConfirmState::NetworkSetupMenu);
+                    }
                     // '?' → show keybindings help overlay.
                     b'?' => {
                         show_help = true;
@@ -1101,7 +1131,7 @@ fn process_prefix(
 }
 
 /// Send a command message to the server.
-fn send_cmd(stream: &mut std::os::unix::net::UnixStream, msg: &ClientMsg) -> io::Result<()> {
+fn send_cmd(stream: &mut ipc::ConnStream, msg: &ClientMsg) -> io::Result<()> {
     let encoded = proto::encode_client(msg);
     proto::send(stream, &encoded)
 }
@@ -1120,7 +1150,7 @@ enum ConfirmAction {
 fn process_confirm(
     input: &[u8],
     state: &mut ConfirmState,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut ipc::ConnStream,
 ) -> io::Result<ConfirmAction> {
     match state {
         ConfirmState::None => Ok(ConfirmAction::Cancelled),
@@ -1192,7 +1222,63 @@ fn process_confirm(
             }
             Ok(ConfirmAction::Continue)
         }
+        ConfirmState::NetworkSetupMenu => match input.first() {
+            Some(b'g' | b'G') => {
+                let psk = crate::config::generate_psk()?;
+                crate::config::persist_psk(&psk)?;
+                send_cmd(stream, &ClientMsg::SetPsk { psk: psk.clone() })?;
+                // Show the full PSK once so it can be shared with remotes.
+                *state = ConfirmState::None;
+                // Re-use flash via a side channel: return Confirmed and let
+                // caller set flash — encode PSK in a temporary Rename? Better:
+                // stash via environment-less approach: write to a static.
+                NETWORK_SETUP_FLASH.lock().unwrap().replace(format!(
+                    "PSK set — share once: {psk} (TLS required outside safe_networks)"
+                ));
+                Ok(ConfirmAction::Confirmed)
+            }
+            Some(b's' | b'S') => {
+                *state = ConfirmState::NetworkSetupSetPsk {
+                    input: String::new(),
+                };
+                Ok(ConfirmAction::Continue)
+            }
+            Some(0x1b | 0x03 | b'q' | b'Q') => Ok(ConfirmAction::Cancelled),
+            _ => Ok(ConfirmAction::Continue),
+        },
+        ConfirmState::NetworkSetupSetPsk { input: buf } => {
+            for &byte in input {
+                match byte {
+                    b'\r' | b'\n' => {
+                        if buf.is_empty() {
+                            return Ok(ConfirmAction::Cancelled);
+                        }
+                        let psk = buf.clone();
+                        crate::config::persist_psk(&psk)?;
+                        send_cmd(stream, &ClientMsg::SetPsk { psk: psk.clone() })?;
+                        NETWORK_SETUP_FLASH.lock().unwrap().replace(format!(
+                            "PSK set ({} chars). Remotes: --psk + --tcp",
+                            psk.len()
+                        ));
+                        return Ok(ConfirmAction::Confirmed);
+                    }
+                    0x1b | 0x03 => return Ok(ConfirmAction::Cancelled),
+                    0x7f | 0x08 => {
+                        buf.pop();
+                    }
+                    0x20..=0x7e => {
+                        buf.push(byte as char);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(ConfirmAction::Continue)
+        }
     }
+}
+
+fn take_network_setup_flash() -> Option<String> {
+    NETWORK_SETUP_FLASH.lock().unwrap().take()
 }
 
 /// Render the confirmation prompt on the status bar line.
@@ -1226,6 +1312,23 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
                 stdout,
                 "\x1b[44;97m Rename session: {}\x1b[1;93m_\x1b[0m\x1b[44;97m  (Enter=confirm, Esc=cancel)\x1b[0m",
                 input
+            )
+            .ok();
+        }
+        ConfirmState::NetworkSetupMenu => {
+            let has = !crate::config::effective_psk().is_empty();
+            write!(
+                stdout,
+                "\x1b[44;97m Network setup: [g]enerate PSK  [s]et PSK  [q]uit{}\x1b[0m",
+                if has { " (PSK already set)" } else { "" }
+            )
+            .ok();
+        }
+        ConfirmState::NetworkSetupSetPsk { input } => {
+            write!(
+                stdout,
+                "\x1b[44;97m Enter PSK: {}\x1b[1;93m_\x1b[0m\x1b[44;97m  (Enter=save, Esc=cancel)\x1b[0m",
+                "*".repeat(input.len())
             )
             .ok();
         }
@@ -1698,6 +1801,7 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),
         ("Ctrl-A r", "Refresh screen"),
+        ("Ctrl-A ,", "Network / PSK setup"),
         ("Ctrl-A d / Ctrl-D", "Detach"),
         ("Ctrl-A \\", "Show server log"),
         ("Ctrl-A ?", "Show this help"),

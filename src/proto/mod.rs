@@ -14,7 +14,14 @@ use crate::grid::{Attr, Cell, Color};
 pub enum ClientMsg {
     /// Initial handshake: client terminal size.
     /// `attach: false` for CLI commands (no snapshot needed).
-    Identify { rows: u16, cols: u16, attach: bool },
+    /// `auth_token` is required on TCP when the server has one configured;
+    /// ignored for Unix-socket clients.
+    Identify {
+        rows: u16,
+        cols: u16,
+        attach: bool,
+        auth_token: String,
+    },
     /// Raw keystrokes from the client's stdin → forward to PTY.
     PaneInput { data: Vec<u8> },
     /// Client terminal resized.
@@ -85,7 +92,11 @@ pub enum ClientMsg {
     GetLog,
     /// Control mode client identifies itself.
     /// The server will send text notifications instead of grid updates.
-    IdentifyControl { rows: u16, cols: u16 },
+    IdentifyControl {
+        rows: u16,
+        cols: u16,
+        auth_token: String,
+    },
     /// Control mode client sends a tmux-style command line.
     /// The server parses it using the cmd module and executes it.
     ControlCommand { line: String },
@@ -99,6 +110,9 @@ pub enum ClientMsg {
         fg: Option<(u8, u8, u8)>,
         bg: Option<(u8, u8, u8)>,
     },
+    /// Set / replace the server PSK (hot-apply + persist). Scaffolding for
+    /// in-session network setup; fullscreen config editor comes later.
+    SetPsk { psk: String },
 }
 
 /// Server → Client messages.
@@ -167,6 +181,8 @@ pub enum ServerMsg {
         code: u8,
         bell_terminated: bool,
     },
+    /// Acknowledge SetPsk (PSK was applied on the server).
+    PskUpdated,
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -197,6 +213,7 @@ const C_CONTROL_COMMAND: u8 = 0x17;
 const C_REFRESH: u8 = 0x18;
 const C_TERM_OSC_REPLY: u8 = 0x19;
 const C_TERM_PALETTE: u8 = 0x1a;
+const C_SET_PSK: u8 = 0x1b;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -210,6 +227,7 @@ const S_WINDOW_CAPTURE: u8 = 0x18;
 const S_LOG_CONTENT: u8 = 0x19;
 const S_CONTROL_NOTIFY: u8 = 0x1a;
 const S_TERM_OSC_QUERY: u8 = 0x1b;
+const S_PSK_UPDATED: u8 = 0x1c;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -217,11 +235,18 @@ const S_TERM_OSC_QUERY: u8 = 0x1b;
 pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
     let mut payload = Vec::new();
     match msg {
-        ClientMsg::Identify { rows, cols, attach } => {
+        ClientMsg::Identify {
+            rows,
+            cols,
+            attach,
+            auth_token,
+        } => {
             payload.push(C_IDENTIFY);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
             payload.push(if *attach { 1 } else { 0 });
+            payload.extend_from_slice(&(auth_token.len() as u32).to_le_bytes());
+            payload.extend_from_slice(auth_token.as_bytes());
         }
         ClientMsg::PaneInput { data } => {
             payload.push(C_PANE_INPUT);
@@ -396,10 +421,16 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::GetLog => {
             payload.push(C_GET_LOG);
         }
-        ClientMsg::IdentifyControl { rows, cols } => {
+        ClientMsg::IdentifyControl {
+            rows,
+            cols,
+            auth_token,
+        } => {
             payload.push(C_IDENTIFY_CONTROL);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
+            payload.extend_from_slice(&(auth_token.len() as u32).to_le_bytes());
+            payload.extend_from_slice(auth_token.as_bytes());
         }
         ClientMsg::ControlCommand { line } => {
             payload.push(C_CONTROL_COMMAND);
@@ -431,6 +462,11 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
                 }
                 None => payload.push(0),
             }
+        }
+        ClientMsg::SetPsk { psk } => {
+            payload.push(C_SET_PSK);
+            payload.extend_from_slice(&(psk.len() as u32).to_le_bytes());
+            payload.extend_from_slice(psk.as_bytes());
         }
     }
     frame(payload)
@@ -569,6 +605,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(*code);
             payload.push(if *bell_terminated { 1 } else { 0 });
         }
+        ServerMsg::PskUpdated => {
+            payload.push(S_PSK_UPDATED);
+        }
     }
     frame(payload)
 }
@@ -650,7 +689,16 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             let rows = read_u16(&mut r)?;
             let cols = read_u16(&mut r)?;
             let attach = r.first().copied().unwrap_or(1) != 0;
-            Ok(ClientMsg::Identify { rows, cols, attach })
+            if !r.is_empty() {
+                r = &r[1..];
+            }
+            let auth_token = read_optional_string(&mut r)?;
+            Ok(ClientMsg::Identify {
+                rows,
+                cols,
+                attach,
+                auth_token,
+            })
         }
         C_PANE_INPUT => Ok(ClientMsg::PaneInput { data: r.to_vec() }),
         C_RESIZE => {
@@ -840,7 +888,12 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         C_IDENTIFY_CONTROL => {
             let rows = read_u16(&mut r)?;
             let cols = read_u16(&mut r)?;
-            Ok(ClientMsg::IdentifyControl { rows, cols })
+            let auth_token = read_optional_string(&mut r)?;
+            Ok(ClientMsg::IdentifyControl {
+                rows,
+                cols,
+                auth_token,
+            })
         }
         C_CONTROL_COMMAND => {
             let len = read_u32(&mut r)? as usize;
@@ -887,6 +940,11 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
                 None
             };
             Ok(ClientMsg::TermPalette { fg, bg })
+        }
+        C_SET_PSK => {
+            let len = read_u32(&mut r)? as usize;
+            let psk = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ClientMsg::SetPsk { psk })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1066,6 +1124,7 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 bell_terminated,
             })
         }
+        S_PSK_UPDATED => Ok(ServerMsg::PskUpdated),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -1111,6 +1170,27 @@ fn decode_attr(r: &mut &[u8]) -> io::Result<Attr> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Read a length-prefixed UTF-8 string if enough bytes remain; else empty.
+/// Used for optional trailing auth_token on Identify (backward compatible).
+fn read_optional_string(r: &mut &[u8]) -> io::Result<String> {
+    if r.len() < 4 {
+        return Ok(String::new());
+    }
+    let len = read_u32(r)? as usize;
+    if len == 0 {
+        return Ok(String::new());
+    }
+    if r.len() < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated string",
+        ));
+    }
+    let s = String::from_utf8_lossy(&r[..len]).into_owned();
+    *r = &r[len..];
+    Ok(s)
+}
 
 fn read_u8(r: &mut &[u8]) -> io::Result<u8> {
     if r.is_empty() {

@@ -11,7 +11,7 @@
 // every client.
 
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use std::os::fd::AsRawFd;
 
@@ -70,7 +70,7 @@ impl CcDebug {
 /// 5. Read tmux-style commands from stdin and send them to the server.
 /// 6. On %exit or server disconnect, emit `%exit` and exit.
 pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
-    let mut stream = ipc::connect(socket_path)?;
+    let mut stream = ipc::connect_any(socket_path)?;
 
     // Get terminal size (default to 24x80 if not available).
     let (rows, cols) = crate::client::terminal::get_size();
@@ -82,7 +82,11 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
     let _term_guard = ControlModeGuard::enter(libc::STDIN_FILENO).ok();
 
     // Send IdentifyControl.
-    let msg = proto::encode_client(&ClientMsg::IdentifyControl { rows, cols });
+    let msg = proto::encode_client(&ClientMsg::IdentifyControl {
+        rows,
+        cols,
+        auth_token: crate::config::effective_psk(),
+    });
     proto::send(&mut stream, &msg)?;
 
     // Probe outer TTY defaults via /dev/tty (stdout is the control channel).
@@ -223,7 +227,7 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                     }
                     // Flush queued commands immediately; POLLOUT handles
                     // leftovers if the socket can't take everything.
-                    flush_fd(stream_fd, &mut server_outbuf);
+                    flush_stream(&mut stream, &mut server_outbuf);
                 } else if n == 0 {
                     dbg.log("IN ", b"<eof>");
                     stdin_eof = true;
@@ -244,13 +248,22 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
 
         // server socket writable → drain pending commands
         if fds[0].revents & libc::POLLOUT != 0 {
-            flush_fd(stream_fd, &mut server_outbuf);
+            flush_stream(&mut stream, &mut server_outbuf);
         }
 
         // server → stdout (decode frames, queue ControlNotify lines)
         if fds[0].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 8192];
-            let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = match stream.read(&mut buf) {
+                Ok(n) => n as isize,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    -1
+                }
+                Err(_) => 0,
+            };
             if n > 0 {
                 server_buf.extend_from_slice(&buf[..n as usize]);
                 // Try to parse complete frames.
@@ -413,6 +426,26 @@ fn flush_fd(fd: libc::c_int, buf: &mut VecDeque<u8>) {
         } else {
             // EAGAIN or error — retry later.
             break;
+        }
+    }
+}
+
+/// Flush pending bytes through a ConnStream (TLS-aware).
+fn flush_stream(stream: &mut ipc::ConnStream, buf: &mut VecDeque<u8>) {
+    while !buf.is_empty() {
+        let (front, _) = buf.as_slices();
+        match stream.write(front) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.drain(..n);
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                break;
+            }
+            Err(_) => break,
         }
     }
 }

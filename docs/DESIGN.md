@@ -230,7 +230,7 @@ Future AI-specific enhancements (programmatic API, pane metadata, AI-aware layou
   - Server survives client crashes (client sockets are cleaned up; sessions persist).
   - Child processes are cleanly terminated on session kill (SIGHUP → SIGKILL escalation).
   - Server persists when the last client detaches; exits only when all sessions are closed or explicitly killed (see §2.15).
-- **Security**: Unix socket permissions set to `0600` (owner-only); socket path under `/tmp/lrmux-UID/` (per-user, like tmux). No network exposure in v1.
+- **Security**: Unix socket permissions set to `0600` (owner-only); socket path under `/tmp/lrmux-UID/` (per-user, like tmux). Optional TCP is off by default; when enabled, `auth_token` + TLS (`auto`/`on`) protect remote attaches (see Phase 7 / README Remote).
 
 ---
 
@@ -435,7 +435,7 @@ src/
 │   └── scrollback.rs
 ├── proto/           # client↔server message protocol (encode/decode)
 │   └── mod.rs
-├── ipc/             # Unix socket transport (abstracted for future TCP)
+├── ipc/             # Unix / TCP / TLS / WebSocket transport (ConnStream)
 │   └── mod.rs
 ├── config/          # TOML config loading + keybinding map
 │   └── mod.rs
@@ -697,16 +697,29 @@ clipboard_cmd = ""          # empty = auto-detect (pbcopy/xclip/wl-copy)
 
 **Deliverable**: the day-1 user experience — run `lrmux`, pick a server and session, get to work.
 
-### Phase 7 — Polish & AI-CLI niceties (future, out of base scope)
+### Phase 7 — Remote connectivity + polish
 
+**Remote (implemented):**
+
+- **Config** `~/.config/lrmux/config.toml` `[network]`: `tcp_listen`, `ws_listen`, `discovery`, `discovery_port` (default 17280), `tls` (`off`|`on`|`auto`), `psk` (alias `auth_token`), `safe_networks` (CIDR list, **default empty** ⇒ `tls=auto` requires TLS for every TCP peer), optional cert paths. All off / safe defaults.
+- **UDP discovery**: servers with TCP/WS (or `discovery = true`) answer Discover probes with unicast Announce. CLI `discover` / `ls` / `ls-servers` / selector share one inventory module and tag LAN entries.
+- **TCP session transport**: same binary framing as Unix; interactive client and `-CC` connect via `--tcp host:port` (optional `--psk`).
+- **WebSocket + browser client**: `ws_listen` / `start-server --ws addr`; `ConnStream::Ws` bridges tungstenite binary frames to the same length-prefixed proto. MVP client in `web/` (Identify + PSK, grid render, keyboard input). WSS via reverse proxy; Rust/WASM client deferred.
+- **PSK auth**: non-empty `psk` required on TCP/WS Identify; Unix sockets skip PSK. CLI `lrmux psk show|set|generate`; in-session `Ctrl-A ,` scaffolding; `SetPsk` hot-applies + persists.
+- **TLS (rustls)**: TCP only; `auto` uses `safe_networks`; self-signed cert bootstrap under `~/.config/lrmux/certs/`.
+
+**Still future:**
+
+- **Fullscreen config editor** (expand `Ctrl-A ,` scaffolding).
+- **Rust/WASM web client** (reuse WS transport; replace or complement `web/app.js`).
 - **Programmatic API** for AI CLIs: attach, send keys, read pane output, create sessions — over the IPC socket or a separate control socket.
 - **Pane metadata**: detect AI CLI processes running in panes, surface status (model, token usage) in the status bar.
 - **AI-aware split layouts**: auto-arrange an AI CLI alongside an editor or output pane.
-- **TCP transport**: remote attach over the network (the IPC abstraction makes this additive).
 - **Config menu (F9)**: interactive configuration UI.
 - **Independent per-client views**: multiple clients on one session with independent window selection.
+- **mTLS / NAT traversal / QUIC**: out of scope; VPN or reachable IP:port assumed for internet.
 
-**Deliverable**: the differentiators that go beyond byobu/tmux parity.
+**Deliverable**: LAN/remote attach with discovery + optional TLS/PSK, plus browser attach over WebSocket.
 
 ---
 

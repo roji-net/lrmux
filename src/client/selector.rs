@@ -1,20 +1,23 @@
 // Interactive startup selector: discover servers, list sessions, let the user pick.
 //
-// Shows a flat list of `server / session` entries with a fuzzy filter.
-// j/k or arrow keys to navigate, Enter to join, n for new session, N for new server.
-// When no servers exist, shows a name prompt to create one.
+// Uses the shared `inventory` module (local sockets + LAN UDP discovery).
 
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 
+use crate::client::inventory::{self, ServerEntry};
 use crate::client::terminal;
 use crate::ipc;
-use crate::proto::{self, ClientMsg, ServerMsg};
 
 /// What the user chose in the selector.
 pub enum SelectorResult {
     /// Attach to an existing session on a server.
-    Attach { server: String, session: String },
+    /// `tcp` is set for LAN-discovered remote servers (`host:port`).
+    Attach {
+        server: String,
+        session: String,
+        tcp: Option<String>,
+    },
     /// Create a new session on a server (optionally named).
     NewSession {
         server: String,
@@ -31,6 +34,22 @@ pub enum SelectorResult {
 struct Entry {
     server: String,
     session: String,
+    /// When set, connect via this TCP address instead of a local Unix socket.
+    tcp: Option<String>,
+    lan: bool,
+}
+
+impl Entry {
+    fn display(&self) -> String {
+        if self.lan {
+            match &self.tcp {
+                Some(addr) => format!("{}@{}/{} [lan]", self.server, addr, self.session),
+                None => format!("{}/{} [lan]", self.server, self.session),
+            }
+        } else {
+            format!("{}/{}", self.server, self.session)
+        }
+    }
 }
 
 /// Run the interactive selector. Returns the user's choice.
@@ -45,23 +64,10 @@ pub fn run_selector_forced() -> io::Result<SelectorResult> {
 }
 
 fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
-    // Discover all running servers and their sessions.
-    let servers = discover_servers();
+    let servers = inventory::collect(std::time::Duration::from_millis(500))?;
     let mut entries: Vec<Entry> = Vec::new();
-    for server in &servers {
-        match query_sessions(server) {
-            Ok(sessions) => {
-                for session in sessions {
-                    entries.push(Entry {
-                        server: server.clone(),
-                        session,
-                    });
-                }
-            }
-            Err(e) => {
-                eprintln!("lrmux: server '{server}' is not responding ({e})");
-            }
-        }
+    for s in &servers {
+        push_server_entries(&mut entries, s);
     }
 
     // Fast path: exactly one server with one session → auto-join.
@@ -69,6 +75,7 @@ fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
         return Ok(SelectorResult::Attach {
             server: entries[0].server.clone(),
             session: entries[0].session.clone(),
+            tcp: entries[0].tcp.clone(),
         });
     }
 
@@ -84,55 +91,29 @@ fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
         });
     }
 
-    // Interactive selector.
     interactive_selector(entries)
 }
 
-/// Discover all running lrmux servers by scanning the socket directory.
-fn discover_servers() -> Vec<String> {
-    let uid = unsafe { libc::getuid() };
-    let dir = format!("/tmp/lrmux-{uid}");
-    let mut servers = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if ipc::server_exists(&path)
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            {
-                servers.push(name.to_string());
-            }
-        }
+fn push_server_entries(entries: &mut Vec<Entry>, s: &ServerEntry) {
+    let tcp = s.tcp_addr().map(|a| a.to_string());
+    let lan = s.is_lan();
+    if s.sessions.is_empty() {
+        // Still show the server so the user can create a session on it.
+        entries.push(Entry {
+            server: s.name.clone(),
+            session: "(no sessions)".to_string(),
+            tcp,
+            lan,
+        });
+        return;
     }
-    servers.sort();
-    servers
-}
-
-/// Query a server for its session list (lightweight: connect, ListSessions, disconnect).
-fn query_sessions(server_name: &str) -> io::Result<Vec<String>> {
-    let sock = ipc::socket_path(server_name);
-    let mut stream = ipc::connect(&sock)?;
-    // A wedged server accepts but never responds — bound the wait so one
-    // bad server doesn't freeze the selector.
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-
-    // Send ListSessions directly (no Identify needed for query).
-    let msg = proto::encode_client(&ClientMsg::ListSessions);
-    proto::send(&mut stream, &msg)?;
-
-    // Read the SessionList response.
-    match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::SessionList {
-            sessions,
-            address: _,
-        }) => Ok(sessions),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "expected SessionList",
-        )),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-            Err(io::Error::new(e.kind(), "timed out"))
-        }
-        Err(e) => Err(e),
+    for session in &s.sessions {
+        entries.push(Entry {
+            server: s.name.clone(),
+            session: session.clone(),
+            tcp: tcp.clone(),
+            lan,
+        });
     }
 }
 
@@ -151,93 +132,52 @@ fn no_servers_prompt() -> io::Result<SelectorResult> {
     match name_prompt(
         "lrmux — no servers running",
         "Server name",
-        "default",
-        &format!("Session name (default: {default_name})"),
-        Some(&default_name),
+        &default_name,
+        "Enter=create  Esc=quit",
+        None,
     ) {
-        Some((server, _)) => Ok(SelectorResult::NewServer { name: server }),
+        Some((name, _)) => Ok(SelectorResult::NewServer { name }),
         None => Ok(SelectorResult::Quit),
     }
 }
 
-/// Interactive name entry prompt.
-/// Shows a title, a label, a pre-filled editable field, and instructions.
-/// Returns Some((input, None)) for server-only, or Some((server, Some(session))) if
-/// a session name is also collected.
+/// Shared editable name prompt. Returns (name, optional extra) or None if cancelled.
 fn name_prompt(
     title: &str,
-    label1: &str,
-    default1: &str,
-    _label2: &str,
-    _default2: Option<&str>,
-) -> Option<(String, Option<String>)> {
-    let _raw_guard = terminal::enter_raw_mode().ok()?;
+    label: &str,
+    default: &str,
+    hint: &str,
+    _extra: Option<&str>,
+) -> Option<(String, ())> {
+    let _raw = terminal::enter_raw_mode().ok()?;
     let mut stdout = io::stdout();
-    let mut input = default1.to_string();
-
+    let mut name = default.to_string();
     loop {
-        // Render.
-        write!(stdout, "\x1b[2J\x1b[H").ok()?;
-        write!(stdout, "{title}\r\n").ok()?;
-        write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n").ok()?;
-        write!(stdout, "{label1}: \x1b[1;36m{input}\x1b[0m\r\n").ok()?;
-        write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n").ok()?;
-        write!(
-            stdout,
-            "\x1b[90mEnter=confirm  Esc=cancel  (type to edit)\x1b[0m"
-        )
-        .ok()?;
-        // Position cursor at end of input.
-        write!(
-            stdout,
-            "\x1b[{};{}H",
-            3,
-            label1.len() + 3 + input.chars().count()
-        )
-        .ok()?;
-        stdout.flush().ok()?;
+        let _ = write!(stdout, "\x1b[2J\x1b[H");
+        let _ = write!(stdout, "{title}\r\n");
+        let _ = write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n");
+        let _ = write!(stdout, "{label}: {name}\r\n");
+        let _ = write!(stdout, "\x1b[90m{hint}\x1b[0m\r\n");
+        let _ = stdout.flush();
 
-        // Read a key.
         let mut buf = [0u8; 1];
         let n = unsafe { libc::read(io::stdin().as_raw_fd(), buf.as_mut_ptr() as *mut _, 1) };
         if n <= 0 {
             return None;
         }
-        let key = buf[0];
-
-        match key {
+        match buf[0] {
             b'\r' | b'\n' => {
-                if input.is_empty() {
-                    input = default1.to_string();
+                if name.is_empty() {
+                    name = default.to_string();
                 }
-                return Some((input, None));
+                return Some((name, ()));
             }
-            0x1b => {
-                // Check if it's an escape sequence (arrow keys).
-                let mut seq = [0u8; 2];
-                let n2 =
-                    unsafe { libc::read(io::stdin().as_raw_fd(), seq.as_mut_ptr() as *mut _, 2) };
-                if n2 == 2 && seq[0] == b'[' {
-                    // Arrow keys — ignore in name prompt (or use for cursor movement).
-                    match seq[1] {
-                        b'C' => { /* Right — could move cursor */ }
-                        b'D' => { /* Left — could move cursor */ }
-                        _ => {}
-                    }
-                } else {
-                    // Plain Esc → cancel.
-                    return None;
-                }
-            }
+            0x03 | 0x1b => return None,
             0x7f | 0x08 => {
-                input.pop();
+                name.pop();
             }
-            0x03 => {
-                // Ctrl-C → cancel.
-                return None;
-            }
-            0x20..=0x7e => {
-                input.push(key as char);
+            b if b.is_ascii_graphic() || b == b' ' => {
+                name.push(b as char);
             }
             _ => {}
         }
@@ -252,7 +192,6 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
     let mut selected: usize = 0;
     let mut query: String = String::new();
 
-    // Filtered entries (recomputed when query changes).
     let filtered = |q: &str| -> Vec<usize> {
         if q.is_empty() {
             (0..entries.len()).collect()
@@ -266,8 +205,7 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
     loop {
         let filt = filtered(&query);
 
-        // Render. Use \r\n because raw mode doesn't translate \n to \r\n.
-        write!(stdout, "\x1b[2J\x1b[H")?; // clear + home
+        write!(stdout, "\x1b[2J\x1b[H")?;
         write!(stdout, "lrmux — select a session\r\n")?;
         write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n")?;
         if filt.is_empty() {
@@ -276,9 +214,9 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             for (row, &idx) in filt.iter().enumerate() {
                 let e = &entries[idx];
                 if row == selected {
-                    write!(stdout, "\x1b[1;36m▶ {}/{}\x1b[0m\r\n", e.server, e.session)?;
+                    write!(stdout, "\x1b[1;36m▶ {}\x1b[0m\r\n", e.display())?;
                 } else {
-                    write!(stdout, "  {}/{}\r\n", e.server, e.session)?;
+                    write!(stdout, "  {}\r\n", e.display())?;
                 }
             }
         }
@@ -290,7 +228,6 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
         write!(stdout, "filter> {}", query)?;
         stdout.flush()?;
 
-        // Read a key.
         let mut buf = [0u8; 1];
         let n = unsafe { libc::read(io::stdin().as_raw_fd(), buf.as_mut_ptr() as *mut _, 1) };
         if n <= 0 {
@@ -299,91 +236,80 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
         let key = buf[0];
 
         match key {
-            // Enter → join selected.
             b'\r' | b'\n' => {
                 if let Some(&idx) = filt.get(selected) {
+                    let e = &entries[idx];
+                    if e.session == "(no sessions)" {
+                        return Ok(SelectorResult::NewSession {
+                            server: e.server.clone(),
+                            name: None,
+                        });
+                    }
                     return Ok(SelectorResult::Attach {
-                        server: entries[idx].server.clone(),
-                        session: entries[idx].session.clone(),
+                        server: e.server.clone(),
+                        session: e.session.clone(),
+                        tcp: e.tcp.clone(),
                     });
                 }
             }
-            // q or Ctrl-C → quit.
             b'q' | 0x03 => {
                 return Ok(SelectorResult::Quit);
             }
-            // Esc → quit or arrow key.
             0x1b => {
-                // Check for arrow key escape sequence.
                 let mut seq = [0u8; 2];
                 let n2 =
                     unsafe { libc::read(io::stdin().as_raw_fd(), seq.as_mut_ptr() as *mut _, 2) };
                 if n2 == 2 && seq[0] == b'[' {
                     match seq[1] {
-                        // Up
-                        b'A' if selected > 0 => {
-                            selected -= 1;
-                        }
-                        // Down
-                        b'B' if selected + 1 < filt.len() => {
-                            selected += 1;
-                        }
+                        b'A' if selected > 0 => selected -= 1,
+                        b'B' if selected + 1 < filt.len() => selected += 1,
                         _ => {}
                     }
                 } else {
-                    // Plain Esc → quit.
                     return Ok(SelectorResult::Quit);
                 }
             }
-            // j → down.
-            b'j' if selected + 1 < filt.len() => {
-                selected += 1;
-            }
-            // k → up.
-            b'k' => {
-                selected = selected.saturating_sub(1);
-            }
-            // n → new session (with editable name prompt).
+            b'j' if selected + 1 < filt.len() => selected += 1,
+            b'k' => selected = selected.saturating_sub(1),
             b'n' => {
                 let server = filt
                     .get(selected)
                     .map(|&i| entries[i].server.clone())
                     .unwrap_or_else(|| "default".to_string());
+                // LAN entries need TCP; new session on LAN not supported from
+                // selector scaffolding yet — fall back to local name.
                 let default_name = default_session_name();
-                match name_prompt(
+                if let Some((name, _)) = name_prompt(
                     "lrmux — new session",
                     "Session name",
                     &default_name,
-                    "",
+                    "Enter=create  Esc=cancel",
                     None,
                 ) {
-                    Some((name, _)) => {
-                        return Ok(SelectorResult::NewSession {
-                            server,
-                            name: Some(name),
-                        });
-                    }
-                    None => { /* cancelled — stay in selector */ }
+                    return Ok(SelectorResult::NewSession {
+                        server,
+                        name: Some(name),
+                    });
                 }
             }
-            // N → new server (with editable name prompt).
             b'N' => {
                 let default_name = ipc::auto_server_name();
-                match name_prompt("lrmux — new server", "Server name", &default_name, "", None) {
-                    Some((name, _)) => {
-                        return Ok(SelectorResult::NewServer { name });
-                    }
-                    None => { /* cancelled — stay in selector */ }
+                if let Some((name, _)) = name_prompt(
+                    "lrmux — new server",
+                    "Server name",
+                    &default_name,
+                    "Enter=create  Esc=cancel",
+                    None,
+                ) {
+                    return Ok(SelectorResult::NewServer { name });
                 }
             }
-            // Backspace → remove last char from query.
             0x7f | 0x08 => {
                 query.pop();
                 selected = 0;
             }
-            // Printable ASCII → append to query.
-            0x20..=0x7e => {
-                query.push(key as char);
+            b if b.is_ascii_graphic() => {
+                query.push(b as char);
                 selected = 0;
             }
             _ => {}
@@ -402,10 +328,4 @@ fn fuzzy_match(text: &str, query: &str) -> bool {
         }
     }
     true
-}
-
-impl Entry {
-    fn display(&self) -> String {
-        format!("{}/{}", self.server, self.session)
-    }
 }
