@@ -23,24 +23,19 @@ mod vt;
 
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::client::selector::SelectorResult;
 use crate::ipc::socket_path;
 use crate::proto::{ClientMsg, ServerMsg};
 
-/// Global TCP address for CLI commands (--tcp <addr>).
-/// When set, CLI commands connect via TCP instead of Unix socket.
-static TCP_ADDR: Mutex<Option<String>> = Mutex::new(None);
-
 /// Connect to a server. Uses TCP if --tcp was set, otherwise Unix socket.
 /// `LRMUX_CLI_SERVER` overrides the default server name for CLI helpers
 /// (capture-pane, send-keys, …) so tests can target a throwaway server
 /// without touching the user's `default`.
 fn connect_to_server(server: &str) -> io::Result<crate::ipc::ConnStream> {
-    if let Some(addr) = TCP_ADDR.lock().unwrap().as_ref() {
-        return crate::ipc::connect_tcp(addr);
+    if let Some(addr) = crate::ipc::tcp_addr() {
+        return crate::ipc::connect_tcp(&addr);
     }
     let server = if server == "default" {
         std::env::var("LRMUX_CLI_SERVER").unwrap_or_else(|_| server.to_string())
@@ -99,8 +94,16 @@ enum CliAction {
         control: bool,
         command: Option<String>,
     },
-    /// `start-server -s <name> [--tcp addr]`: start a headless server.
-    StartServer { name: String, tcp: Option<String> },
+    /// `start-server -s <name> [--tcp addr] [--ws addr]`: start a headless server.
+    StartServer {
+        name: String,
+        tcp: Option<String>,
+        ws: Option<String>,
+    },
+    /// `discover`: UDP broadcast probe for LAN servers.
+    Discover,
+    /// `psk show|set|generate`: manage the TCP pre-shared key.
+    Psk(Vec<String>),
     /// `list-servers`: list all running servers.
     ListServers,
     /// `list-sessions [server]`: list sessions (all servers, or one).
@@ -173,6 +176,7 @@ fn print_help() {
          lrmux kill-server -s <name>\n    \
          lrmux new-server [-s <name>] [-CC] [--] [<cmd> [args...]]\n    \
          lrmux start-server -s <name> [--tcp <addr>]\n    \
+         lrmux discover               Probe LAN for servers (UDP)\n    \
          lrmux session-selector      Force the interactive session selector\n    \
          lrmux versions              Show client and all running server versions
     \
@@ -234,9 +238,13 @@ fn print_help() {
          State: /tmp/lrmux-<UID>/logs/<server>.state\n    \
          Ring log: Ctrl-A \\ (in-session, last 500 entries)\n\
          \n\
-         TCP:\n    \
+         TCP / remote:\n    \
          lrmux start-server --tcp <addr>  Listen on TCP\n    \
-         lrmux --tcp <addr> <command>      Connect via TCP"
+         lrmux --tcp <addr> [--psk <s>]   Attach / CLI over TCP\n    \
+         lrmux discover / ls / ls-servers Local + LAN inventory\n    \
+         lrmux psk generate|set|show     Share one secret (no file copy)\n    \
+         Config: ~/.config/lrmux/config.toml [network]\n    \
+         safe_networks = [] (default) => TLS required for all TCP peers"
     );
 }
 
@@ -254,15 +262,18 @@ fn parse_args() -> CliAction {
         if !is_start_server && args[i] == "--tcp" && i + 1 < args.len() {
             tcp_addr = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--psk" && i + 1 < args.len() {
+            crate::config::set_psk_override(Some(args[i + 1].clone()));
+            i += 2;
         } else {
             filtered.push(args[i].clone());
             i += 1;
         }
     }
     let args = filtered;
-    // Store tcp_addr in a global for CLI commands to use.
-    if let Some(ref addr) = tcp_addr {
-        *TCP_ADDR.lock().unwrap() = Some(addr.clone());
+    // Store tcp_addr in a global for CLI commands and interactive clients.
+    if let Some(addr) = tcp_addr {
+        crate::ipc::set_tcp_addr(Some(addr));
     }
 
     let subcmd = args.get(1).map(|s| s.as_str());
@@ -372,6 +383,8 @@ fn parse_args() -> CliAction {
         Some("new-server") => parse_new_server(subcmd_args),
         Some("start-server") => parse_start_server(subcmd_args),
         Some("list-servers") | Some("ls-servers") => CliAction::ListServers,
+        Some("discover") => CliAction::Discover,
+        Some("psk") => CliAction::Psk(subcmd_args.to_vec()),
         Some("list-sessions") | Some("ls-sessions") | Some("ls") => {
             let parsed = cmd::parse_flags(subcmd_args);
             CliAction::ListSessions(
@@ -552,8 +565,8 @@ fn parse_new_server(args: &[String]) -> CliAction {
     }
 }
 
-/// Parse `start-server` args: optional name + optional --tcp addr.
-///   start-server -s <name> --tcp <addr>
+/// Parse `start-server` args: optional name + optional --tcp / --ws addr.
+///   start-server -s <name> --tcp <addr> --ws <addr>
 fn parse_start_server(args: &[String]) -> CliAction {
     let parsed = cmd::parse_flags(args);
     let name = parsed
@@ -562,7 +575,8 @@ fn parse_start_server(args: &[String]) -> CliAction {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "default".to_string());
     let tcp = parsed.get("tcp").map(|s| s.to_string());
-    CliAction::StartServer { name, tcp }
+    let ws = parsed.get("ws").map(|s| s.to_string());
+    CliAction::StartServer { name, tcp, ws }
 }
 
 /// Parse `new-window` args using tmux-style flags.
@@ -683,6 +697,8 @@ fn parse_tmux_keys(parts: &[String]) -> Vec<u8> {
 
 /// Entry point: parse args, connect to or fork a server, run the client.
 fn run() -> io::Result<()> {
+    // Load config early so [network] applies to server fork and clients.
+    let _ = crate::config::global();
     let action = parse_args();
 
     // Detect nested lrmux — running lrmux inside lrmux hangs because
@@ -739,6 +755,7 @@ fn run() -> io::Result<()> {
                     rows: 24,
                     cols: 80,
                     attach: false,
+                    auth_token: crate::config::effective_psk(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -776,6 +793,7 @@ fn run() -> io::Result<()> {
                     rows: 24,
                     cols: 80,
                     attach: false,
+                    auth_token: crate::config::effective_psk(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -812,6 +830,7 @@ fn run() -> io::Result<()> {
                     rows: 24,
                     cols: 80,
                     attach: false,
+                    auth_token: crate::config::effective_psk(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -855,6 +874,7 @@ fn run() -> io::Result<()> {
                     rows: 24,
                     cols: 80,
                     attach: false,
+                    auth_token: crate::config::effective_psk(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -890,6 +910,7 @@ fn run() -> io::Result<()> {
                 eprintln!("lrmux: starting server '{name}' on {}...", sock.display());
                 fork_server(
                     &sock,
+                    None,
                     None,
                     false,
                     ServerInit {
@@ -970,6 +991,7 @@ fn run() -> io::Result<()> {
                 fork_server(
                     &sock,
                     None,
+                    None,
                     false,
                     ServerInit {
                         command: command.as_deref(),
@@ -988,6 +1010,7 @@ fn run() -> io::Result<()> {
                         rows: 24,
                         cols: 80,
                         attach: false,
+                        auth_token: crate::config::effective_psk(),
                     });
                     proto::send(&mut stream, &msg)?;
                     match proto::decode_server(&mut stream) {
@@ -1005,6 +1028,7 @@ fn run() -> io::Result<()> {
                         rows: 24,
                         cols: 80,
                         attach: false,
+                        auth_token: crate::config::effective_psk(),
                     });
                     proto::send(&mut stream, &msg)?;
                     match proto::decode_server(&mut stream) {
@@ -1047,7 +1071,8 @@ fn run() -> io::Result<()> {
             // The parser already resolved [server][:][session].
             let server = server.unwrap_or_else(|| "default".to_string());
             let sock = socket_path(&server);
-            if !ipc::server_exists(&sock) {
+            let via_tcp = crate::ipc::tcp_addr().is_some();
+            if !via_tcp && !ipc::server_exists(&sock) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
@@ -1092,6 +1117,7 @@ fn run() -> io::Result<()> {
                 rows: 24,
                 cols: 80,
                 attach: false,
+                auth_token: crate::config::effective_psk(),
             });
             proto::send(&mut stream, &msg)?;
             match proto::decode_server(&mut stream) {
@@ -1146,6 +1172,7 @@ fn run() -> io::Result<()> {
                 start_headless_server(
                     &name,
                     None,
+                    None,
                     ServerInit {
                         command: command.as_deref(),
                         session: None,
@@ -1157,9 +1184,11 @@ fn run() -> io::Result<()> {
                 start_new_server(&name, None, command)
             }
         }
-        CliAction::StartServer { name, tcp } => {
-            start_headless_server(&name, tcp.as_deref(), ServerInit::default())
+        CliAction::StartServer { name, tcp, ws } => {
+            start_headless_server(&name, tcp.as_deref(), ws.as_deref(), ServerInit::default())
         }
+        CliAction::Discover => cmd_discover(),
+        CliAction::Psk(args) => cmd_psk(&args),
         CliAction::Default => run_default(),
         CliAction::SessionSelector => run_session_selector(),
         CliAction::ListServers => list_servers(),
@@ -1207,8 +1236,14 @@ fn run() -> io::Result<()> {
 /// Default action: show the selector, then act on the user's choice.
 fn run_default() -> io::Result<()> {
     match client::selector::run_selector() {
-        Ok(SelectorResult::Attach { server, session }) => {
-            // Attach to the selected server and switch to the selected session.
+        Ok(SelectorResult::Attach {
+            server,
+            session,
+            tcp,
+        }) => {
+            if let Some(addr) = tcp {
+                crate::ipc::set_tcp_addr(Some(addr));
+            }
             let sock = socket_path(&server);
             client::run(&sock, None, Some(session), None, None)
         }
@@ -1227,7 +1262,7 @@ fn run_default() -> io::Result<()> {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                fork_server(&sock, None, false, ServerInit::default())?;
+                fork_server(&sock, None, None, false, ServerInit::default())?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
@@ -1239,7 +1274,14 @@ fn run_default() -> io::Result<()> {
 /// Force the interactive session selector (no auto-join even if only one session exists).
 fn run_session_selector() -> io::Result<()> {
     match client::selector::run_selector_forced() {
-        Ok(SelectorResult::Attach { server, session }) => {
+        Ok(SelectorResult::Attach {
+            server,
+            session,
+            tcp,
+        }) => {
+            if let Some(addr) = tcp {
+                crate::ipc::set_tcp_addr(Some(addr));
+            }
             let sock = socket_path(&server);
             client::run(&sock, None, Some(session), None, None)
         }
@@ -1256,7 +1298,7 @@ fn run_session_selector() -> io::Result<()> {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                fork_server(&sock, None, false, ServerInit::default())?;
+                fork_server(&sock, None, None, false, ServerInit::default())?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
@@ -1285,8 +1327,11 @@ fn start_new_server(
     eprintln!("lrmux: starting server '{name}' on {}...", sock.display());
     // Bootstrap the first session with the command (if any) so we don't get
     // an empty shell session plus a second session for the app.
+    // No pre-removal of the socket file: ipc::listen() only unlinks genuinely
+    // stale sockets, and wait_for_server() waits for a real connection.
     fork_server(
         &sock,
+        None,
         None,
         false,
         ServerInit {
@@ -1310,6 +1355,7 @@ fn start_new_server(
 fn start_headless_server(
     name: &str,
     tcp_addr: Option<&str>,
+    ws_addr: Option<&str>,
     init: ServerInit<'_>,
 ) -> io::Result<()> {
     let sock = socket_path(name);
@@ -1328,7 +1374,11 @@ fn start_headless_server(
     if let Some(ref addr) = tcp_addr {
         eprintln!("lrmux: TCP listener: {addr}");
     }
-    fork_server(&sock, tcp_addr, true, init)?;
+    if let Some(ref addr) = ws_addr {
+        eprintln!("lrmux: WebSocket listener: {addr}");
+        eprintln!("lrmux: open web/ via a static server, connect to ws://{addr}");
+    }
+    fork_server(&sock, tcp_addr, ws_addr, true, init)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: headless server '{name}' ready.");
     eprintln!("lrmux: connect with `lrmux` or use CLI commands (send-keys, capture-window, etc.)");
@@ -1342,10 +1392,11 @@ fn run_control_mode(target: Option<&str>) -> io::Result<()> {
     // so that real errors (unknown server) are still visible to the user.
     let server = resolve_control_target(target)?;
     let sock = socket_path(&server);
-    if !ipc::server_exists(&sock) {
+    let via_tcp = crate::ipc::tcp_addr().is_some();
+    if !via_tcp && !ipc::server_exists(&sock) {
         if server == "default" {
             // Start a headless default server silently.
-            fork_server(&sock, None, true, ServerInit::default())?;
+            fork_server(&sock, None, None, true, ServerInit::default())?;
             wait_for_server(&sock)?;
         } else {
             return Err(io::Error::new(
@@ -1381,24 +1432,34 @@ fn resolve_control_target(target: Option<&str>) -> io::Result<String> {
     Ok(srv.to_string())
 }
 
-/// List all running servers.
+/// List all running servers (local sockets + LAN discovery).
 fn list_servers() -> io::Result<()> {
-    let uid = unsafe { libc::getuid() };
-    let dir = format!("/tmp/lrmux-{uid}");
-    let mut found = false;
-    if let Ok(read_dir) = std::fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if ipc::server_exists(&path)
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            {
-                println!("{name}");
-                found = true;
-            }
-        }
-    }
-    if !found {
+    let entries = client::inventory::collect(Duration::from_millis(500))?;
+    if entries.is_empty() {
         eprintln!("(no servers running)");
+        return Ok(());
+    }
+    for e in entries {
+        println!("{}", e.display_label());
+    }
+    Ok(())
+}
+
+/// Broadcast a UDP Discover probe and print LAN servers (shared inventory).
+fn cmd_discover() -> io::Result<()> {
+    let port = crate::config::global().network.discovery_port;
+    eprintln!("lrmux: probing UDP {port}...");
+    let entries = client::inventory::collect(Duration::from_millis(800))?;
+    let lan: Vec<_> = entries.into_iter().filter(|e| e.is_lan()).collect();
+    if lan.is_empty() {
+        eprintln!("(no servers answered)");
+        return Ok(());
+    }
+    for e in lan {
+        println!("{}", e.display_label());
+        for s in &e.sessions {
+            println!("  {s}");
+        }
     }
     Ok(())
 }
@@ -1425,7 +1486,7 @@ fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
 
 /// List sessions. With a server argument, list that server's sessions as
 /// `session @ <address>`. Without one, list sessions across all running
-/// servers in `server:session @ <address>` format.
+/// servers (local + LAN) using the shared inventory.
 fn list_sessions(server: Option<&str>) -> io::Result<()> {
     if let Some(name) = server {
         let (address, sessions) = query_session_names(name)?;
@@ -1439,43 +1500,111 @@ fn list_sessions(server: Option<&str>) -> io::Result<()> {
         return Ok(());
     }
 
-    // All servers: discover sockets in /tmp/lrmux-<UID>/.
-    let uid = unsafe { libc::getuid() };
-    let dir = format!("/tmp/lrmux-{uid}");
-    let mut servers: Vec<String> = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if ipc::server_exists(&path)
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            {
-                servers.push(name.to_string());
-            }
-        }
-    }
-    servers.sort();
-    let multi = servers.len() > 1;
-    let mut any = false;
-    for name in &servers {
-        let (address, sessions) = match query_session_names(name) {
-            Ok((a, s)) => (a, s),
-            Err(e) => {
-                eprintln!("lrmux: server '{name}' is not responding ({e})");
-                continue;
-            }
-        };
-        for s in &sessions {
-            any = true;
-            if multi {
-                println!("{name}:{s} @ {address}");
-            } else {
+    // With --tcp, query that single endpoint once.
+    if crate::ipc::tcp_addr().is_some() {
+        let (address, sessions) = query_session_names("tcp")?;
+        if sessions.is_empty() {
+            eprintln!("(no sessions)");
+        } else {
+            for s in &sessions {
                 println!("{s} @ {address}");
             }
+        }
+        return Ok(());
+    }
+
+    let entries = client::inventory::collect(Duration::from_millis(500))?;
+    let multi = entries.len() > 1;
+    let mut any = false;
+    for e in &entries {
+        for s in &e.sessions {
+            any = true;
+            let tag = if e.is_lan() { "lan" } else { "local" };
+            if multi {
+                println!("{}:{} @ {} [{tag}]", e.name, s, e.address);
+            } else {
+                println!("{s} @ {} [{tag}]", e.address);
+            }
+        }
+        if e.sessions.is_empty() {
+            any = true;
+            let tag = if e.is_lan() { "lan" } else { "local" };
+            println!("{} @ {} [{tag}] (no sessions)", e.name, e.address);
         }
     }
     if !any {
         eprintln!("(no sessions)");
     }
+    Ok(())
+}
+
+/// CLI: show / set / generate the PSK used for TCP auth.
+fn cmd_psk(args: &[String]) -> io::Result<()> {
+    match args.first().map(|s| s.as_str()) {
+        None | Some("show") => {
+            let p = crate::config::effective_psk();
+            if p.is_empty() {
+                println!("(no PSK configured)");
+            } else {
+                let preview = if p.len() > 8 {
+                    format!("{}... ({} chars)", &p[..4], p.len())
+                } else {
+                    "********".to_string()
+                };
+                println!("psk: {preview}");
+                println!("tip: use `lrmux psk generate` to create a new one");
+            }
+            Ok(())
+        }
+        Some("set") => {
+            let psk = args.get(1).cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "usage: lrmux psk set <secret>")
+            })?;
+            crate::config::persist_psk(&psk)?;
+            let _ = push_psk_to_running_server(&psk);
+            println!("psk saved to {}", crate::config::config_path().display());
+            println!("remote clients: lrmux --tcp <host:port> --psk '<secret>'");
+            Ok(())
+        }
+        Some("generate") | Some("gen") => {
+            let psk = crate::config::generate_psk()?;
+            crate::config::persist_psk(&psk)?;
+            let _ = push_psk_to_running_server(&psk);
+            println!("{psk}");
+            eprintln!(
+                "lrmux: PSK saved to {}. Share this string with remote clients — do not copy config files.",
+                crate::config::config_path().display()
+            );
+            eprintln!("lrmux: ensure the server listens on TCP (network.tcp_listen or --tcp).");
+            eprintln!("lrmux: with default safe_networks=[], TLS is required for all TCP peers.");
+            Ok(())
+        }
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown psk subcommand '{other}' (show|set|generate)"),
+        )),
+    }
+}
+
+fn push_psk_to_running_server(psk: &str) -> io::Result<()> {
+    let sock = socket_path("default");
+    if !ipc::server_exists(&sock) {
+        return Ok(());
+    }
+    let mut stream = ipc::connect(&sock).map(ipc::ConnStream::Unix)?;
+    let msg = proto::encode_client(&ClientMsg::Identify {
+        rows: 24,
+        cols: 80,
+        attach: true,
+        auth_token: crate::config::effective_psk(),
+    });
+    proto::send(&mut stream, &msg)?;
+    let _ = proto::decode_server(&mut stream)?;
+    let msg = proto::encode_client(&ClientMsg::SetPsk {
+        psk: psk.to_string(),
+    });
+    proto::send(&mut stream, &msg)?;
+    let _ = proto::decode_server(&mut stream)?;
     Ok(())
 }
 
@@ -1537,6 +1666,7 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
         rows: 0,
         cols: 0,
         attach: false,
+        auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &identify)?;
     match proto::decode_server(&mut stream) {
@@ -1558,7 +1688,7 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
 /// Falls back to removing the socket file if the server can't be reached.
 fn kill_server(name: &str) -> io::Result<()> {
     // Try TCP first if --tcp is set.
-    if TCP_ADDR.lock().unwrap().is_some() {
+    if crate::ipc::tcp_addr().is_some() {
         let mut stream = connect_to_server(name)?;
         let msg = proto::encode_client(&ClientMsg::KillServer);
         proto::send(&mut stream, &msg)?;
@@ -1608,6 +1738,7 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
         rows,
         cols,
         attach: false,
+        auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &msg)?;
     // Wait for IdentifyAck.
@@ -1650,6 +1781,7 @@ fn cli_capture_window(
         rows,
         cols,
         attach: false,
+        auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
@@ -1711,6 +1843,7 @@ fn cli_send_keys(target: &cmd::Target, keys: &[u8], quiet: bool) -> io::Result<(
         rows,
         cols,
         attach: false,
+        auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
@@ -1758,6 +1891,7 @@ struct ServerInit<'a> {
 fn fork_server(
     sock: &Path,
     tcp_addr: Option<&str>,
+    ws_addr: Option<&str>,
     headless: bool,
     init: ServerInit<'_>,
 ) -> io::Result<()> {
@@ -1799,7 +1933,8 @@ fn fork_server(
         }
         let sock = sock.to_path_buf();
         let tcp = tcp_addr.map(|s| s.to_string());
-        match server::run(&sock, tcp.as_deref(), headless) {
+        let ws = ws_addr.map(|s| s.to_string());
+        match server::run(&sock, tcp.as_deref(), ws.as_deref(), headless) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("lrmux server: {e}");

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
@@ -52,6 +53,9 @@ struct ClientConn {
     suppressed: bool,
     /// Outer TTY default colors (OSC 10/11), probed by the client on attach.
     palette: super::capture::TerminalPalette,
+    /// True when connected over TCP (plain or TLS). Unix clients skip
+    /// auth_token checks (filesystem permissions are the gate).
+    is_tcp: bool,
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
@@ -66,6 +70,7 @@ const CLIENT_SUPPRESS_LOW: usize = 256 * 1024;
 impl ClientConn {
     fn new(stream: crate::ipc::ConnStream, attach: bool) -> Self {
         let fd = stream.as_raw_fd();
+        let is_tcp = stream.is_tcp();
         Self {
             stream,
             fd,
@@ -79,8 +84,14 @@ impl ClientConn {
             close_when_idle: false,
             suppressed: false,
             palette: super::capture::TerminalPalette::default(),
+            is_tcp,
         }
     }
+}
+
+/// TCP clients must present a matching auth_token when the server has one.
+fn check_tcp_auth(client: &ClientConn, token: &str) -> bool {
+    tcp_auth_ok(client.is_tcp, token)
 }
 
 /// Queue bytes for a client and flush what can be written without blocking.
@@ -137,6 +148,7 @@ pub fn run(
     listeners: Vec<crate::ipc::ConnListener>,
     socket_path: &std::path::Path,
     headless: bool,
+    discovery_sock: Option<std::net::UdpSocket>,
 ) -> io::Result<()> {
     // Capture once at startup. Probes (ListSessions) and failed first
     // handshakes must not consume / lose `new-server -- cmd` options.
@@ -199,10 +211,21 @@ pub fn run(
     // the normal graceful shutdown (SIGHUP children, save state, cleanup).
     let mut shutdown = false;
 
+    // TCP listen port for discovery Announce (0 if no TCP).
+    let announce_tcp_port: u16 = listeners
+        .iter()
+        .find_map(|l| match l {
+            crate::ipc::ConnListener::Tcp(t) => t.local_addr().ok().map(|a| a.port()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let announce_tls = crate::server::tls_server_config().is_some()
+        && !matches!(crate::server::network().tls, crate::config::TlsMode::Off);
+
     loop {
-        // Build pollfd array: listeners + all window PTY fds + all client fds.
+        // Build pollfd array: listeners + discovery + all window PTY fds + all client fds.
         let mut pty_map: Vec<(usize, usize)> = Vec::new();
-        let mut fds = Vec::with_capacity(listener_fds.len() + 64 + clients.len());
+        let mut fds = Vec::with_capacity(listener_fds.len() + 64 + clients.len() + 1);
         for &lfd in &listener_fds {
             fds.push(libc::pollfd {
                 fd: lfd,
@@ -210,6 +233,16 @@ pub fn run(
                 revents: 0,
             });
         }
+        let discovery_idx = if let Some(ref ds) = discovery_sock {
+            fds.push(libc::pollfd {
+                fd: ds.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            Some(fds.len() - 1)
+        } else {
+            None
+        };
         for (si, session) in sessions.iter().enumerate() {
             for (wi, w) in session.windows.iter().enumerate() {
                 if w.pane.is_exited() {
@@ -225,6 +258,7 @@ pub fn run(
             }
         }
         let num_pty_fds = pty_map.len();
+        let pty_base = listener_fds.len() + if discovery_idx.is_some() { 1 } else { 0 };
         for c in &clients {
             fds.push(libc::pollfd {
                 fd: c.fd,
@@ -281,13 +315,35 @@ pub fn run(
             }
         }
 
+        // Discovery UDP: respond to Discover probes with Announce.
+        if let (Some(di), Some(ds)) = (discovery_idx, discovery_sock.as_ref())
+            && fds[di].revents & libc::POLLIN != 0
+            && announce_tcp_port != 0
+        {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = ds.recv_from(&mut buf) {
+                if let Some(crate::ipc::discovery::ParsedPacket::Discover) =
+                    crate::ipc::discovery::parse_packet(&buf[..n], from)
+                {
+                    let pkt = crate::ipc::discovery::encode_announce(
+                        crate::server::server_name(),
+                        announce_tcp_port,
+                        announce_tls,
+                        crate::version::VERSION,
+                        crate::server::tls_fingerprint(),
+                    );
+                    let _ = ds.send_to(&pkt, from);
+                }
+            }
+        }
+
         // Window PTY output → grid → send only to clients viewing that window.
         // First pass: read all PTYs, collect grid updates and child exits.
         // We must NOT modify sessions/windows during this pass because
         // pty_map indices would become stale for subsequent PTYs.
         let mut pty_exits: Vec<(usize, usize, i32)> = Vec::new();
         for pty_i in 0..num_pty_fds {
-            let pf = &fds[1 + pty_i];
+            let pf = &fds[pty_base + pty_i];
             if pf.revents & libc::POLLIN != 0 {
                 let (si, wi) = pty_map[pty_i];
                 // Bounds-check against current sessions/windows (safety: a
@@ -344,7 +400,7 @@ pub fn run(
         // writes that couldn't be done in one shot (e.g., a burst of arrow keys
         // while the child is busy), keeping escape sequences intact.
         for pty_i in 0..num_pty_fds {
-            let pf = &fds[1 + pty_i];
+            let pf = &fds[pty_base + pty_i];
             if pf.revents & libc::POLLOUT != 0 {
                 let (si, wi) = pty_map[pty_i];
                 if si < sessions.len() && wi < sessions[si].windows.len() {
@@ -448,7 +504,7 @@ pub fn run(
             if client_idx >= clients.len() {
                 break;
             }
-            let pf = &fds[1 + num_pty_fds + client_idx];
+            let pf = &fds[pty_base + num_pty_fds + client_idx];
             crate::log::debug(&format!(
                 "client {} poll revents=0x{:x} fd={}",
                 client_idx, pf.revents, pf.fd
@@ -1077,7 +1133,39 @@ pub fn run(
                                             proto::encode_server(&ServerMsg::LogContent { lines });
                                         let _ = client_send(&mut clients[client_idx], &msg);
                                     }
-                                    ClientMsg::IdentifyControl { rows, cols } => {
+                                    ClientMsg::SetPsk { psk } => {
+                                        if !clients[client_idx].attach
+                                            && !clients[client_idx].is_control
+                                        {
+                                            let msg = proto::encode_server(&ServerMsg::Error {
+                                                msg: "SetPsk requires an attached client".into(),
+                                            });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        } else {
+                                            crate::server::set_runtime_psk(psk.clone());
+                                            if let Err(e) = crate::config::persist_psk(&psk) {
+                                                crate::log::warn(&format!(
+                                                    "failed to persist PSK to config: {e}"
+                                                ));
+                                            }
+                                            crate::log::info("PSK updated via SetPsk");
+                                            let msg = proto::encode_server(&ServerMsg::PskUpdated);
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
+                                    }
+                                    ClientMsg::IdentifyControl {
+                                        rows,
+                                        cols,
+                                        auth_token,
+                                    } => {
+                                        if !check_tcp_auth(&clients[client_idx], &auth_token) {
+                                            let msg = proto::encode_server(&ServerMsg::Error {
+                                                msg: "authentication failed".into(),
+                                            });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                            to_remove.push(client_idx);
+                                            break;
+                                        }
                                         // Control mode client: mark as control
                                         // and emit the initial state right away,
                                         // like real tmux -CC does after the DCS.
@@ -1787,13 +1875,19 @@ fn handshake_first_client(
     stream: crate::ipc::ConnStream,
     boot: &Bootstrap,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
-    let mut client = stream;
+    let mut client = wrap_accepted_stream(stream)?;
     // Bound the handshake read: a client that connects and stays silent
     // must not stall server startup forever.
     let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let is_tcp = client.is_tcp();
 
-    let (client_rows, client_cols) = match proto::decode_client(&mut client) {
-        Ok(ClientMsg::Identify { rows, cols, .. }) => (rows, cols),
+    let (client_rows, client_cols, auth_token) = match proto::decode_client(&mut client) {
+        Ok(ClientMsg::Identify {
+            rows,
+            cols,
+            auth_token,
+            ..
+        }) => (rows, cols, auth_token),
         Ok(ClientMsg::ListSessions) => {
             // Respond with empty session list (no sessions yet) and signal retry.
             let msg = proto::encode_server(&ServerMsg::SessionList {
@@ -1826,6 +1920,19 @@ fn handshake_first_client(
             ));
         }
     };
+
+    if !tcp_auth_ok(is_tcp, &auth_token) {
+        let _ = proto::send(
+            &mut client,
+            &proto::encode_server(&ServerMsg::Error {
+                msg: "authentication failed".into(),
+            }),
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authentication failed",
+        ));
+    }
 
     // Reserve 1 row for the status bar.
     let grid_rows = client_rows.saturating_sub(1);
@@ -1884,6 +1991,27 @@ fn handshake_first_client(
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
 
+fn wrap_accepted_stream(stream: crate::ipc::ConnStream) -> io::Result<crate::ipc::ConnStream> {
+    // Unix and WebSocket skip TCP TLS wrapping (WS is already a framed transport;
+    // put a TLS-terminating proxy in front for WSS).
+    if !matches!(stream, crate::ipc::ConnStream::Tcp(_)) {
+        return Ok(stream);
+    }
+    ipc::maybe_wrap_accepted_tcp(
+        stream,
+        crate::server::network(),
+        crate::server::tls_server_config(),
+    )
+}
+
+fn tcp_auth_ok(is_tcp: bool, token: &str) -> bool {
+    let required = crate::server::runtime_psk();
+    if required.is_empty() || !is_tcp {
+        return true;
+    }
+    token == required
+}
+
 /// Accept a new client, do the handshake, and add it to the clients list.
 /// New clients default to session 0, window 0.
 fn accept_new_client(
@@ -1894,15 +2022,27 @@ fn accept_new_client(
     clients: &mut Vec<ClientConn>,
 ) -> io::Result<()> {
     match listener.accept() {
-        Ok(mut stream) => {
+        Ok(stream) => {
+            let mut stream = match wrap_accepted_stream(stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::log::warn(&format!("TLS wrap failed on accept: {e}"));
+                    return Ok(());
+                }
+            };
             stream.set_nonblocking(false)?;
             // Bound the handshake read: a client that connects and stays
             // silent must not freeze the whole event loop.
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let is_tcp = stream.is_tcp();
 
-            let (attach, is_control) = match proto::decode_client(&mut stream) {
-                Ok(ClientMsg::Identify { attach: a, .. }) => (a, false),
-                Ok(ClientMsg::IdentifyControl { .. }) => (false, true),
+            let (attach, is_control, auth_token) = match proto::decode_client(&mut stream) {
+                Ok(ClientMsg::Identify {
+                    attach: a,
+                    auth_token,
+                    ..
+                }) => (a, false, auth_token),
+                Ok(ClientMsg::IdentifyControl { auth_token, .. }) => (false, true, auth_token),
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
                     let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
@@ -1930,6 +2070,16 @@ fn accept_new_client(
                     return Ok(());
                 }
             };
+
+            if !tcp_auth_ok(is_tcp, &auth_token) {
+                let _ = proto::send(
+                    &mut stream,
+                    &proto::encode_server(&ServerMsg::Error {
+                        msg: "authentication failed".into(),
+                    }),
+                );
+                return Ok(());
+            }
 
             // Send IdentifyAck with grid dimensions.
             let ack = proto::encode_server(&ServerMsg::IdentifyAck {
@@ -2255,7 +2405,22 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             let rows = u16::from_le_bytes([data[0], data[1]]);
             let cols = u16::from_le_bytes([data[2], data[3]]);
             let attach = data.get(4).copied().unwrap_or(1) != 0;
-            ClientMsg::Identify { rows, cols, attach }
+            let auth_token = if data.len() >= 9 {
+                let len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+                if data.len() >= 9 + len {
+                    String::from_utf8_lossy(&data[9..9 + len]).into_owned()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            ClientMsg::Identify {
+                rows,
+                cols,
+                attach,
+                auth_token,
+            }
         }
         0x02 => ClientMsg::PaneInput {
             data: data.to_vec(),
@@ -2652,7 +2817,21 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             }
             let rows = u16::from_le_bytes([data[0], data[1]]);
             let cols = u16::from_le_bytes([data[2], data[3]]);
-            ClientMsg::IdentifyControl { rows, cols }
+            let auth_token = if data.len() >= 8 {
+                let len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                if data.len() >= 8 + len {
+                    String::from_utf8_lossy(&data[8..8 + len]).into_owned()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            ClientMsg::IdentifyControl {
+                rows,
+                cols,
+                auth_token,
+            }
         }
         0x17 => {
             // ControlCommand: 4-byte length + string
@@ -2723,6 +2902,24 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 None
             };
             ClientMsg::TermPalette { fg, bg }
+        }
+        0x1b => {
+            // SetPsk: 4-byte length + string
+            if data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SetPsk needs 4-byte length",
+                ));
+            }
+            let plen = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if data.len() < 4 + plen {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SetPsk data truncated",
+                ));
+            }
+            let psk = String::from_utf8_lossy(&data[4..4 + plen]).into_owned();
+            ClientMsg::SetPsk { psk }
         }
         _ => {
             return Err(io::Error::new(
