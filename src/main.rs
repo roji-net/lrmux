@@ -219,6 +219,7 @@ fn print_help() {
          Ctrl-A c    New window\n    \
          Ctrl-A n/p  Next/prev window\n    \
          Ctrl-A Ctrl-A  Toggle last window\n    \
+         Ctrl-A a    Send Ctrl-A to pane\n    \
          Ctrl-A 0-9  Select window\n    \
          Ctrl-A C    New session\n    \
          Ctrl-A N/P  Next/prev session\n    \

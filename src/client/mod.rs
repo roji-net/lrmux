@@ -997,6 +997,10 @@ fn process_prefix(
                             passthrough.push(PREFIX);
                         }
                     }
+                    // 'a' → send literal Ctrl-A to the child (screen/byobu).
+                    b'a' => {
+                        passthrough.push(PREFIX);
+                    }
                     // 'c' → new window.
                     b'c' => {
                         send_cmd(stream, &ClientMsg::NewWindow)?;
@@ -1796,6 +1800,7 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A n / Space / Ctrl-Space", "Next window"),
         ("Ctrl-A p / Ctrl-P", "Previous window"),
         ("Ctrl-A Ctrl-A", "Toggle last focused window"),
+        ("Ctrl-A a", "Send Ctrl-A to pane"),
         ("Ctrl-A 0-9", "Select window by index"),
         ("Ctrl-A C", "New session"),
         ("Ctrl-A N", "Next session"),
