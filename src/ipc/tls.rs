@@ -130,7 +130,7 @@ fn generate_self_signed(cert_path: &Path, key_path: &Path) -> io::Result<()> {
     ])
     .map_err(|e| io::Error::other(format!("cert generation failed: {e}")))?;
     fs::write(cert_path, certified.cert.pem().as_bytes())?;
-    fs::write(key_path, certified.key_pair.serialize_pem().as_bytes())?;
+    fs::write(key_path, certified.signing_key.serialize_pem().as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
