@@ -358,8 +358,8 @@ impl CopyMode {
 
         // Render status bar with [copy] indicator.
         let row = view_rows + 1;
-        write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
-        let copy_status = format!("\x1b[44;97m[copy] \x1b[1;44;93m{}\x1b[0m", status_text);
+        write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
+        let copy_status = format!("\x1b[0;44;97m[copy] \x1b[0;1;44;93m{}\x1b[0m", status_text);
         let display: String = copy_status.chars().take(term_cols).collect();
         stdout.write_all(display.as_bytes())?;
 

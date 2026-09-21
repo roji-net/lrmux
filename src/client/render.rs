@@ -170,7 +170,11 @@ impl Renderer {
         self.prev_cursor = cursor;
         self.prev_cursor_visible = grid.cursor_visible && cursor_in_viewport;
 
+        // Leave the terminal in a clean SGR state. The last cell written may
+        // have reverse/underline set (common in AI TUI input highlights), and
+        // the status bar / other overlays must not inherit those attrs.
         if !buf.is_empty() {
+            buf.push_str("\x1b[0m");
             writer.write_all(buf.as_bytes())?;
             writer.flush()?;
         }
