@@ -149,8 +149,13 @@ impl Perform for VtHandler<'_> {
                 }
             }
 
-            // SGR - set graphic rendition
-            'm' => {
+            // SGR - set graphic rendition.
+            // Only plain CSI ... m is SGR. CSI > Ps ; Pv m is xterm's
+            // modifyOtherKeys (Pp=4); treating it as SGR makes param 4
+            // stick underline on forever — Claude/Ink enable it often,
+            // which is why whole UIs look underlined inside lrmux but not
+            // in a real terminal.
+            'm' if intermediates.is_empty() => {
                 self.grid.set_sgr(&p);
             }
 
@@ -399,5 +404,26 @@ mod tests {
         let mut parser = vte::Parser::new();
         parse_bytes(&mut parser, &mut grid, b"ello\x1b[1G\x1b[@h");
         assert_eq!(row_text(&grid, 0), "hello");
+    }
+
+    #[test]
+    fn modify_other_keys_csi_is_not_sgr_underline() {
+        // xterm CSI > 4 ; 2 m sets modifyOtherKeys — must NOT enable underline.
+        let mut grid = Grid::new(1, 20, 10);
+        let mut parser = vte::Parser::new();
+        parse_bytes(&mut parser, &mut grid, b"\x1b[>4;2mhello\x1b[>4m!");
+        assert!(!grid.attrs.underline, "pen must not stick underline");
+        let row = grid.row(0).unwrap();
+        for cell in row.iter().take(6) {
+            assert!(
+                !cell.attrs.underline,
+                "cell {:?} must not be underlined",
+                cell.ch
+            );
+        }
+        // Real SGR underline still works.
+        parse_bytes(&mut parser, &mut grid, b"\x1b[4mU\x1b[24m");
+        let u = grid.row(0).unwrap()[6].attrs.underline;
+        assert!(u, "plain CSI 4 m must still set underline");
     }
 }

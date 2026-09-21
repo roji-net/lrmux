@@ -1285,12 +1285,13 @@ fn take_network_setup_flash() -> Option<String> {
 fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
     let mut stdout = io::stdout();
     let row = term_rows;
-    // Clear the line and write the prompt.
-    write!(stdout, "\x1b[{};1H\x1b[2K", row).ok();
+    // Reset SGR before clear/write so reverse/underline from the pane
+    // cannot bleed into the prompt (same issue as the status bar).
+    write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row).ok();
     match state {
         ConfirmState::None => {}
         ConfirmState::KillWindow => {
-            write!(stdout, "\x1b[43;30m Kill current window? (y/n) \x1b[0m").ok();
+            write!(stdout, "\x1b[0;43;30m Kill current window? (y/n) \x1b[0m").ok();
         }
         ConfirmState::KillSession {
             input,
@@ -1299,7 +1300,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
         } => {
             write!(
                 stdout,
-                "\x1b[41;97m Kill session '{}' ({} window{})? Type the name to confirm: {}\x1b[0m",
+                "\x1b[0;41;97m Kill session '{}' ({} window{})? Type the name to confirm: {}\x1b[0m",
                 target,
                 window_count,
                 if *window_count == 1 { "" } else { "s" },
@@ -1310,7 +1311,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
         ConfirmState::RenameSession { input } => {
             write!(
                 stdout,
-                "\x1b[44;97m Rename session: {}\x1b[1;93m_\x1b[0m\x1b[44;97m  (Enter=confirm, Esc=cancel)\x1b[0m",
+                "\x1b[0;44;97m Rename session: {}\x1b[0;1;44;93m_\x1b[0;44;97m  (Enter=confirm, Esc=cancel)\x1b[0m",
                 input
             )
             .ok();
@@ -1319,7 +1320,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
             let has = !crate::config::effective_psk().is_empty();
             write!(
                 stdout,
-                "\x1b[44;97m Network setup: [g]enerate PSK  [s]et PSK  [q]uit{}\x1b[0m",
+                "\x1b[0;44;97m Network setup: [g]enerate PSK  [s]et PSK  [q]uit{}\x1b[0m",
                 if has { " (PSK already set)" } else { "" }
             )
             .ok();
@@ -1327,7 +1328,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
         ConfirmState::NetworkSetupSetPsk { input } => {
             write!(
                 stdout,
-                "\x1b[44;97m Enter PSK: {}\x1b[1;93m_\x1b[0m\x1b[44;97m  (Enter=save, Esc=cancel)\x1b[0m",
+                "\x1b[0;44;97m Enter PSK: {}\x1b[0;1;44;93m_\x1b[0;44;97m  (Enter=save, Esc=cancel)\x1b[0m",
                 "*".repeat(input.len())
             )
             .ok();
@@ -1346,24 +1347,27 @@ fn format_status_bar(
     server_version: &str,
     high_output: bool,
 ) -> String {
+    // Each sequence starts with `0;` so reverse/underline/italic from the
+    // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
     // Blue background + white text for inactive windows.
-    const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
+    const BAR: &str = "\x1b[0;44;97m"; // reset, bg blue, bright white
     // Active window: bold bright yellow on blue.
-    const ACTIVE: &str = "\x1b[1;44;93m"; // bold, bg blue, bright yellow
+    const ACTIVE: &str = "\x1b[0;1;44;93m"; // reset, bold, bg blue, bright yellow
     // Session name: bold bright cyan on blue.
-    const SESSION: &str = "\x1b[1;44;96m"; // bold, bg blue, bright cyan
+    const SESSION: &str = "\x1b[0;1;44;96m"; // reset, bold, bg blue, bright cyan
     const RESET: &str = "\x1b[0m";
-    const WARN: &str = "\x1b[1;44;31m"; // bold red on blue
+    const WARN: &str = "\x1b[0;1;44;31m"; // reset, bold red on blue
 
     let server_hash = server_version.rsplit('-').next().unwrap_or(server_version);
     let mismatch = server_version != version::VERSION;
     let version_marker = if mismatch {
-        format!("{WARN}!{RESET}")
+        // Restore BAR after the bang so the blue background continues.
+        format!("{WARN}!{BAR}")
     } else {
         String::new()
     };
     let burst_marker = if high_output {
-        format!("{WARN}[BURST]{RESET} ")
+        format!("{WARN}[BURST]{BAR} ")
     } else {
         String::new()
     };
@@ -1401,8 +1405,11 @@ fn render_status_bar(
 ) -> io::Result<()> {
     // Position cursor at the last row of the terminal (1-based).
     let row = term_rows;
-    // Clear the line first, then write the colored status bar.
-    write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
+    // Reset SGR *before* clear/write. The diff renderer leaves the last
+    // cell's attrs active (AI CLIs often use reverse/underline), and
+    // `\x1b[2K` / bare `\x1b[44m` would otherwise inherit them — making
+    // the footer look inverted or underlined until the next clean redraw.
+    write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
     // Write the full status bar text (it includes its own ANSI colors).
     stdout.write_all(text.as_bytes())?;
     // Measure visible width (excluding ANSI escape sequences) and pad
@@ -1411,8 +1418,8 @@ fn render_status_bar(
     let max_cols = term_cols.min(500);
     let visible_len = strip_ansi(text).chars().count();
     if visible_len < max_cols {
-        // Use the same blue background, no text attributes.
-        write!(stdout, "\x1b[44m{}", " ".repeat(max_cols - visible_len))?;
+        // Full SGR reset + blue bg (no reverse/underline/bold).
+        write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - visible_len))?;
     }
     // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
@@ -1445,7 +1452,7 @@ fn render_flash_status_bar(
     grid: &Grid,
 ) -> io::Result<()> {
     let row = term_rows;
-    write!(stdout, "\x1b[{};1H\x1b[2K", row)?;
+    write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
     let max_cols = term_cols.min(500);
 
     // Strip escape sequences from normal_text to measure visible width.
@@ -1453,9 +1460,9 @@ fn render_flash_status_bar(
     let normal_len = normal_visible.chars().count();
 
     // Flash message in bold yellow on blue, with a separator.
-    const FLASH: &str = "\x1b[1;44;93m"; // bold, bg blue, bright yellow
-    const BAR: &str = "\x1b[44;97m"; // bg blue, bright white
-    const RESET: &str = "\x1b[0m";
+    // Leading `0;` clears reverse/underline inherited from the pane.
+    const FLASH: &str = "\x1b[0;1;44;93m"; // reset, bold, bg blue, bright yellow
+    const BAR: &str = "\x1b[0;44;97m"; // reset, bg blue, bright white
 
     let flash_text = format!("{}  ⚠ {}{}", FLASH, msg, BAR);
     let flash_visible: String = strip_ansi(&flash_text);
@@ -1477,7 +1484,7 @@ fn render_flash_status_bar(
     // Pad the rest with blue background.
     let total_visible = normal_len + flash_len;
     if total_visible < max_cols {
-        write!(stdout, "\x1b[44m{}", " ".repeat(max_cols - total_visible))?;
+        write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - total_visible))?;
     }
     stdout.write_all(b"\x1b[0m")?;
 
