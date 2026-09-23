@@ -5,7 +5,13 @@ mod pane;
 mod session;
 mod window;
 
-pub fn run() {
-    // Phase 3+: fork server, bind socket, run event loop.
-    todo!("server::run");
+use std::io;
+use std::path::Path;
+
+use crate::ipc;
+
+/// Start the server: bind the socket, run the event loop.
+pub fn run(socket_path: &Path) -> io::Result<()> {
+    let listener = ipc::listen(socket_path)?;
+    event_loop::run(listener, socket_path)
 }

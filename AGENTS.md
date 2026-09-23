@@ -43,6 +43,16 @@ Module layout (per §5.7 of the design doc):
 ## Known issues (Phase 2)
 
 - **Cursor jump on Enter (cosmetic)**: When pressing Enter in zsh, the cursor briefly appears to jump to the end of the line before settling at the new prompt position. This is because the diff renderer writes changed cells sequentially (cursor follows along) and then repositions. The cursor-hide/show around render helps but doesn't fully eliminate the effect. Potential fixes to explore later: (a) batch all cursor movements and only emit one final positioning, (b) track the grid cursor more aggressively so the renderer knows the final position before writing, (c) skip repositioning when the cursor is already at the right spot after sequential writes.
-- **No unit tests yet**: `cargo test` reports 0 tests. Need tests for grid printing/wrapping, scrollback ring, SGR parsing, renderer output.
+- **No unit tests yet**: `cargo test` reports 0 tests. Need tests for grid printing/wrapping, scrollback ring, SGR parsing, renderer output, protocol encode/decode.
 - **CSI private mode handling**: The VT parser checks `intermediates.contains(b'?')` but in `vte` the private marker may be in the parameter structure, not intermediates. Needs validation.
 - **No SIGWINCH handling**: Terminal resize is not propagated to the PTY or grid at runtime.
+
+## Phase 3 status
+
+- **Server/client split implemented**: The binary forks a server process (child) on first use, then connects as a client over a Unix socket at `/tmp/lrmux-<UID>/default`.
+- **Protocol**: Length-prefixed binary messages (4-byte LE u32 length + 1-byte type + payload). Client→Server: Identify, PaneInput, Resize, Detach. Server→Client: IdentifyAck, GridSnapshot, GridUpdate, PaneExit, Error.
+- **Architecture**: Server owns PTY + grid + VT parser. After each PTY read, sends dirty rows + cursor to client. Client maintains its own grid copy, applies updates, and renders locally using the diff-based renderer.
+- **Single session/window/pane**: Phase 3 proves the architecture with one session, one window, one pane. Multi-pane/multi-window is deferred.
+- **Server lifecycle**: Server exits when the client disconnects or the child process exits. Socket file is cleaned up on exit.
+- **No reconnect yet**: If the client disconnects, the server exits. Reconnect to a persistent server is deferred.
+- **No SIGWINCH yet**: Resize messages are handled in the protocol but not triggered by signal handling.
