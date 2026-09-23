@@ -88,7 +88,8 @@ All network features are **off by default**. Configure `~/.config/lrmux/config.t
 
 ```toml
 [network]
-tcp_listen = "0.0.0.0:17280"   # empty = no TCP listener
+tcp_listen = "auto"             # empty = no TCP. "auto" = 0.0.0.0, first free port from 17280
+                               # "0.0.0.0:17280+" is the same; "0.0.0.0:17280" binds that port only
 ws_listen = "127.0.0.1:17282"  # empty = no WebSocket listener (browser client)
 discovery = true                 # optional; also auto-enabled when TCP/WS is on
 discovery_port = 17280

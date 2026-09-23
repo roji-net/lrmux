@@ -120,7 +120,9 @@ impl<'de> Deserialize<'de> for TlsMode {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkConfig {
-    /// TCP listen address, e.g. "0.0.0.0:17280". Empty = no TCP listener.
+    /// TCP listen address. Empty = no TCP listener.
+    /// `"auto"` or `"0.0.0.0:17280+"` binds the first free port from 17280.
+    /// `"0.0.0.0:17280"` binds that port only.
     #[serde(default)]
     pub tcp_listen: String,
     /// Respond to UDP discovery probes.

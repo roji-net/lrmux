@@ -142,10 +142,16 @@ pub fn run(
 
     // Build the listeners list (Unix + optional TCP + optional WebSocket).
     let mut listeners: Vec<ipc::ConnListener> = vec![ipc::ConnListener::Unix(unix_listener)];
+    let mut tcp_bound: Option<String> = None;
     if let Some(ref addr) = tcp {
         let tcp_listener = ipc::listen_tcp(addr)?;
-        log::info(&format!("server also listening on TCP {addr}"));
-        eprintln!("lrmux: server listening on TCP {addr}");
+        let bound = tcp_listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| addr.clone());
+        log::info(&format!("server also listening on TCP {bound}"));
+        eprintln!("lrmux: server listening on TCP {bound}");
+        tcp_bound = Some(bound);
         listeners.push(ipc::ConnListener::Tcp(tcp_listener));
     }
 
@@ -187,10 +193,8 @@ pub fn run(
         .and_then(|n| n.to_str())
         .unwrap_or("default");
     let _ = SERVER_NAME.set(server_name.to_string());
-    let _ = SERVER_ADDRESS.set(
-        tcp.clone()
-            .unwrap_or_else(|| socket_path.to_string_lossy().into_owned()),
-    );
+    let _ =
+        SERVER_ADDRESS.set(tcp_bound.unwrap_or_else(|| socket_path.to_string_lossy().into_owned()));
     let syslog = std::env::var("LRMUX_SYSLOG").ok().and_then(|s| {
         let parts: Vec<&str> = s.rsplitn(2, ':').collect();
         if parts.len() == 2 {
