@@ -19,9 +19,11 @@ pub enum SelectorResult {
         tcp: Option<String>,
     },
     /// Create a new session on a server (optionally named).
+    /// `tcp` is set for a LAN server; the caller must not fork a local one.
     NewSession {
         server: String,
         name: Option<String>,
+        tcp: Option<String>,
     },
     /// Create a new server + session.
     NewServer { name: String },
@@ -37,10 +39,16 @@ struct Entry {
     /// When set, connect via this TCP address instead of a local Unix socket.
     tcp: Option<String>,
     lan: bool,
+    /// ListSessions failed. Enter reports this and stays in the selector.
+    unreachable: Option<String>,
 }
 
 impl Entry {
     fn display(&self) -> String {
+        if let Some(err) = &self.unreachable {
+            let addr = self.tcp.as_deref().unwrap_or("?");
+            return format!("{}@{} [lan] unreachable: {err}", self.server, addr);
+        }
         if self.lan {
             match &self.tcp {
                 Some(addr) => format!("{}@{}/{} [lan]", self.server, addr, self.session),
@@ -70,13 +78,18 @@ fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
         push_server_entries(&mut entries, s);
     }
 
-    // Fast path: exactly one server with one session → auto-join.
+    // Fast path: exactly one reachable session → auto-join.
+    // "(no sessions)" is not a session name, and an unreachable LAN row
+    // must not attach (or spawn anything) on its own.
     if !force && entries.len() == 1 {
-        return Ok(SelectorResult::Attach {
-            server: entries[0].server.clone(),
-            session: entries[0].session.clone(),
-            tcp: entries[0].tcp.clone(),
-        });
+        let e = &entries[0];
+        if e.unreachable.is_none() && e.session != "(no sessions)" {
+            return Ok(SelectorResult::Attach {
+                server: e.server.clone(),
+                session: e.session.clone(),
+                tcp: e.tcp.clone(),
+            });
+        }
     }
 
     // No servers running:
@@ -97,6 +110,16 @@ fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
 fn push_server_entries(entries: &mut Vec<Entry>, s: &ServerEntry) {
     let tcp = s.tcp_addr().map(|a| a.to_string());
     let lan = s.is_lan();
+    if let Some(err) = &s.probe_error {
+        entries.push(Entry {
+            server: s.name.clone(),
+            session: "(unreachable)".to_string(),
+            tcp,
+            lan,
+            unreachable: Some(err.clone()),
+        });
+        return;
+    }
     if s.sessions.is_empty() {
         // Still show the server so the user can create a session on it.
         entries.push(Entry {
@@ -104,6 +127,7 @@ fn push_server_entries(entries: &mut Vec<Entry>, s: &ServerEntry) {
             session: "(no sessions)".to_string(),
             tcp,
             lan,
+            unreachable: None,
         });
         return;
     }
@@ -113,6 +137,7 @@ fn push_server_entries(entries: &mut Vec<Entry>, s: &ServerEntry) {
             session: session.clone(),
             tcp: tcp.clone(),
             lan,
+            unreachable: None,
         });
     }
 }
@@ -191,6 +216,7 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
 
     let mut selected: usize = 0;
     let mut query: String = String::new();
+    let mut flash: Option<String> = None;
 
     let filtered = |q: &str| -> Vec<usize> {
         if q.is_empty() {
@@ -221,6 +247,9 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             }
         }
         write!(stdout, "\x1b[90m──────────────────────────────\x1b[0m\r\n")?;
+        if let Some(msg) = &flash {
+            write!(stdout, "\x1b[31m{msg}\x1b[0m\r\n")?;
+        }
         write!(
             stdout,
             "\x1b[90mEnter=join  n=new session  N=new server  q=quit\x1b[0m\r\n"
@@ -239,10 +268,16 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             b'\r' | b'\n' => {
                 if let Some(&idx) = filt.get(selected) {
                     let e = &entries[idx];
+                    if let Some(err) = &e.unreachable {
+                        let addr = e.tcp.as_deref().unwrap_or("?");
+                        flash = Some(format!("cannot reach {} @ {addr}: {err}", e.server));
+                        continue;
+                    }
                     if e.session == "(no sessions)" {
                         return Ok(SelectorResult::NewSession {
                             server: e.server.clone(),
                             name: None,
+                            tcp: e.tcp.clone(),
                         });
                     }
                     return Ok(SelectorResult::Attach {
@@ -272,12 +307,17 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             b'j' if selected + 1 < filt.len() => selected += 1,
             b'k' => selected = selected.saturating_sub(1),
             b'n' => {
-                let server = filt
+                let (server, tcp) = filt
                     .get(selected)
-                    .map(|&i| entries[i].server.clone())
-                    .unwrap_or_else(|| "default".to_string());
-                // LAN entries need TCP; new session on LAN not supported from
-                // selector scaffolding yet — fall back to local name.
+                    .map(|&i| (entries[i].server.clone(), entries[i].tcp.clone()))
+                    .unwrap_or_else(|| ("default".to_string(), None));
+                if let Some(err) = filt
+                    .get(selected)
+                    .and_then(|&i| entries[i].unreachable.clone())
+                {
+                    flash = Some(format!("cannot reach {server}: {err}"));
+                    continue;
+                }
                 let default_name = default_session_name();
                 if let Some((name, _)) = name_prompt(
                     "lrmux — new session",
@@ -289,6 +329,7 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
                     return Ok(SelectorResult::NewSession {
                         server,
                         name: Some(name),
+                        tcp,
                     });
                 }
             }

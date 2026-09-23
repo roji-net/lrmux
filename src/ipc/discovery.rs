@@ -135,8 +135,80 @@ pub enum ParsedPacket {
 }
 
 /// Bind a UDP socket for discovery replies (server side).
+///
+/// Several servers on one host share the discovery port. `SO_REUSEADDR`
+/// (and `SO_REUSEPORT` on BSD/macOS) is set before bind so the second
+/// process is not refused. Broadcast probes are delivered to every socket.
 pub fn bind_server(port: u16) -> io::Result<UdpSocket> {
-    let sock = UdpSocket::bind(("0.0.0.0", port))?;
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let yes: libc::c_int = 1;
+    let yes_len = std::mem::size_of_val(&yes) as libc::socklen_t;
+    // Safety: `fd` is a freshly created datagram socket. On failure it is closed.
+    let set = |opt| unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &yes as *const _ as *const libc::c_void,
+            yes_len,
+        )
+    };
+    if set(libc::SO_REUSEADDR) < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    // macOS/BSD refuse a second live bind of the same UDP port without
+    // SO_REUSEPORT, and deliver broadcast probes to every such socket.
+    // On Linux that option load-balances, so a broadcast would reach only
+    // one server; SO_REUSEADDR already fans broadcasts out there.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    if set(libc::SO_REUSEPORT) < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = port.to_be();
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from(Ipv4Addr::UNSPECIFIED).to_be(),
+    };
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    }
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if bound < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    // Safety: `fd` is a bound datagram socket and is not used again after this move.
+    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
     sock.set_nonblocking(true)?;
     sock.set_broadcast(true)?;
     Ok(sock)
@@ -176,4 +248,20 @@ pub fn discover(port: u16, timeout: Duration) -> io::Result<Vec<Announcement>> {
         }
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_discovery_sockets_can_bind_the_same_port() {
+        let first = bind_server(0).expect("bind ephemeral");
+        let port = first.local_addr().expect("local addr").port();
+        let second = bind_server(port);
+        assert!(
+            second.is_ok(),
+            "second discovery bind on {port} failed: {second:?}"
+        );
+    }
 }

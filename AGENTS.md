@@ -72,7 +72,7 @@ Module layout (per §5.7 of the design doc):
 - **Viewport model**: Canonical grid size set by the first client. SIGWINCH does NOT resize panes — the client renders a viewport (crop if smaller, filler if larger). `Ctrl-A F` sends an explicit canonical resize to the server. Filler region uses dim background with thin border lines.
 - **Server lifecycle**: Server persists until all sessions are closed. Last window in a session removes the session. Last session shuts down the server.
 - **Concurrent clients**: Multiple clients can connect to the same server simultaneously.
-- **CLI commands**: `lrmux` (default: selector or auto-join), `lrmux new-session [name]`, `lrmux new-server [name]`, `lrmux ls-servers`, `lrmux ls-sessions [server]`, `lrmux kill-server [name]`.
+- **CLI commands**: `lrmux` (default: selector or auto-join), `lrmux <command> --help` for that command. `lrmux new-session [--headless]`, `lrmux new-server [-s name] [--tcp addr] [--headless]` (attaches unless `--headless`), `lrmux attach [host:port]`, `lrmux ls`, `lrmux list-servers`, `lrmux kill-server`, `lrmux -v`. `attach-session` is an alias of `attach`. `start-server` is an alias of `new-server --headless`. A `host:port` target connects over TCP instead of a local Unix socket.
 - **Server discovery**: Scans `/tmp/lrmux-<UID>/` for socket files and probes each to find running servers.
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
 - **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.

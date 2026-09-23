@@ -31,6 +31,8 @@ pub struct ServerEntry {
     pub sessions: Vec<String>,
     /// Primary address for display (Unix path or `host:port`).
     pub address: String,
+    /// Set when the server answered discovery but ListSessions failed.
+    pub probe_error: Option<String>,
 }
 
 impl ServerEntry {
@@ -95,6 +97,7 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
                         source: ServerSource::Local,
                         sessions,
                         address,
+                        probe_error: None,
                     });
                 }
                 Err(e) => {
@@ -130,10 +133,13 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
                             },
                             sessions,
                             address,
+                            probe_error: None,
                         });
                     }
                     Err(e) => {
                         // Still list the announcement so the user sees it.
+                        // The selector must not treat this as "no sessions"
+                        // and fork a local server.
                         eprintln!(
                             "lrmux: lan server '{}' @ {} listed but ListSessions failed ({e})",
                             ann.name, tcp
@@ -148,6 +154,7 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
                             },
                             sessions: vec![],
                             address: tcp,
+                            probe_error: Some(e.to_string()),
                         });
                     }
                 }

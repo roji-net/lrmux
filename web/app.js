@@ -253,8 +253,12 @@ function handleServerPayload(tag, data) {
     }
     const active = readU16(view, o); o = active.o;
     const scount = readU16(view, o); o = scount.o;
+    if (o < data.length) o += 1; // high_output
+    let server = "";
+    if (o + 4 <= data.length) server = readString(data, view, o).v;
     const parts = windows.map((w, i) => (i === active.v ? `*${w}` : w));
-    statusBarEl.textContent = `${session.v} [${scount.v}] ${parts.join(" ")}`;
+    const label = server ? `[${session.v}]@${server}` : session.v;
+    statusBarEl.textContent = `${label} [${scount.v}] ${parts.join(" ")}`;
     return;
   }
   if (tag === S_ERROR) {

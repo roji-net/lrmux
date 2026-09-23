@@ -161,6 +161,8 @@ pub enum ServerMsg {
         active: u16,
         session_count: u16,
         high_output: bool,
+        /// Server name. Empty on messages from an older server.
+        server: String,
     },
     /// List of session names + server address (response to ListSessions).
     SessionList {
@@ -554,6 +556,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             active,
             session_count,
             high_output,
+            server,
         } => {
             payload.push(S_STATUS_BAR);
             payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
@@ -566,6 +569,8 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&active.to_le_bytes());
             payload.extend_from_slice(&session_count.to_le_bytes());
             payload.push(*high_output as u8);
+            payload.extend_from_slice(&(server.len() as u32).to_le_bytes());
+            payload.extend_from_slice(server.as_bytes());
         }
         ServerMsg::SessionList { sessions, address } => {
             payload.push(S_SESSION_LIST);
@@ -1063,12 +1068,18 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let active = read_u16(&mut r)?;
             let session_count = read_u16(&mut r)?;
             let high_output = !r.is_empty() && r[0] != 0;
+            if !r.is_empty() {
+                r = &r[1..];
+            }
+            // Optional: older servers stop after `high_output`.
+            let server = read_optional_string(&mut r)?;
             Ok(ServerMsg::StatusBarUpdate {
                 session,
                 windows,
                 active,
                 session_count,
                 high_output,
+                server,
             })
         }
         S_SESSION_LIST => {
@@ -1233,4 +1244,31 @@ pub fn send<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.write_all(bytes)?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_bar_roundtrip_includes_server_name() {
+        let msg = ServerMsg::StatusBarUpdate {
+            session: "lrmux".into(),
+            windows: vec!["zsh".into()],
+            active: 0,
+            session_count: 1,
+            high_output: false,
+            server: "infra".into(),
+        };
+        let bytes = encode_server(&msg);
+        match decode_server(&mut &bytes[..]).unwrap() {
+            ServerMsg::StatusBarUpdate {
+                session, server, ..
+            } => {
+                assert_eq!(session, "lrmux");
+                assert_eq!(server, "infra");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
