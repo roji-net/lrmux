@@ -13,6 +13,7 @@ use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
 use crate::pty;
 use crate::server::session::Session;
+use crate::server::state;
 use crate::server::window::Window;
 
 /// A connected client.
@@ -54,8 +55,8 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             Ok(result) => break result,
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                 // KillServer received during initial handshake — shut down.
+                crate::log::info("KillServer during initial handshake, shutting down");
                 ipc::cleanup(socket_path);
-                eprintln!("lrmux: server stopped (killed before first client).");
                 return Ok(());
             }
             Err(e) => {
@@ -70,6 +71,9 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
     // Set listener to non-blocking so we can poll it alongside clients.
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
+
+    // Periodic state save counter (save every ~1000 iterations ≈ 10s).
+    let mut iter_count: u32 = 0;
 
     loop {
         // Build pollfd array: listener + all window PTY fds (across all sessions) + all client fds.
@@ -121,12 +125,14 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                     // KillServer received — shut down gracefully.
+                    crate::log::info("KillServer received, shutting down");
+                    kill_all_children(&sessions);
+                    state::save_state(socket_path, &sessions);
                     broadcast_to_all(
                         &mut clients,
                         &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
                     );
                     ipc::cleanup(socket_path);
-                    eprintln!("lrmux: server stopped.");
                     return Ok(());
                 }
                 Err(_) => {}
@@ -134,10 +140,20 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         }
 
         // Window PTY output → grid → send only to clients viewing that window.
+        // First pass: read all PTYs, collect grid updates and child exits.
+        // We must NOT modify sessions/windows during this pass because
+        // pty_map indices would become stale for subsequent PTYs.
+        let mut pty_exits: Vec<(usize, usize, i32)> = Vec::new();
         for pty_i in 0..num_pty_fds {
             let pf = &fds[1 + pty_i];
             if pf.revents & libc::POLLIN != 0 {
                 let (si, wi) = pty_map[pty_i];
+                // Bounds-check against current sessions/windows (safety: a
+                // previous exit in this same poll iteration may have removed
+                // a session/window, making this index stale).
+                if si >= sessions.len() || wi >= sessions[si].windows.len() {
+                    continue;
+                }
                 let session = &mut sessions[si];
                 let pane = &mut session.windows[wi].pane;
                 match pane.process_pty_output() {
@@ -145,69 +161,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                     }
                     Ok(false) => {
-                        // Child exited (PTY read returned 0 or EIO).
-                        // Reap the child and get the exit code.
+                        // Child exited — reap and defer the removal.
                         let exit_code = pane.reap_child().unwrap_or(0);
-                        // Treat 0 and 130 (128+SIGINT, common when exiting shells
-                        // with Ctrl-D after a Ctrl-C) and -2 (direct SIGINT signal)
-                        // as success — auto-close the window.
-                        if exit_code == 0 || exit_code == 130 || exit_code == -2 {
-                            // Exit code 0: auto-close the window.
-                            session.windows.remove(wi);
-                            if session.windows.is_empty() {
-                                // Last window in this session closed — remove the session.
-                                eprintln!(
-                                    "lrmux: last window in session '{}' closed, removing session.",
-                                    session.name
-                                );
-                                sessions.remove(si);
-                                if sessions.is_empty() {
-                                    // Last session closed — shut down the server.
-                                    eprintln!("lrmux: last session closed, shutting down server.");
-                                    broadcast_to_all(
-                                        &mut clients,
-                                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
-                                    );
-                                    ipc::cleanup(socket_path);
-                                    eprintln!("lrmux: server stopped.");
-                                    return Ok(());
-                                }
-                                // Fix up all clients' session indices.
-                                for c in &mut clients {
-                                    if c.session_idx == si {
-                                        // Client was in the removed session — move to session 0.
-                                        c.session_idx = 0;
-                                        c.active_window = 0;
-                                    } else if c.session_idx > si {
-                                        c.session_idx -= 1;
-                                    }
-                                }
-                                // All clients need a snapshot + status bar (their view changed).
-                                let _ = send_all_snapshots(&mut clients, &sessions);
-                                broadcast_status_bar(&mut clients, &sessions);
-                            } else {
-                                // Fix up all clients' active_window indices in this session.
-                                for c in &mut clients {
-                                    if c.session_idx == si {
-                                        if c.active_window == wi {
-                                            c.active_window = wi.min(session.windows.len() - 1);
-                                        } else if c.active_window > wi {
-                                            c.active_window -= 1;
-                                        }
-                                    }
-                                }
-                                // Send snapshots to affected clients + status bar to all.
-                                let _ = send_all_snapshots(&mut clients, &sessions);
-                                broadcast_status_bar(&mut clients, &sessions);
-                            }
-                        } else {
-                            // Exit code ≠ 0: keep the pane open with an exit message.
-                            // The user can read the output and close manually with Prefix x.
-                            pane.write_exit_message(exit_code);
-                            let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
-                        }
+                        pty_exits.push((si, wi, exit_code));
                     }
                     Err(e) => {
+                        crate::log::error(&format!("pty read error: {e}"));
                         broadcast_to_all(
                             &mut clients,
                             &proto::encode_server(&ServerMsg::Error {
@@ -216,6 +175,82 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                         );
                     }
                 }
+            }
+        }
+
+        // Second pass: process child exits.
+        // Sort in reverse order (highest si first, then highest wi) so removals
+        // don't invalidate lower indices.
+        pty_exits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        for (si, wi, exit_code) in pty_exits {
+            // Bounds-check again (a previous removal in this loop may have shifted indices).
+            if si >= sessions.len() {
+                continue;
+            }
+            let session = &mut sessions[si];
+            if wi >= session.windows.len() {
+                continue;
+            }
+            let session_name = session.name.clone();
+            crate::log::info(&format!(
+                "child exited in session '{session_name}' window {wi}: code {exit_code}"
+            ));
+            // Treat 0 and 130 (128+SIGINT, common when exiting shells
+            // with Ctrl-D after a Ctrl-C) and -2 (direct SIGINT signal)
+            // as success — auto-close the window.
+            if exit_code == 0 || exit_code == 130 || exit_code == -2 {
+                // Exit code 0: auto-close the window.
+                session.windows.remove(wi);
+                if session.windows.is_empty() {
+                    // Last window in this session closed — remove the session.
+                    crate::log::info(&format!(
+                        "last window in session '{session_name}' closed, removing session"
+                    ));
+                    sessions.remove(si);
+                    if sessions.is_empty() {
+                        // Last session closed — shut down the server.
+                        crate::log::info("last session closed, shutting down server");
+                        broadcast_to_all(
+                            &mut clients,
+                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        );
+                        ipc::cleanup(socket_path);
+                        return Ok(());
+                    }
+                    // Fix up all clients' session indices.
+                    for c in &mut clients {
+                        if c.session_idx == si {
+                            // Client was in the removed session — move to session 0.
+                            c.session_idx = 0;
+                            c.active_window = 0;
+                        } else if c.session_idx > si {
+                            c.session_idx -= 1;
+                        }
+                    }
+                    // All clients need a snapshot + status bar (their view changed).
+                    let _ = send_all_snapshots(&mut clients, &sessions);
+                    broadcast_status_bar(&mut clients, &sessions);
+                } else {
+                    // Fix up all clients' active_window indices in this session.
+                    for c in &mut clients {
+                        if c.session_idx == si {
+                            if c.active_window == wi {
+                                c.active_window = wi.min(session.windows.len() - 1);
+                            } else if c.active_window > wi {
+                                c.active_window -= 1;
+                            }
+                        }
+                    }
+                    // Send snapshots to affected clients + status bar to all.
+                    let _ = send_all_snapshots(&mut clients, &sessions);
+                    broadcast_status_bar(&mut clients, &sessions);
+                }
+            } else {
+                // Exit code ≠ 0: keep the pane open with an exit message.
+                // The user can read the output and close manually with Prefix x.
+                let pane = &mut sessions[si].windows[wi].pane;
+                pane.write_exit_message(exit_code);
+                let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
             }
         }
 
@@ -313,8 +348,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                                 ),
                                             };
                                             sessions[si].windows.push(win);
-                                            clients[client_idx].active_window =
-                                                sessions[si].windows.len() - 1;
+                                            let new_wi = sessions[si].windows.len() - 1;
+                                            let sname = sessions[si].name.clone();
+                                            crate::log::info(&format!(
+                                                "new window {new_wi} in session '{sname}'"
+                                            ));
+                                            clients[client_idx].active_window = new_wi;
                                             if !need_snapshot.contains(&client_idx) {
                                                 need_snapshot.push(client_idx);
                                             }
@@ -362,6 +401,13 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             continue;
                                         }
                                         let session = &mut sessions[si];
+                                        if wi >= session.windows.len() {
+                                            continue;
+                                        }
+                                        let session_name = session.name.clone();
+                                        crate::log::info(&format!(
+                                            "kill pane: session '{session_name}' window {wi}"
+                                        ));
                                         if session.windows.len() > 1 {
                                             session.windows.remove(wi);
                                             // Fix up all clients' active_window in this session.
@@ -383,14 +429,13 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         } else {
                                             // Last window in this session — remove the session.
-                                            eprintln!(
-                                                "lrmux: last window in session '{}' killed, removing session.",
-                                                session.name
-                                            );
+                                            crate::log::info(&format!(
+                                                "last window in session '{session_name}' killed, removing session"
+                                            ));
                                             sessions.remove(si);
                                             if sessions.is_empty() {
-                                                eprintln!(
-                                                    "lrmux: last session closed, shutting down server."
+                                                crate::log::info(
+                                                    "last session closed, shutting down server",
                                                 );
                                                 broadcast_to_all(
                                                     &mut clients,
@@ -399,7 +444,6 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                                     }),
                                                 );
                                                 ipc::cleanup(socket_path);
-                                                eprintln!("lrmux: server stopped.");
                                                 return Ok(());
                                             }
                                             // Fix up all clients' session indices.
@@ -419,23 +463,26 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::NewSession { name } => {
-                                        // Use the CWD of the active window's child process
-                                        // as the default session name and working directory.
+                                    ClientMsg::NewSession { name, cwd } => {
+                                        // Use the CWD from the client message if provided
+                                        // (e.g. from `lrmux new-session` CLI). Otherwise,
+                                        // fall back to the CWD of the active window's child.
                                         let si = clients[client_idx].session_idx;
                                         let wi = clients[client_idx].active_window;
-                                        let cwd_full = if si < sessions.len()
-                                            && wi < sessions[si].windows.len()
-                                        {
-                                            let pane = &sessions[si].windows[wi].pane;
-                                            if !pane.exited {
-                                                pty::child_cwd_full(pane.pty.child_pid)
+                                        let cwd_full = cwd.or_else(|| {
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                            {
+                                                let pane = &sessions[si].windows[wi].pane;
+                                                if !pane.exited {
+                                                    pty::child_cwd_full(pane.pty.child_pid)
+                                                } else {
+                                                    None
+                                                }
                                             } else {
                                                 None
                                             }
-                                        } else {
-                                            None
-                                        };
+                                        });
                                         let session_name =
                                             name.unwrap_or_else(|| match &cwd_full {
                                                 Some(cwd) => {
@@ -460,6 +507,10 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         };
                                         sessions.push(session);
                                         let new_si = sessions.len() - 1;
+                                        let new_name = sessions[new_si].name.clone();
+                                        crate::log::info(&format!(
+                                            "new session '{new_name}' created (index {new_si})"
+                                        ));
                                         clients[client_idx].session_idx = new_si;
                                         clients[client_idx].active_window = 0;
                                         if !need_snapshot.contains(&client_idx) {
@@ -509,15 +560,15 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             continue;
                                         }
                                         let name = sessions[si].name.clone();
-                                        eprintln!(
-                                            "lrmux: session '{}' killed by client, removing.",
-                                            name
-                                        );
+                                        crate::log::info(&format!(
+                                            "session '{name}' killed by client, removing"
+                                        ));
                                         sessions.remove(si);
                                         if sessions.is_empty() {
-                                            eprintln!(
-                                                "lrmux: last session closed, shutting down server."
+                                            crate::log::info(
+                                                "last session closed, shutting down server",
                                             );
+                                            kill_all_children(&sessions);
                                             broadcast_to_all(
                                                 &mut clients,
                                                 &proto::encode_server(&ServerMsg::PaneExit {
@@ -525,7 +576,6 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                                 }),
                                             );
                                             ipc::cleanup(socket_path);
-                                            eprintln!("lrmux: server stopped.");
                                             return Ok(());
                                         }
                                         // Fix up all clients' session indices.
@@ -670,6 +720,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             }
                                         }
                                     }
+                                    ClientMsg::GetLog => {
+                                        let lines = crate::log::get_ring_log();
+                                        let msg =
+                                            proto::encode_server(&ServerMsg::LogContent { lines });
+                                        let _ = proto::send(&mut clients[client_idx].stream, &msg);
+                                    }
                                 }
                             }
                             Ok(None) => break,
@@ -721,6 +777,10 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         // Remove disconnected clients (in reverse order to preserve indices).
         for &idx in to_remove.iter().rev() {
             if idx < clients.len() {
+                crate::log::info(&format!(
+                    "client {idx} disconnected, {} remaining",
+                    clients.len() - 1
+                ));
                 clients.remove(idx);
             }
         }
@@ -729,12 +789,37 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         if sessions.is_empty() && clients.is_empty() {
             break;
         }
+
+        // Periodic state save (every ~1000 iterations ≈ 10s).
+        iter_count = iter_count.wrapping_add(1);
+        if iter_count.is_multiple_of(1000) && !sessions.is_empty() {
+            state::save_state(socket_path, &sessions);
+        }
     }
 
-    eprintln!("lrmux: no sessions and no clients remaining, server exiting.");
+    crate::log::info("no sessions and no clients remaining, server exiting");
+    // Send SIGHUP to all remaining child processes before cleanup.
+    kill_all_children(&sessions);
+    state::save_state(socket_path, &sessions);
     ipc::cleanup(socket_path);
-    eprintln!("lrmux: server stopped.");
     Ok(())
+}
+
+/// Send SIGHUP to all living child processes across all sessions.
+/// This ensures children (shells, AI CLIs, etc.) are notified when the
+/// server is shutting down, rather than being orphaned silently.
+fn kill_all_children(sessions: &[Session]) {
+    for session in sessions {
+        for w in &session.windows {
+            if !w.pane.exited {
+                crate::log::info(&format!(
+                    "SIGHUP child pid {} in session '{}' window",
+                    w.pane.pty.child_pid, session.name
+                ));
+                crate::pty::kill_child(w.pane.pty.child_pid, libc::SIGHUP);
+            }
+        }
+    }
 }
 
 /// Default name for a new window.
@@ -984,7 +1069,7 @@ fn accept_new_client(
                     return Ok(());
                 }
                 Ok(ClientMsg::KillServer) => {
-                    eprintln!("lrmux: KillServer received, shutting down.");
+                    crate::log::info("KillServer received, shutting down");
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "KillServer",
@@ -1045,6 +1130,10 @@ fn accept_new_client(
             let mut conn = ClientConn::new(stream);
             conn.session_idx = session_idx;
             conn.active_window = active;
+            crate::log::info(&format!(
+                "client connected: session_idx={session_idx}, window={active}, total clients={}",
+                clients.len() + 1
+            ));
             clients.push(conn);
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -1196,7 +1285,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x09 => ClientMsg::KillPane,
         0x0a => {
-            // NewSession: 1 byte flag (0 = no name, 1 = has name) + optional name
+            // NewSession: name flag + optional name, then cwd flag + optional cwd
             if data.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1204,25 +1293,53 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 ));
             }
             let has_name = data[0];
-            if has_name != 0 {
-                if data.len() < 5 {
+            let mut pos = 1;
+            let name = if has_name != 0 {
+                if data.len() < pos + 4 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "NewSession name needs 4-byte length",
                     ));
                 }
-                let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-                if data.len() < 5 + len {
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                pos += 4;
+                if data.len() < pos + len {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "NewSession name truncated",
                     ));
                 }
-                let name = String::from_utf8_lossy(&data[5..5 + len]).into_owned();
-                ClientMsg::NewSession { name: Some(name) }
+                let n = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+                pos += len;
+                Some(n)
             } else {
-                ClientMsg::NewSession { name: None }
-            }
+                None
+            };
+            let cwd = if pos < data.len() && data[pos] != 0 {
+                pos += 1;
+                if data.len() < pos + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession cwd needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                pos += 4;
+                if data.len() < pos + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession cwd truncated",
+                    ));
+                }
+                Some(String::from_utf8_lossy(&data[pos..pos + len]).into_owned())
+            } else {
+                None
+            };
+            ClientMsg::NewSession { name, cwd }
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
@@ -1448,6 +1565,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 keys,
             }
         }
+        0x15 => ClientMsg::GetLog,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -77,3 +77,13 @@ Module layout (per §5.7 of the design doc):
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
 - **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.
 - **Not yet implemented**: Pane splits, layout engine, window auto-renumber (already works via Vec), search in copy mode, TOML config loading, F-key shortcuts.
+
+## Crash recovery and state persistence
+
+- **State file**: `/tmp/lrmux-<UID>/logs/<server-name>.state` — saved every ~10s and on shutdown. Contains session names, window names, child PIDs, CWDs, and process status.
+- **Crash detection**: On startup, if a state file exists, the previous server crashed. lrmux logs a warning and prints the previous state to stderr.
+- **Clean shutdown**: On graceful shutdown (all sessions closed, KillServer), the state file is removed. On error/panic shutdown, the state file is kept for crash analysis.
+- **Panic handling**: The event loop is wrapped in `catch_unwind`. If the event loop panics, the panic is logged, state is saved, and the server exits with an error message instead of crashing silently.
+- **SIGHUP on shutdown**: All living child processes receive SIGHUP before the server exits, so they can clean up instead of being orphaned.
+- **Logging**: File log at `/tmp/lrmux-<UID>/logs/<server-name>.log`, optional remote syslog via `LRMUX_SYSLOG=host:port`, in-memory ring log (500 entries) viewable with `Ctrl-A \`.
+- **Log levels**: `LRMUX_LOG_LEVEL=debug|info|warn|error` (default: info).

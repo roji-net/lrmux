@@ -138,10 +138,15 @@ pub fn run(
     // Temporary status bar message (shown for a few seconds, then cleared).
     let mut flash_msg: Option<String> = None;
     let mut flash_deadline: Option<std::time::Instant> = None;
+    let mut pending_session_chooser = false;
 
     // If requested, create a new session on the server right after handshake.
+    // Send the client's CWD so the new session opens in the right directory.
     if let Some(name) = new_session {
-        let msg = proto::encode_client(&ClientMsg::NewSession { name });
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd });
         proto::send(&mut stream, &msg)?;
     }
     // If requested, switch to an existing session by name.
@@ -402,15 +407,30 @@ pub fn run(
                         }
                     }
                 } else if matches!(confirm_state, ConfirmState::None) {
-                    let (passthrough, detach, confirm, remaining, enter_copy_mode, paste, flash) =
-                        process_prefix(
-                            input,
-                            &mut prefix_state,
-                            &mut stream,
-                            current_window_count,
-                            session_count,
-                            last_window,
-                        )?;
+                    let (
+                        passthrough,
+                        detach,
+                        confirm,
+                        remaining,
+                        enter_copy_mode,
+                        paste,
+                        flash,
+                        show_help,
+                        request_session_chooser,
+                    ) = process_prefix(
+                        input,
+                        &mut prefix_state,
+                        &mut stream,
+                        current_window_count,
+                        session_count,
+                        last_window,
+                    )?;
+                    if show_help {
+                        show_help_overlay();
+                    }
+                    if request_session_chooser {
+                        pending_session_chooser = true;
+                    }
                     if let Some(msg) = flash {
                         flash_msg = Some(msg);
                         flash_deadline =
@@ -698,8 +718,21 @@ pub fn run(
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
-                        ServerMsg::SessionList { .. } => {}
+                        ServerMsg::SessionList { sessions } => {
+                            if pending_session_chooser {
+                                pending_session_chooser = false;
+                                if let Some(name) = show_session_chooser(&sessions) {
+                                    let msg = proto::encode_client(&ClientMsg::SelectSession {
+                                        name: name.clone(),
+                                    });
+                                    let _ = proto::send(&mut stream, &msg);
+                                }
+                            }
+                        }
                         ServerMsg::WindowCapture { .. } => {}
+                        ServerMsg::LogContent { lines } => {
+                            show_log_overlay(&lines);
+                        }
                         ServerMsg::Error { msg } => {
                             eprintln!("\r\nlrmux: server error: {msg}\r");
                             break;
@@ -748,6 +781,8 @@ fn process_prefix(
     bool,
     bool,
     Option<String>,
+    bool,
+    bool,
 )> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
@@ -755,6 +790,8 @@ fn process_prefix(
     let mut enter_copy_mode = false;
     let mut paste = false;
     let mut flash: Option<String> = None;
+    let mut show_help = false;
+    let mut request_session_chooser = false;
 
     for (i, &byte) in input.iter().enumerate() {
         if confirm.is_some() {
@@ -767,6 +804,8 @@ fn process_prefix(
                 enter_copy_mode,
                 paste,
                 flash,
+                show_help,
+                request_session_chooser,
             ));
         }
         match state {
@@ -836,7 +875,13 @@ fn process_prefix(
                     }
                     // 'C' → new session (uppercase, like lowercase 'c' for new window).
                     b'C' => {
-                        send_cmd(stream, &ClientMsg::NewSession { name: None })?;
+                        send_cmd(
+                            stream,
+                            &ClientMsg::NewSession {
+                                name: None,
+                                cwd: None,
+                            },
+                        )?;
                     }
                     // 'N' → next session.
                     b'N' => {
@@ -854,6 +899,11 @@ fn process_prefix(
                             send_cmd(stream, &ClientMsg::PrevSession)?;
                         }
                     }
+                    // 'S' → session chooser (list sessions, pick one).
+                    b'S' => {
+                        send_cmd(stream, &ClientMsg::ListSessions)?;
+                        request_session_chooser = true;
+                    }
                     // 'F' → explicit canonical resize (resize panes to current terminal size).
                     b'F' => {
                         let (r, c) = terminal::get_size();
@@ -866,6 +916,14 @@ fn process_prefix(
                     // ']' → paste from internal paste buffer.
                     b']' => {
                         paste = true;
+                    }
+                    // '\' → show server ring log overlay.
+                    b'\\' => {
+                        send_cmd(stream, &ClientMsg::GetLog)?;
+                    }
+                    // '?' → show keybindings help overlay.
+                    b'?' => {
+                        show_help = true;
                     }
                     // '0'–'9' → select window by index.
                     b'0'..=b'9' => {
@@ -887,6 +945,8 @@ fn process_prefix(
         enter_copy_mode,
         paste,
         flash,
+        show_help,
+        request_session_chooser,
     ))
 }
 
@@ -1343,4 +1403,141 @@ fn try_parse_server_frame(buf: &mut Vec<u8>) -> io::Result<Option<ServerMsg>> {
     let mut cursor = io::Cursor::new(frame);
     let msg = proto::decode_server(&mut cursor)?;
     Ok(Some(msg))
+}
+
+/// Show the server ring log as a temporary overlay.
+/// Waits for any key to dismiss.
+fn show_log_overlay(lines: &[String]) {
+    use std::io::Read;
+    let mut stdout = io::stdout();
+    let (rows, cols) = terminal::get_size();
+
+    // Clear screen and show the log.
+    write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
+    stdout.flush().ok();
+
+    let title = "lrmux server log (press any key to dismiss)";
+    write!(stdout, "\x1b[1;36m{title}\x1b[0m\r\n").ok();
+    write!(
+        stdout,
+        "\x1b[90m{}\x1b[0m\r\n",
+        "─".repeat(cols.saturating_sub(1) as usize)
+    )
+    .ok();
+
+    let available = rows.saturating_sub(3) as usize;
+    let start = if lines.len() > available {
+        lines.len() - available
+    } else {
+        0
+    };
+    for line in &lines[start..] {
+        // Truncate to terminal width.
+        let truncated: String = line.chars().take(cols.saturating_sub(1) as usize).collect();
+        write!(stdout, "{truncated}\r\n").ok();
+    }
+
+    stdout.flush().ok();
+
+    // Wait for a single keypress to dismiss.
+    let mut buf = [0u8; 1];
+    let _ = std::io::stdin().read(&mut buf);
+
+    // Clear and request a full re-render.
+    write!(stdout, "\x1b[2J\x1b[H\x1b[?25l").ok();
+    stdout.flush().ok();
+}
+
+/// Show a session chooser overlay.
+/// Returns the selected session name, or None if cancelled.
+fn show_session_chooser(sessions: &[String]) -> Option<String> {
+    use std::io::Read;
+    let mut stdout = io::stdout();
+    let (rows, _cols) = terminal::get_size();
+
+    write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
+    stdout.flush().ok();
+
+    let title = "lrmux sessions (number to switch, any other key to cancel)";
+    write!(stdout, "\x1b[1;36m{title}\x1b[0m\r\n").ok();
+    write!(stdout, "\r\n").ok();
+
+    let available = rows.saturating_sub(4) as usize;
+    for (i, name) in sessions.iter().take(available).enumerate() {
+        write!(stdout, "  \x1b[1;33m{i}\x1b[0m  {name}\r\n").ok();
+    }
+
+    stdout.flush().ok();
+
+    // Wait for a single keypress.
+    let mut buf = [0u8; 1];
+    if std::io::stdin().read(&mut buf).is_ok() && buf[0] >= b'0' && buf[0] <= b'9' {
+        let idx = (buf[0] - b'0') as usize;
+        if idx < sessions.len() {
+            // Clear and request a full re-render.
+            write!(stdout, "\x1b[2J\x1b[H\x1b[?25l").ok();
+            stdout.flush().ok();
+            return Some(sessions[idx].clone());
+        }
+    }
+
+    // Clear and request a full re-render.
+    write!(stdout, "\x1b[2J\x1b[H\x1b[?25l").ok();
+    stdout.flush().ok();
+    None
+}
+
+/// Show the keybindings help as a temporary overlay.
+/// Waits for any key to dismiss.
+fn show_help_overlay() {
+    use std::io::Read;
+    let mut stdout = io::stdout();
+    let (rows, _cols) = terminal::get_size();
+
+    write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
+    stdout.flush().ok();
+
+    let title = "lrmux keybindings (press any key to dismiss)";
+    write!(stdout, "\x1b[1;36m{title}\x1b[0m\r\n").ok();
+    write!(stdout, "\r\n").ok();
+
+    let bindings = [
+        ("Ctrl-A c", "New window"),
+        ("Ctrl-A n / Space / Ctrl-Space", "Next window"),
+        ("Ctrl-A p / Ctrl-P", "Previous window"),
+        ("Ctrl-A Ctrl-A", "Toggle last focused window"),
+        ("Ctrl-A 0-9", "Select window by index"),
+        ("Ctrl-A C", "New session"),
+        ("Ctrl-A N", "Next session"),
+        ("Ctrl-A P", "Previous session"),
+        ("Ctrl-A $", "Rename session"),
+        ("Ctrl-A K", "Kill session (confirm)"),
+        ("Ctrl-A x", "Kill pane/window"),
+        ("Ctrl-A k", "Kill pane (confirm)"),
+        ("Ctrl-A [", "Enter copy mode"),
+        ("Ctrl-A ]", "Paste from buffer"),
+        ("Ctrl-A F", "Resize to terminal size"),
+        ("Ctrl-A d / Ctrl-D", "Detach"),
+        ("Ctrl-A \\", "Show server log"),
+        ("Ctrl-A ?", "Show this help"),
+    ];
+
+    for (key, desc) in &bindings {
+        write!(stdout, "  \x1b[1;33m{key:<35}\x1b[0m {desc}\r\n").ok();
+    }
+
+    // Ensure we don't overflow.
+    if rows as usize > bindings.len() + 4 {
+        write!(stdout, "\r\n").ok();
+    }
+
+    stdout.flush().ok();
+
+    // Wait for a single keypress to dismiss.
+    let mut buf = [0u8; 1];
+    let _ = std::io::stdin().read(&mut buf);
+
+    // Clear and request a full re-render.
+    write!(stdout, "\x1b[2J\x1b[H\x1b[?25l").ok();
+    stdout.flush().ok();
 }

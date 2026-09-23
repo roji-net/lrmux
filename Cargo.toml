@@ -9,10 +9,10 @@ keywords = ["terminal", "multiplexer", "tmux", "byobu"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-nix = { version = "0.30", features = ["term", "process", "event", "fs", "user"] }
+nix = { version = "0.31", features = ["term", "process", "event", "fs", "user"] }
 libc = "0.2"
-vte = "0.13"
-toml = "0.8"
+vte = "0.15"
+toml = "1.1"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
