@@ -42,6 +42,8 @@ pub enum ClientMsg {
     KillSession,
     /// Request list of sessions on this server (for the selector).
     ListSessions,
+    /// Kill the server entirely (used by `lrmux kill-server`).
+    KillServer,
 }
 
 /// Server → Client messages.
@@ -65,6 +67,9 @@ pub enum ServerMsg {
         cursor_col: u16,
         cursor_visible: bool,
     },
+    /// Scrollback rows that scrolled off the top since the last update.
+    /// Sent before GridUpdate so the client can push them to scrollback.
+    ScrollbackUpdate { rows: Vec<Vec<Cell>> },
     /// Child process exited.
     PaneExit { code: u8 },
     /// Error message.
@@ -96,10 +101,12 @@ const C_PREV_SESSION: u8 = 0x0c;
 const C_SELECT_SESSION: u8 = 0x0f;
 const C_KILL_SESSION: u8 = 0x0e;
 const C_LIST_SESSIONS: u8 = 0x0d;
+const C_KILL_SERVER: u8 = 0x10;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
 const S_GRID_UPDATE: u8 = 0x12;
+const S_SCROLLBACK_UPDATE: u8 = 0x17;
 const S_PANE_EXIT: u8 = 0x13;
 const S_ERROR: u8 = 0x14;
 const S_STATUS_BAR: u8 = 0x15;
@@ -172,6 +179,9 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::ListSessions => {
             payload.push(C_LIST_SESSIONS);
         }
+        ClientMsg::KillServer => {
+            payload.push(C_KILL_SERVER);
+        }
     }
     frame(payload)
 }
@@ -222,6 +232,16 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_row.to_le_bytes());
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
+        }
+        ServerMsg::ScrollbackUpdate { rows } => {
+            payload.push(S_SCROLLBACK_UPDATE);
+            payload.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            for row in rows {
+                payload.extend_from_slice(&(row.len() as u32).to_le_bytes());
+                for cell in row {
+                    encode_cell(&mut payload, cell);
+                }
+            }
         }
         ServerMsg::PaneExit { code } => {
             payload.push(S_PANE_EXIT);
@@ -371,6 +391,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         }
         C_KILL_SESSION => Ok(ClientMsg::KillSession),
         C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
+        C_KILL_SERVER => Ok(ClientMsg::KillServer),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -429,6 +450,19 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 cursor_col,
                 cursor_visible,
             })
+        }
+        S_SCROLLBACK_UPDATE => {
+            let row_count = read_u32(&mut r)? as usize;
+            let mut rows = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
+                let cell_count = read_u32(&mut r)? as usize;
+                let mut row = Vec::with_capacity(cell_count);
+                for _ in 0..cell_count {
+                    row.push(decode_cell(&mut r)?);
+                }
+                rows.push(row);
+            }
+            Ok(ServerMsg::ScrollbackUpdate { rows })
         }
         S_PANE_EXIT => {
             let code = read_u8(&mut r)?;

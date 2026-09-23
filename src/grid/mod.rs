@@ -26,6 +26,8 @@ pub struct Grid {
     pub attrs: Attr,
     /// Scrollback history (rows that scrolled off the top).
     pub scrollback: Scrollback,
+    /// New scrollback rows not yet sent to clients. Drained by take_pending_scrollback().
+    pending_scrollback: Vec<Vec<Cell>>,
     /// Scroll region top (inclusive), 0-indexed.
     scroll_top: usize,
     /// Scroll region bottom (exclusive), 0-indexed.
@@ -54,6 +56,7 @@ impl Grid {
             bg: Color::Default,
             attrs: Attr::default(),
             scrollback: Scrollback::new(scrollback_capacity),
+            pending_scrollback: Vec::new(),
             scroll_top: 0,
             scroll_bottom: rows,
             wrap_pending: false,
@@ -100,6 +103,13 @@ impl Grid {
         dirty_rows
     }
 
+    /// Take pending scrollback rows (rows that scrolled off the top since
+    /// the last call). The server sends these to clients so they can
+    /// maintain their own scrollback for copy mode.
+    pub fn take_pending_scrollback(&mut self) -> Vec<Vec<Cell>> {
+        std::mem::take(&mut self.pending_scrollback)
+    }
+
     /// Resize the grid. Content is preserved where possible; new cells are blank.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         // Adjust row count.
@@ -113,7 +123,8 @@ impl Grid {
             for _ in rows..self.row_count {
                 let row = self.rows.remove(self.rows.len() - 1);
                 // Only push non-blank rows to scrollback.
-                self.scrollback.push(row);
+                self.scrollback.push(row.clone());
+                self.pending_scrollback.push(row);
             }
         }
 
@@ -255,7 +266,8 @@ impl Grid {
             let row_idx = self.scroll_top + i;
             if row_idx < self.rows.len() {
                 let row = std::mem::replace(&mut self.rows[row_idx], blank_row.clone());
-                self.scrollback.push(row);
+                self.scrollback.push(row.clone());
+                self.pending_scrollback.push(row);
             }
         }
 

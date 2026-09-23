@@ -681,8 +681,8 @@ clipboard_cmd = ""          # empty = auto-detect (pbcopy/xclip/wl-copy)
 - `src/keys/` + `src/config/`: prefix detection, command mode.
 - **First-iteration keybindings** (§6.2): `c` (new window), `n`/`p` (next/prev window), `0`–`9` (select window), `[` (copy mode), `?` (help), `d` (detach), `x` (kill pane), double-prefix (send literal prefix).
 - F-key shortcuts (toggleable).
-- **Scrollback/copy mode** (§2.6): vi-style keys, search, selection.
-- **Clipboard integration** (§2.6): internal paste buffer + system clipboard (auto-detect `pbcopy`/`xclip`/`wl-copy`).
+- **Scrollback/copy mode** (§2.6): vi-style keys, search, selection. **[PARTIAL]** — vi navigation (h/j/k/l, g/G, Ctrl-u/d, Ctrl-b/f, 0/^/$), selection (Space/Enter), clipboard integration (pbcopy/xclip/wl-copy), paste (Prefix ]) all implemented. Search (/?, n/N) not yet implemented.
+- **Clipboard integration** (§2.6): internal paste buffer + system clipboard (auto-detect `pbcopy`/`xclip`/`wl-copy`). **[DONE]**
 - TOML config loading (all sections from §7).
 - Later-iteration keybindings (splits, pane focus, rename, etc.) added as their features land in Phase 4+.
 

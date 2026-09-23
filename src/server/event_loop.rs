@@ -45,9 +45,26 @@ impl ClientConn {
 /// all sessions are closed.
 pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<()> {
     // Wait for the first client to determine terminal size.
-    let (first_stream, _) = listener.accept()?;
-    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) =
-        handshake_first_client(first_stream)?;
+    // Retry on bad connections (e.g. ListSessions queries from the selector,
+    // or connections that send unexpected data).
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = loop {
+        let (stream, _) = listener.accept()?;
+        match handshake_first_client(stream) {
+            Ok(result) => break result,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                // KillServer received during initial handshake — shut down.
+                ipc::cleanup(socket_path);
+                eprintln!("lrmux: server stopped (killed before first client).");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "lrmux server: initial handshake failed ({e}), waiting for next client..."
+                );
+                continue;
+            }
+        }
+    };
 
     // Set listener to non-blocking so we can poll it alongside clients.
     listener.set_nonblocking(true)?;
@@ -65,6 +82,10 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         });
         for (si, session) in sessions.iter().enumerate() {
             for (wi, w) in session.windows.iter().enumerate() {
+                // Skip exited panes — their child is dead, no more PTY output.
+                if w.pane.is_exited() {
+                    continue;
+                }
                 pty_map.push((si, wi));
                 fds.push(libc::pollfd {
                     fd: w.pty_fd(),
@@ -95,7 +116,20 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
 
         // Listener readable → accept new client.
         if fds[0].revents & libc::POLLIN != 0 {
-            let _ = accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients);
+            match accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                    // KillServer received — shut down gracefully.
+                    broadcast_to_all(
+                        &mut clients,
+                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                    );
+                    ipc::cleanup(socket_path);
+                    eprintln!("lrmux: server stopped.");
+                    return Ok(());
+                }
+                Err(_) => {}
+            }
         }
 
         // Window PTY output → grid → send only to clients viewing that window.
@@ -110,53 +144,66 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                     }
                     Ok(false) => {
-                        // Child exited. Remove the window.
-                        session.windows.remove(wi);
-                        if session.windows.is_empty() {
-                            // Last window in this session closed — remove the session.
-                            eprintln!(
-                                "lrmux: last window in session '{}' closed, removing session.",
-                                session.name
-                            );
-                            sessions.remove(si);
-                            if sessions.is_empty() {
-                                // Last session closed — shut down the server.
-                                eprintln!("lrmux: last session closed, shutting down server.");
-                                broadcast_to_all(
-                                    &mut clients,
-                                    &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        // Child exited (PTY read returned 0 or EIO).
+                        // Reap the child and get the exit code.
+                        let exit_code = pane.reap_child().unwrap_or(0);
+                        // Treat 0 and 130 (128+SIGINT, common when exiting shells
+                        // with Ctrl-D after a Ctrl-C) and -2 (direct SIGINT signal)
+                        // as success — auto-close the window.
+                        if exit_code == 0 || exit_code == 130 || exit_code == -2 {
+                            // Exit code 0: auto-close the window.
+                            session.windows.remove(wi);
+                            if session.windows.is_empty() {
+                                // Last window in this session closed — remove the session.
+                                eprintln!(
+                                    "lrmux: last window in session '{}' closed, removing session.",
+                                    session.name
                                 );
-                                ipc::cleanup(socket_path);
-                                eprintln!("lrmux: server stopped.");
-                                return Ok(());
-                            }
-                            // Fix up all clients' session indices.
-                            for c in &mut clients {
-                                if c.session_idx == si {
-                                    // Client was in the removed session — move to session 0.
-                                    c.session_idx = 0;
-                                    c.active_window = 0;
-                                } else if c.session_idx > si {
-                                    c.session_idx -= 1;
+                                sessions.remove(si);
+                                if sessions.is_empty() {
+                                    // Last session closed — shut down the server.
+                                    eprintln!("lrmux: last session closed, shutting down server.");
+                                    broadcast_to_all(
+                                        &mut clients,
+                                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                                    );
+                                    ipc::cleanup(socket_path);
+                                    eprintln!("lrmux: server stopped.");
+                                    return Ok(());
                                 }
-                            }
-                            // All clients need a snapshot + status bar (their view changed).
-                            let _ = send_all_snapshots(&mut clients, &sessions);
-                            broadcast_status_bar(&mut clients, &sessions);
-                        } else {
-                            // Fix up all clients' active_window indices in this session.
-                            for c in &mut clients {
-                                if c.session_idx == si {
-                                    if c.active_window == wi {
-                                        c.active_window = wi.min(session.windows.len() - 1);
-                                    } else if c.active_window > wi {
-                                        c.active_window -= 1;
+                                // Fix up all clients' session indices.
+                                for c in &mut clients {
+                                    if c.session_idx == si {
+                                        // Client was in the removed session — move to session 0.
+                                        c.session_idx = 0;
+                                        c.active_window = 0;
+                                    } else if c.session_idx > si {
+                                        c.session_idx -= 1;
                                     }
                                 }
+                                // All clients need a snapshot + status bar (their view changed).
+                                let _ = send_all_snapshots(&mut clients, &sessions);
+                                broadcast_status_bar(&mut clients, &sessions);
+                            } else {
+                                // Fix up all clients' active_window indices in this session.
+                                for c in &mut clients {
+                                    if c.session_idx == si {
+                                        if c.active_window == wi {
+                                            c.active_window = wi.min(session.windows.len() - 1);
+                                        } else if c.active_window > wi {
+                                            c.active_window -= 1;
+                                        }
+                                    }
+                                }
+                                // Send snapshots to affected clients + status bar to all.
+                                let _ = send_all_snapshots(&mut clients, &sessions);
+                                broadcast_status_bar(&mut clients, &sessions);
                             }
-                            // Send snapshots to affected clients + status bar to all.
-                            let _ = send_all_snapshots(&mut clients, &sessions);
-                            broadcast_status_bar(&mut clients, &sessions);
+                        } else {
+                            // Exit code ≠ 0: keep the pane open with an exit message.
+                            // The user can read the output and close manually with Prefix x.
+                            pane.write_exit_message(exit_code);
+                            let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         }
                     }
                     Err(e) => {
@@ -450,6 +497,16 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         });
                                         let _ = proto::send(&mut clients[client_idx].stream, &msg);
                                     }
+                                    ClientMsg::KillServer => {
+                                        eprintln!("lrmux: KillServer received, shutting down.");
+                                        broadcast_to_all(
+                                            &mut clients,
+                                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                                        );
+                                        ipc::cleanup(socket_path);
+                                        eprintln!("lrmux: server stopped.");
+                                        return Ok(());
+                                    }
                                 }
                             }
                             Ok(None) => break,
@@ -592,6 +649,8 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     }
     let pane = &sessions[si].windows[aw].pane;
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+
+    // Send the grid snapshot first (client creates a fresh grid).
     let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
         rows: pane.rows,
         cols: pane.cols,
@@ -600,7 +659,20 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
         cursor_col,
         cursor_visible,
     });
-    proto::send(&mut client.stream, &snapshot)
+    if proto::send(&mut client.stream, &snapshot).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "client gone",
+        ));
+    }
+
+    // Then send scrollback so the client can populate the fresh grid's history.
+    let sb_rows = pane.scrollback_rows();
+    if !sb_rows.is_empty() {
+        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate { rows: sb_rows });
+        let _ = proto::send(&mut client.stream, &sb_msg);
+    }
+    Ok(())
 }
 
 /// Send each client a snapshot of its own active window.
@@ -617,6 +689,8 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io
 }
 
 /// Handshake with the first client: read Identify, create first session, send ack + snapshot.
+/// Returns Err if the connection is not an Identify (e.g. ListSessions query or bad data).
+/// The caller should retry by accepting the next connection.
 fn handshake_first_client(
     stream: UnixStream,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
@@ -624,6 +698,22 @@ fn handshake_first_client(
 
     let (client_rows, client_cols) = match proto::decode_client(&mut client) {
         Ok(ClientMsg::Identify { rows, cols }) => (rows, cols),
+        Ok(ClientMsg::ListSessions) => {
+            // Respond with empty session list (no sessions yet) and signal retry.
+            let msg = proto::encode_server(&ServerMsg::SessionList { sessions: vec![] });
+            let _ = proto::send(&mut client, &msg);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ListSessions query during initial handshake",
+            ));
+        }
+        Ok(ClientMsg::KillServer) => {
+            eprintln!("lrmux: KillServer received during initial handshake, shutting down.");
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "KillServer",
+            ));
+        }
         _ => {
             let _ = proto::send(
                 &mut client,
@@ -698,6 +788,13 @@ fn accept_new_client(
                     let _ = proto::send(&mut stream, &msg);
                     return Ok(());
                 }
+                Ok(ClientMsg::KillServer) => {
+                    eprintln!("lrmux: KillServer received, shutting down.");
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "KillServer",
+                    ));
+                }
                 _ => {
                     let _ = proto::send(
                         &mut stream,
@@ -767,11 +864,30 @@ fn send_grid_update_to_window_viewers(
     window_idx: usize,
     pane: &mut crate::server::pane::Pane,
 ) -> io::Result<()> {
-    let dirty = pane.take_dirty_rows();
-    if dirty.is_empty() {
-        return Ok(());
+    // Take pending scrollback rows and send them first.
+    let scrolled = pane.take_pending_scrollback();
+    if !scrolled.is_empty() {
+        let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate { rows: scrolled });
+        let mut i = 0;
+        while i < clients.len() {
+            if clients[i].session_idx == session_idx
+                && clients[i].active_window == window_idx
+                && proto::send(&mut clients[i].stream, &sb_msg).is_err()
+            {
+                clients.remove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
+
+    let dirty = pane.take_dirty_rows();
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+    // Always send a GridUpdate when the PTY produced output, even if no
+    // rows are dirty. The cursor may have moved (e.g., shell echoing a space
+    // to an already-blank cell, or cursor-positioning escape sequences).
+    // Without this, the client's cursor would not update until the next
+    // dirty row — making it look like keypresses are ignored.
     let msg = proto::encode_server(&ServerMsg::GridUpdate {
         dirty,
         cursor_row,
@@ -934,6 +1050,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x0e => ClientMsg::KillSession,
         0x0d => ClientMsg::ListSessions,
+        0x10 => ClientMsg::KillServer,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

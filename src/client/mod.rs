@@ -1,5 +1,6 @@
 // Client process: raw mode, input relay, prefix detection, output render.
 
+pub mod copy_mode;
 pub mod render;
 pub mod selector;
 pub mod terminal;
@@ -70,10 +71,16 @@ pub fn run(
     // Enter raw mode on the controlling terminal.
     let _raw_guard = terminal::enter_raw_mode()?;
 
-    // Enter alternate screen.
+    // Enter raw mode. Do NOT use alternate screen — we want the terminal's
+    // native scrollback to capture content that scrolls off the top.
+    // A scroll region is set (excluding the status bar) so that \x1b[S
+    // scrolls only the content area, pushing lines into the terminal's
+    // scrollback buffer.
     {
         let mut stdout = io::stdout();
-        stdout.write_all(b"\x1b[?1049h")?;
+        // Clear screen, hide cursor, set scroll region to exclude status bar.
+        let view_rows = terminal::get_size().0.saturating_sub(1);
+        write!(stdout, "\x1b[2J\x1b[H\x1b[?25l\x1b[1;{}r", view_rows.max(1))?;
         stdout.flush()?;
     }
 
@@ -144,6 +151,15 @@ pub fn run(
     let mut server_buf: Vec<u8> = Vec::new();
     let mut prefix_state = PrefixState::Normal;
     let mut confirm_state = ConfirmState::None;
+    // Copy/scrollback mode state (None when inactive).
+    let mut copy_mode: Option<copy_mode::CopyMode> = None;
+    // Internal paste buffer (for Prefix ] paste).
+    let mut paste_buffer = String::new();
+    // When true, skip \x1b[NS terminal scroll for the next ScrollbackUpdate.
+    // Set by GridSnapshot (window/session switch) because the scrollback
+    // replayed there is history, not new scroll-off — emitting \x1b[NS
+    // would scroll the just-rendered content off the screen.
+    let mut skip_terminal_scroll = false;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -157,6 +173,13 @@ pub fn run(
             let (new_rows, new_cols) = terminal::get_size();
             term_rows = new_rows as usize;
             term_cols = new_cols as usize;
+            // Update scroll region to exclude the status bar.
+            {
+                let view_rows = term_rows.saturating_sub(1).max(1);
+                let mut stdout = io::stdout();
+                write!(stdout, "\x1b[1;{}r", view_rows)?;
+                stdout.flush()?;
+            }
             update_viewport(
                 &mut renderer,
                 term_rows,
@@ -164,14 +187,21 @@ pub fn run(
                 grid.rows(),
                 grid.cols(),
             );
-            // Clear screen and re-render everything.
-            let mut stdout = io::stdout();
-            stdout.write_all(b"\x1b[2J\x1b[H")?;
-            renderer.invalidate();
-            grid.mark_all_dirty();
-            renderer.render(&mut stdout, &mut grid)?;
-            render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
-            render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+            if let Some(ref cm) = copy_mode {
+                // In copy mode: re-render the copy mode view.
+                let view_rows = term_rows.saturating_sub(1);
+                let mut stdout = io::stdout();
+                cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+            } else {
+                // Clear screen and re-render everything.
+                let mut stdout = io::stdout();
+                stdout.write_all(b"\x1b[2J\x1b[H")?;
+                renderer.invalidate();
+                grid.mark_all_dirty();
+                renderer.render(&mut stdout, &mut grid)?;
+                render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
+                render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+            }
         }
 
         let mut fds = [
@@ -202,8 +232,148 @@ pub fn run(
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n > 0 {
                 let input = &buf[..n as usize];
-                if matches!(confirm_state, ConfirmState::None) {
-                    let (passthrough, detach, confirm, remaining) =
+
+                if copy_mode.is_some() {
+                    // In copy mode: all input goes to copy mode key handling.
+                    // Arrow keys send escape sequences (\x1b[A/B/C/D) which must
+                    // be distinguished from a standalone Esc (\x1b) that quits.
+                    let view_rows = term_rows.saturating_sub(1);
+                    let mut copy_action: Option<copy_mode::CopyAction> = None;
+                    let mut i = 0;
+                    while i < input.len() {
+                        if let Some(ref mut cm) = copy_mode {
+                            // Check for escape sequence (arrow keys, Home/End, Page Up/Down).
+                            if input[i] == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+                                let handled = match input[i + 2] {
+                                    b'A' => {
+                                        cm.move_cursor(-1, 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    b'B' => {
+                                        cm.move_cursor(1, 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    b'C' => {
+                                        cm.move_cursor(0, 1, &grid);
+                                        true
+                                    }
+                                    b'D' => {
+                                        cm.move_cursor(0, -1, &grid);
+                                        true
+                                    }
+                                    b'H' => {
+                                        cm.vcol = 0;
+                                        true
+                                    } // Home
+                                    b'F' => {
+                                        cm.vcol = cm.last_non_blank(&grid, cm.vrow);
+                                        true
+                                    } // End
+                                    _ => false,
+                                };
+                                if handled {
+                                    i += 3;
+                                    let mut stdout = io::stdout();
+                                    cm.render(
+                                        &mut stdout,
+                                        &grid,
+                                        view_rows,
+                                        term_cols,
+                                        &status_text,
+                                    )?;
+                                    continue;
+                                }
+                            }
+                            // Check for Page Up/Down: \x1b[5~ or \x1b[6~
+                            if input[i] == 0x1b && i + 3 < input.len() && input[i + 1] == b'[' {
+                                let handled = match (input[i + 2], input[i + 3]) {
+                                    (b'5', b'~') => {
+                                        let page = view_rows.max(1);
+                                        cm.move_cursor(-(page as i32), 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    (b'6', b'~') => {
+                                        let page = view_rows.max(1);
+                                        cm.move_cursor(page as i32, 0, &grid);
+                                        cm.ensure_cursor_visible(view_rows);
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                if handled {
+                                    i += 4;
+                                    let mut stdout = io::stdout();
+                                    cm.render(
+                                        &mut stdout,
+                                        &grid,
+                                        view_rows,
+                                        term_cols,
+                                        &status_text,
+                                    )?;
+                                    continue;
+                                }
+                            }
+                            // Standalone Esc (not followed by [) → quit copy mode.
+                            // Esc at the end of buffer is also treated as quit.
+                            if input[i] == 0x1b && (i + 1 >= input.len() || input[i + 1] != b'[') {
+                                copy_action = Some(copy_mode::CopyAction::Quit);
+                                break;
+                            }
+                            // \x1b[ followed by unknown byte — skip the \x1b and let
+                            // the normal byte-by-byte handler deal with the rest.
+                            let action = cm.process_key(input[i], &grid, view_rows);
+                            match action {
+                                copy_mode::CopyAction::Continue => {
+                                    let mut stdout = io::stdout();
+                                    cm.render(
+                                        &mut stdout,
+                                        &grid,
+                                        view_rows,
+                                        term_cols,
+                                        &status_text,
+                                    )?;
+                                }
+                                _ => {
+                                    copy_action = Some(action);
+                                    break;
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                    // Handle copy mode exit (outside the borrow).
+                    if let Some(action) = copy_action {
+                        match action {
+                            copy_mode::CopyAction::Quit => {
+                                copy_mode = None;
+                                restore_normal_view(
+                                    &mut renderer,
+                                    &mut grid,
+                                    &status_text,
+                                    term_rows,
+                                    term_cols,
+                                )?;
+                            }
+                            copy_mode::CopyAction::Copy(text) => {
+                                paste_buffer = text.clone();
+                                let _ = copy_mode::copy_to_clipboard(&text);
+                                copy_mode = None;
+                                restore_normal_view(
+                                    &mut renderer,
+                                    &mut grid,
+                                    &status_text,
+                                    term_rows,
+                                    term_cols,
+                                )?;
+                            }
+                            copy_mode::CopyAction::Continue => {}
+                        }
+                    }
+                } else if matches!(confirm_state, ConfirmState::None) {
+                    let (passthrough, detach, confirm, remaining, enter_copy_mode, paste) =
                         process_prefix(input, &mut prefix_state, &mut stream)?;
                     if !passthrough.is_empty() {
                         let msg = proto::encode_client(&ClientMsg::PaneInput { data: passthrough });
@@ -213,6 +383,28 @@ pub fn run(
                         let msg = proto::encode_client(&ClientMsg::Detach);
                         proto::send(&mut stream, &msg)?;
                         break;
+                    }
+                    if enter_copy_mode {
+                        copy_mode = Some(copy_mode::CopyMode::new(
+                            grid.scrollback.len(),
+                            grid.cursor_row,
+                            grid.cursor_col,
+                        ));
+                        let view_rows = term_rows.saturating_sub(1);
+                        let mut stdout = io::stdout();
+                        copy_mode.as_ref().unwrap().render(
+                            &mut stdout,
+                            &grid,
+                            view_rows,
+                            term_cols,
+                            &status_text,
+                        )?;
+                    }
+                    if paste && !paste_buffer.is_empty() {
+                        let msg = proto::encode_client(&ClientMsg::PaneInput {
+                            data: paste_buffer.as_bytes().to_vec(),
+                        });
+                        proto::send(&mut stream, &msg)?;
                     }
                     if let Some(mut c) = confirm {
                         // Fill in the session name and window count for kill-session confirmation.
@@ -294,6 +486,34 @@ pub fn run(
                 server_buf.extend_from_slice(&buf[..n as usize]);
                 while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
                     match msg {
+                        ServerMsg::ScrollbackUpdate { rows } => {
+                            // Push to internal scrollback (for copy mode).
+                            let n = rows.len();
+                            for row in rows {
+                                grid.scrollback.push(row);
+                            }
+                            // Scroll the terminal to push content into the
+                            // terminal's native scrollback buffer.
+                            // Skip in copy mode (terminal is showing copy view).
+                            // Also skip when this scrollback is a replay of the
+                            // window's history (after GridSnapshot) — emitting
+                            // \x1b[NS here would scroll the just-rendered content
+                            // off the screen, leaving it blank.
+                            if n > 0 && copy_mode.is_none() && !skip_terminal_scroll {
+                                let mut stdout = io::stdout();
+                                write!(stdout, "\x1b[{}S", n)?;
+                                stdout.flush()?;
+                                // The terminal shifted all content up by n lines.
+                                // Mark all rows dirty so the renderer rewrites them
+                                // at their correct positions (the GridUpdate that
+                                // follows will render them).
+                                grid.mark_all_dirty();
+                                renderer.invalidate();
+                            }
+                            // Reset the flag — only the first ScrollbackUpdate
+                            // after a GridSnapshot should be skipped.
+                            skip_terminal_scroll = false;
+                        }
                         ServerMsg::GridUpdate {
                             dirty,
                             cursor_row,
@@ -306,15 +526,22 @@ pub fn run(
                             grid.cursor_row = cursor_row as usize;
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
-                            let mut stdout = io::stdout();
-                            renderer.render(&mut stdout, &mut grid)?;
-                            render_status_bar(
-                                &mut stdout,
-                                &status_text,
-                                term_rows,
-                                term_cols,
-                                &grid,
-                            )?;
+                            if let Some(ref cm) = copy_mode {
+                                // In copy mode: re-render the copy mode view.
+                                let view_rows = term_rows.saturating_sub(1);
+                                let mut stdout = io::stdout();
+                                cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                            } else {
+                                let mut stdout = io::stdout();
+                                renderer.render(&mut stdout, &mut grid)?;
+                                render_status_bar(
+                                    &mut stdout,
+                                    &status_text,
+                                    term_rows,
+                                    term_cols,
+                                    &grid,
+                                )?;
+                            }
                         }
                         ServerMsg::GridSnapshot {
                             rows,
@@ -324,6 +551,11 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                         } => {
+                            // The server sends ScrollbackUpdate right after
+                            // GridSnapshot to replay the window's history.
+                            // We must NOT emit \x1b[NS for that replay — it
+                            // would scroll the just-rendered content off screen.
+                            skip_terminal_scroll = true;
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
                             renderer.resize(rows as usize, cols as usize);
@@ -350,7 +582,12 @@ pub fn run(
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
                             let mut stdout = io::stdout();
-                            stdout.write_all(b"\x1b[2J\x1b[H")?;
+                            // Reset scroll region to full screen, clear, then
+                            // re-establish the scroll region. This ensures the
+                            // clear affects the entire screen and the terminal
+                            // viewport is in a clean state before rendering.
+                            let view_rows = term_rows.saturating_sub(1);
+                            write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
                             renderer.render(&mut stdout, &mut grid)?;
                             render_filler(
                                 &mut stdout,
@@ -418,7 +655,7 @@ pub fn run(
 }
 
 /// Process input bytes through the prefix-key state machine.
-/// Returns (passthrough bytes, should_detach, optional confirm dialog, remaining unprocessed bytes).
+/// Returns (passthrough, detach, confirm, remaining, enter_copy_mode, paste).
 /// When a confirm dialog is triggered, remaining bytes after the trigger are returned
 /// so the caller can process them with process_confirm.
 #[allow(clippy::type_complexity)]
@@ -426,15 +663,24 @@ fn process_prefix(
     input: &[u8],
     state: &mut PrefixState,
     stream: &mut std::os::unix::net::UnixStream,
-) -> io::Result<(Vec<u8>, bool, Option<ConfirmState>, Vec<u8>)> {
+) -> io::Result<(Vec<u8>, bool, Option<ConfirmState>, Vec<u8>, bool, bool)> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
     let mut confirm: Option<ConfirmState> = None;
+    let mut enter_copy_mode = false;
+    let mut paste = false;
 
     for (i, &byte) in input.iter().enumerate() {
         if confirm.is_some() {
             // Stop processing — return remaining bytes for the confirm handler.
-            return Ok((passthrough, detach, confirm, input[i..].to_vec()));
+            return Ok((
+                passthrough,
+                detach,
+                confirm,
+                input[i..].to_vec(),
+                enter_copy_mode,
+                paste,
+            ));
         }
         match state {
             PrefixState::Normal => {
@@ -499,6 +745,14 @@ fn process_prefix(
                         let (r, c) = terminal::get_size();
                         send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
                     }
+                    // '[' → enter copy/scrollback mode.
+                    b'[' => {
+                        enter_copy_mode = true;
+                    }
+                    // ']' → paste from internal paste buffer.
+                    b']' => {
+                        paste = true;
+                    }
                     // '0'–'9' → select window by index.
                     b'0'..=b'9' => {
                         send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
@@ -511,7 +765,14 @@ fn process_prefix(
         }
     }
 
-    Ok((passthrough, detach, confirm, Vec::new()))
+    Ok((
+        passthrough,
+        detach,
+        confirm,
+        Vec::new(),
+        enter_copy_mode,
+        paste,
+    ))
 }
 
 /// Send a command message to the server.
@@ -693,6 +954,28 @@ fn update_viewport(
     renderer.set_viewport(view_rows, view_cols);
 }
 
+/// Restore the normal (non-copy-mode) view after exiting copy mode.
+fn restore_normal_view(
+    renderer: &mut render::Renderer,
+    grid: &mut Grid,
+    status_text: &str,
+    term_rows: usize,
+    term_cols: usize,
+) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    // Hide cursor (copy mode shows it; normal mode hides it).
+    stdout.write_all(b"\x1b[?25l")?;
+    // Reset scroll region to exclude status bar, then clear and re-render.
+    let view_rows = term_rows.saturating_sub(1).max(1);
+    write!(stdout, "\x1b[1;{}r\x1b[2J\x1b[H", view_rows)?;
+    renderer.invalidate();
+    grid.mark_all_dirty();
+    renderer.render(&mut stdout, grid)?;
+    render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
+    render_status_bar(&mut io::stdout(), status_text, term_rows, term_cols, grid)?;
+    Ok(())
+}
+
 /// Render the filler region: the area beyond the canonical grid when the
 /// terminal is larger than the grid. Uses a dim background with a thin
 /// border line separating content from filler (per §2.16 of the design doc).
@@ -802,7 +1085,8 @@ fn apply_row(grid: &mut Grid, row: usize, cells: &[Cell]) {
 /// Restore the terminal (exit alternate screen, show cursor).
 fn restore_terminal() {
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
+    // Reset scroll region to full screen, show cursor, clear screen.
+    let _ = stdout.write_all(b"\x1b[r\x1b[?25h\x1b[2J\x1b[H");
     let _ = stdout.flush();
 }
 
