@@ -220,8 +220,11 @@ lrmux new-server [-s <name>] [--tcp <addr>] [--ws <addr>] [--headless] [-CC] [--
         body: "\
 -s, --server <name>    Server name (default: an unused local name)\n\
 --tcp <addr>           Listen address, e.g. 0.0.0.0:17281.\n    \
+A trailing + (0.0.0.0:17280+) binds the first free port from there.\n    \
 This is where the server binds. The local client still\n    \
-attaches on the Unix socket, not via this address.\n\
+attaches on the Unix socket, not via this address.\n    \
+Config: tcp_listen = \"auto\" in ~/.config/lrmux/config.toml does the same\n    \
+for every server, without passing --tcp.\n\
 --ws <addr>            WebSocket listen address\n\
 --headless             Start the server and return. Do not attach.\n    \
 `start-server` is an alias of `new-server --headless`.\n\

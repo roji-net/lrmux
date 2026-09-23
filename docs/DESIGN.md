@@ -701,7 +701,7 @@ clipboard_cmd = ""          # empty = auto-detect (pbcopy/xclip/wl-copy)
 
 **Remote (implemented):**
 
-- **Config** `~/.config/lrmux/config.toml` `[network]`: `tcp_listen`, `ws_listen`, `discovery`, `discovery_port` (default 17280), `tls` (`off`|`on`|`auto`), `psk` (alias `auth_token`), `safe_networks` (CIDR list, **default empty** ⇒ `tls=auto` requires TLS for every TCP peer), optional cert paths. All off / safe defaults.
+- **Config** `~/.config/lrmux/config.toml` `[network]`: `tcp_listen` (empty = off; `"auto"` or `host:port+` = first free port from that port / 17280; `host:port` = exact), `ws_listen`, `discovery`, `discovery_port` (default 17280), `tls` (`off`|`on`|`auto`), `psk` (alias `auth_token`), `safe_networks` (CIDR list, **default empty** ⇒ `tls=auto` requires TLS for every TCP peer), optional cert paths. All off / safe defaults.
 - **UDP discovery**: servers with TCP/WS (or `discovery = true`) answer Discover probes with unicast Announce. CLI `discover` / `ls` / `ls-servers` / selector share one inventory module and tag LAN entries.
 - **TCP session transport**: same binary framing as Unix; interactive client and `-CC` connect via `--tcp host:port` (optional `--psk`).
 - **WebSocket + browser client**: `ws_listen` / `start-server --ws addr`; `ConnStream::Ws` bridges tungstenite binary frames to the same length-prefixed proto. MVP client in `web/` (Identify + PSK, grid render, keyboard input). WSS via reverse proxy; Rust/WASM client deferred.
