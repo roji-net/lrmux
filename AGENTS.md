@@ -60,14 +60,16 @@ Module layout (per §5.7 of the design doc):
 ## Phase 4 status
 
 - **Multiple sessions**: Server holds `Vec<Session>`, each session owns windows. Clients track their own `session_idx` + `active_window`.
-- **Session commands**: `Ctrl-A C` (new session, uppercase), `Ctrl-A N` (next session), `Ctrl-A P` (previous session). Session names auto-generated: `session`, `session-2`, `session-3`, etc.
-- **Multiple windows**: `Ctrl-A c` (new window), `Ctrl-A n`/`Space` (next), `Ctrl-A p` (prev), `Ctrl-A 0-9` (select), `Ctrl-A x` (kill).
+- **Session commands**: `Ctrl-A C` (new session, uppercase), `Ctrl-A N` (next session), `Ctrl-A P` (previous session). Session names derived from CWD basename (e.g. `lrmux`), with `-2`, `-3` suffixes on collision.
+- **Multiple windows**: `Ctrl-A c` (new window), `Ctrl-A n`/`Space` (next), `Ctrl-A p` (prev), `Ctrl-A 0-9` (select), `Ctrl-A x` (kill), `Ctrl-A k` (kill with y/n confirmation).
+- **Kill session**: `Ctrl-A K` (kill current session with typed-name confirmation, shows window count).
 - **Per-client views**: Each client has its own active session and active window. Grid updates are routed only to clients viewing the relevant window.
-- **Status bar**: Blue background, session name in cyan, window list with active window highlighted in bold yellow. `*` marks the active window.
-- **SIGWINCH**: Client detects terminal resize and sends `Resize` to server, which resizes all windows (accounting for 1-row status bar).
+- **Status bar**: Blue background, session name in cyan, window list with active window highlighted in bold yellow. `*` marks the active window. Positioned at the bottom of the terminal.
+- **Viewport model**: Canonical grid size set by the first client. SIGWINCH does NOT resize panes — the client renders a viewport (crop if smaller, filler if larger). `Ctrl-A F` sends an explicit canonical resize to the server. Filler region uses dim background with thin border lines.
 - **Server lifecycle**: Server persists until all sessions are closed. Last window in a session removes the session. Last session shuts down the server.
 - **Concurrent clients**: Multiple clients can connect to the same server simultaneously.
 - **CLI commands**: `lrmux` (default: selector or auto-join), `lrmux new-session [name]`, `lrmux new-server [name]`, `lrmux ls-servers`, `lrmux ls-sessions [server]`, `lrmux kill-server [name]`.
 - **Server discovery**: Scans `/tmp/lrmux-<UID>/` for socket files and probes each to find running servers.
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
-- **Not yet implemented**: Pane splits, layout engine, viewport model (canonical grid + filler), interactive selector TUI (j/k navigation, fuzzy filter), session persistence across restart.
+- **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.
+- **Not yet implemented**: Pane splits, layout engine, child exit behavior (auto-close on 0, keep on non-zero), window auto-renumber, copy/scrollback mode, clipboard, TOML config loading, F-key shortcuts.

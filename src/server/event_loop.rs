@@ -204,16 +204,27 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         }
                                     }
                                     ClientMsg::Resize { rows, cols } => {
-                                        // Resize all windows in all sessions.
-                                        grid_rows = rows.saturating_sub(1);
-                                        grid_cols = cols;
-                                        for session in &mut sessions {
-                                            for w in &mut session.windows {
-                                                w.pane.resize(grid_rows, grid_cols);
+                                        // Explicit canonical resize (Prefix F).
+                                        // Only resize the current session's panes, not all sessions.
+                                        let si = clients[client_idx].session_idx;
+                                        let new_grid_rows = rows.saturating_sub(1);
+                                        let new_grid_cols = cols;
+                                        if si < sessions.len() {
+                                            for w in &mut sessions[si].windows {
+                                                w.pane.resize(new_grid_rows, new_grid_cols);
                                             }
                                         }
-                                        for ci in 0..clients.len() {
-                                            if !need_snapshot.contains(&ci) {
+                                        // Update global grid size if the first session was resized
+                                        // (used for new windows/sessions created after this point).
+                                        if si == 0 {
+                                            grid_rows = new_grid_rows;
+                                            grid_cols = new_grid_cols;
+                                        }
+                                        // Send snapshots to all clients viewing this session.
+                                        for (ci, client) in clients.iter().enumerate() {
+                                            if client.session_idx == si
+                                                && !need_snapshot.contains(&ci)
+                                            {
                                                 need_snapshot.push(ci);
                                             }
                                         }
