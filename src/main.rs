@@ -93,6 +93,9 @@ enum CliAction {
     /// `--tcp` / `--ws` are listen addresses, not client connect targets.
     NewServer {
         name: String,
+        /// First session name when the user passed `-s`. `None` for an
+        /// auto-picked server name, which leaves the session as the cwd.
+        session: Option<String>,
         control: bool,
         command: Option<String>,
         headless: bool,
@@ -494,13 +497,14 @@ fn note_tcp_server(name: &str) {
 /// `force_headless` is set for the `start-server` alias.
 fn parse_new_server(args: &[String], force_headless: bool) -> CliAction {
     let parsed = cmd::parse_flags(args);
-    let name = parsed
+    let session = parsed
         .get("s")
         .or_else(|| parsed.get("server"))
-        .map(|s| s.to_string())
-        .unwrap_or_else(ipc::auto_server_name);
+        .map(|s| s.to_string());
+    let name = session.clone().unwrap_or_else(ipc::auto_server_name);
     CliAction::NewServer {
         name,
+        session,
         control: parsed.has("CC"),
         command: shell_command_from_parsed(&parsed),
         headless: force_headless || parsed.has("headless"),
@@ -831,6 +835,7 @@ fn run() -> io::Result<()> {
             }
             CliAction::NewServer {
                 name,
+                session,
                 control,
                 command,
                 headless,
@@ -857,7 +862,7 @@ fn run() -> io::Result<()> {
                     headless,
                     ServerInit {
                         command: command.as_deref(),
-                        session: None,
+                        session: session.as_deref(),
                         cwd: None,
                     },
                 )?;
@@ -1084,13 +1089,14 @@ fn run() -> io::Result<()> {
             // Outside lrmux: start a new server if needed, create a window with the command, attach.
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                return start_new_server("default", Some(None), None, None, None);
+                return start_new_server("default", Some(None), None, None, None, None);
             }
             // Server exists: create a new window with the command and attach.
             client::run(&sock, None, None, Some(cmd), None)
         }
         CliAction::NewServer {
             name,
+            session,
             control,
             command,
             headless,
@@ -1118,7 +1124,7 @@ fn run() -> io::Result<()> {
                     ws.as_deref(),
                     ServerInit {
                         command: command.as_deref(),
-                        session: None,
+                        session: session.as_deref(),
                         cwd: None,
                     },
                 )?;
@@ -1130,12 +1136,19 @@ fn run() -> io::Result<()> {
                     ws.as_deref(),
                     ServerInit {
                         command: command.as_deref(),
-                        session: None,
+                        session: session.as_deref(),
                         cwd: None,
                     },
                 )
             } else {
-                start_new_server(&name, None, command, tcp.as_deref(), ws.as_deref())
+                start_new_server(
+                    &name,
+                    None,
+                    command,
+                    tcp.as_deref(),
+                    ws.as_deref(),
+                    session.as_deref(),
+                )
             }
         }
         CliAction::Discover => cmd_discover(),
@@ -1217,11 +1230,13 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
             }
             let sock = socket_path(&server);
             if !ipc::server_exists(&sock) {
-                start_new_server(&server, None, None, None, None)?;
+                start_new_server(&server, None, None, None, None, None)?;
             }
             client::run(&sock, Some(name), None, None, None)
         }
-        Ok(SelectorResult::NewServer { name }) => start_new_server(&name, None, None, None, None),
+        Ok(SelectorResult::NewServer { name }) => {
+            start_new_server(&name, None, None, None, None, Some(&name))
+        }
         Ok(SelectorResult::Quit) => Ok(()),
         Err(e) => {
             // Selector failed (e.g. no raw mode) — fall back to default server.
@@ -1245,6 +1260,7 @@ fn start_new_server(
     command: Option<String>,
     tcp_listen: Option<&str>,
     ws_listen: Option<&str>,
+    session: Option<&str>,
 ) -> io::Result<()> {
     let sock = socket_path(name);
 
@@ -1275,7 +1291,7 @@ fn start_new_server(
         false,
         ServerInit {
             command: command.as_deref(),
-            session: None,
+            session,
             cwd: None,
         },
     )?;
