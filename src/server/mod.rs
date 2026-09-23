@@ -82,7 +82,7 @@ pub fn tls_fingerprint() -> &'static str {
 /// If `tcp_addr` / `ws_addr` are provided (CLI), they override
 /// `network.tcp_listen` / `network.ws_listen`.
 /// If `headless` is true, create a default session without waiting for
-/// the first client (used by `lrmux start-server`).
+/// the first client (used by `lrmux new-server --headless` / `start-server`).
 ///
 /// Optional bootstrap env (set by the parent before fork, cleared here):
 /// - `LRMUX_INIT_COMMAND` — first window runs `$SHELL -ci <command>`

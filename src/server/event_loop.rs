@@ -156,8 +156,8 @@ pub fn run(
 
     let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
         // Headless mode: create a default session (24x80) without waiting
-        // for the first client. Used by `lrmux start-server` for testing
-        // and remote management.
+        // for the first client. Used by `lrmux new-server --headless`
+        // (`start-server` is the same) for testing and remote management.
         let session_name = boot.session_name.clone().unwrap_or_else(|| {
             std::env::current_dir()
                 .ok()
@@ -2026,7 +2026,9 @@ fn accept_new_client(
             let mut stream = match wrap_accepted_stream(stream) {
                 Ok(s) => s,
                 Err(e) => {
-                    crate::log::warn(&format!("TLS wrap failed on accept: {e}"));
+                    let line = format!("{e}");
+                    crate::log::warn(&format!("TCP accept: {line}"));
+                    eprintln!("lrmux: {line}");
                     return Ok(());
                 }
             };
