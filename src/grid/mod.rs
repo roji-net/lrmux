@@ -1,0 +1,495 @@
+// Grid: screen grid + scrollback ring buffer, cursor, terminal state.
+
+pub mod cell;
+pub mod scrollback;
+
+pub use cell::{Attr, Cell, Color};
+use scrollback::Scrollback;
+
+/// The terminal screen grid.
+///
+/// Stores the visible rows plus scrollback history. The cursor position
+/// and current text attributes (fg/bg/attrs) are tracked here so the VT
+/// parser can update them as it processes escape sequences.
+pub struct Grid {
+    rows: Vec<Vec<Cell>>,
+    cols: usize,
+    row_count: usize,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub cursor_visible: bool,
+    /// Current foreground color for newly printed chars.
+    pub fg: Color,
+    /// Current background color for newly printed chars.
+    pub bg: Color,
+    /// Current text attributes for newly printed chars.
+    pub attrs: Attr,
+    /// Scrollback history (rows that scrolled off the top).
+    pub scrollback: Scrollback,
+    /// Scroll region top (inclusive), 0-indexed.
+    scroll_top: usize,
+    /// Scroll region bottom (exclusive), 0-indexed.
+    scroll_bottom: usize,
+    /// Whether the next print should wrap to the next line.
+    wrap_pending: bool,
+    /// Saved cursor position (for DECSC/DECRC).
+    saved_cursor: Option<(usize, usize)>,
+    /// Rows modified since the last render. The renderer uses this to
+    /// skip unchanged rows instead of scanning the entire grid.
+    dirty: Vec<bool>,
+}
+
+impl Grid {
+    pub fn new(rows: usize, cols: usize, scrollback_capacity: usize) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let mut grid = Self {
+            rows: (0..rows).map(|_| vec![Cell::blank(); cols]).collect(),
+            cols,
+            row_count: rows,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            fg: Color::Default,
+            bg: Color::Default,
+            attrs: Attr::default(),
+            scrollback: Scrollback::new(scrollback_capacity),
+            scroll_top: 0,
+            scroll_bottom: rows,
+            wrap_pending: false,
+            saved_cursor: None,
+            dirty: vec![true; rows],
+        };
+        grid.scroll_bottom = rows;
+        grid
+    }
+
+    pub fn rows(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Mark a row as dirty (modified since last render).
+    #[inline]
+    fn mark_dirty(&mut self, row: usize) {
+        if row < self.dirty.len() {
+            self.dirty[row] = true;
+        }
+    }
+
+    /// Mark all rows as dirty.
+    fn mark_all_dirty(&mut self) {
+        for d in &mut self.dirty {
+            *d = true;
+        }
+    }
+
+    /// Take the dirty row set, returning a vector of dirty row indices
+    /// and clearing the dirty flags. Called by the renderer after scanning.
+    pub fn take_dirty(&mut self) -> Vec<usize> {
+        let mut dirty_rows = Vec::new();
+        for (i, d) in self.dirty.iter_mut().enumerate() {
+            if *d {
+                dirty_rows.push(i);
+                *d = false;
+            }
+        }
+        dirty_rows
+    }
+
+    /// Resize the grid. Content is preserved where possible; new cells are blank.
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        // Adjust row count.
+        if rows > self.row_count {
+            // Add blank rows at the bottom.
+            for _ in self.row_count..rows {
+                self.rows.push(vec![Cell::blank(); cols]);
+            }
+        } else if rows < self.row_count {
+            // Remove rows from the bottom, pushing them to scrollback.
+            for _ in rows..self.row_count {
+                let row = self.rows.remove(self.rows.len() - 1);
+                // Only push non-blank rows to scrollback.
+                self.scrollback.push(row);
+            }
+        }
+
+        // Adjust column count for each row.
+        for row in &mut self.rows {
+            if cols > row.len() {
+                row.resize(cols, Cell::blank());
+            } else if cols < row.len() {
+                row.truncate(cols);
+            }
+        }
+
+        self.row_count = rows;
+        self.cols = cols;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows;
+        self.dirty.resize(rows, true);
+        self.mark_all_dirty();
+        // Clamp cursor.
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.wrap_pending = false;
+    }
+
+    /// Get a reference to a row. Returns None if out of bounds.
+    pub fn row(&self, row: usize) -> Option<&[Cell]> {
+        self.rows.get(row).map(|r| &r[..])
+    }
+
+    /// Get a mutable reference to a row. Returns None if out of bounds.
+    fn row_mut(&mut self, row: usize) -> Option<&mut Vec<Cell>> {
+        self.rows.get_mut(row)
+    }
+
+    /// Get a specific cell. Returns None if out of bounds.
+    pub fn cell(&self, row: usize, col: usize) -> Option<&Cell> {
+        self.rows.get(row).and_then(|r| r.get(col))
+    }
+
+    /// Print a character at the cursor position, advancing the cursor.
+    pub fn print(&mut self, c: char) {
+        // Handle wrap: if we were at the last column and need to wrap.
+        if self.wrap_pending {
+            self.cursor_col = 0;
+            self.cursor_row += 1;
+            self.wrap_pending = false;
+            if self.cursor_row >= self.scroll_bottom {
+                self.scroll_up(1);
+                self.cursor_row = self.scroll_bottom.saturating_sub(1);
+            }
+        }
+
+        if self.cursor_col >= self.cols {
+            // Should not happen if wrap_pending is handled, but clamp just in case.
+            self.cursor_col = self.cols.saturating_sub(1);
+        }
+
+        // Write the cell.
+        let (fg, bg, attrs) = (self.fg, self.bg, self.attrs);
+        let (crow, ccol) = (self.cursor_row, self.cursor_col);
+        if let Some(row) = self.rows.get_mut(crow)
+            && ccol < row.len()
+        {
+            row[ccol] = Cell {
+                ch: c,
+                fg,
+                bg,
+                attrs,
+            };
+        }
+        self.mark_dirty(crow);
+
+        // Advance cursor.
+        self.cursor_col += 1;
+        if self.cursor_col >= self.cols {
+            // Wrap to next line on next print.
+            self.cursor_col = self.cols.saturating_sub(1);
+            self.wrap_pending = true;
+        }
+    }
+
+    /// Move cursor to absolute position.
+    pub fn move_cursor(&mut self, row: usize, col: usize) {
+        self.cursor_row = row.min(self.row_count.saturating_sub(1));
+        self.cursor_col = col.min(self.cols.saturating_sub(1));
+        self.wrap_pending = false;
+    }
+
+    /// Move cursor relative to current position.
+    pub fn move_cursor_rel(&mut self, drow: i32, dcol: i32) {
+        let new_row = self.cursor_row as i32 + drow;
+        let new_col = self.cursor_col as i32 + dcol;
+        self.move_cursor(new_row.max(0) as usize, new_col.max(0) as usize);
+    }
+
+    /// Carriage return: move cursor to column 0.
+    pub fn carriage_return(&mut self) {
+        self.cursor_col = 0;
+        self.wrap_pending = false;
+    }
+
+    /// Line feed: move cursor down one row, scrolling if needed.
+    pub fn line_feed(&mut self) {
+        self.cursor_row += 1;
+        if self.cursor_row >= self.scroll_bottom {
+            self.scroll_up(1);
+            self.cursor_row = self.scroll_bottom - 1;
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Backspace: move cursor left one column.
+    pub fn backspace(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        }
+        self.wrap_pending = false;
+    }
+
+    /// Tab: move cursor to next multiple of 8.
+    pub fn tab(&mut self) {
+        let next = (self.cursor_col / 8 + 1) * 8;
+        self.cursor_col = next.min(self.cols.saturating_sub(1));
+        self.wrap_pending = false;
+    }
+
+    /// Scroll the scroll region up by n lines. Lines that scroll off the top
+    /// go to the scrollback buffer.
+    pub fn scroll_up(&mut self, n: usize) {
+        let n = n.min(self.scroll_bottom - self.scroll_top);
+        if n == 0 {
+            return;
+        }
+
+        // Save scrolled-off rows to scrollback, replacing with blank rows
+        // of the correct width so the Vec never becomes empty.
+        let blank_row = vec![Cell::blank(); self.cols];
+        for i in 0..n {
+            let row_idx = self.scroll_top + i;
+            if row_idx < self.rows.len() {
+                let row = std::mem::replace(&mut self.rows[row_idx], blank_row.clone());
+                self.scrollback.push(row);
+            }
+        }
+
+        // Shift rows up: rotate the scroll region left by n.
+        // The blank rows we inserted at the top end up at the bottom.
+        self.rows[self.scroll_top..self.scroll_bottom].rotate_left(n);
+
+        // All rows in the scroll region changed.
+        for i in self.scroll_top..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Scroll the scroll region down by n lines (e.g., for reverse line feed).
+    pub fn scroll_down(&mut self, n: usize) {
+        let n = n.min(self.scroll_bottom - self.scroll_top);
+        if n == 0 {
+            return;
+        }
+
+        // Insert blank rows at the top, then rotate right by n.
+        let blank_row = vec![Cell::blank(); self.cols];
+        for i in 0..n {
+            let row_idx = self.scroll_top + i;
+            if row_idx < self.rows.len() {
+                self.rows[row_idx] = blank_row.clone();
+            }
+        }
+
+        // Shift rows down: rotate the scroll region right by n.
+        // The blank rows we inserted at the top push existing content down.
+        self.rows[self.scroll_top..self.scroll_bottom].rotate_right(n);
+
+        for i in self.scroll_top..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Erase from cursor to end of line.
+    pub fn erase_to_end_of_line(&mut self) {
+        let (crow, ccol) = (self.cursor_row, self.cursor_col);
+        if let Some(row) = self.rows.get_mut(crow) {
+            let start = ccol.min(row.len());
+            for cell in &mut row[start..] {
+                *cell = Cell::blank();
+            }
+        }
+        self.mark_dirty(crow);
+    }
+
+    /// Erase from start of line to cursor (inclusive).
+    pub fn erase_to_cursor(&mut self) {
+        let (crow, ccol) = (self.cursor_row, self.cursor_col);
+        if let Some(row) = self.rows.get_mut(crow) {
+            if row.is_empty() {
+                return;
+            }
+            let end = ccol.min(row.len() - 1);
+            for cell in &mut row[..=end] {
+                *cell = Cell::blank();
+            }
+        }
+        self.mark_dirty(crow);
+    }
+
+    /// Erase the entire current line.
+    pub fn erase_line(&mut self) {
+        let crow = self.cursor_row;
+        if let Some(row) = self.row_mut(crow) {
+            for cell in row.iter_mut() {
+                *cell = Cell::blank();
+            }
+        }
+        self.mark_dirty(crow);
+    }
+
+    /// Erase from cursor to end of screen.
+    pub fn erase_to_end_of_screen(&mut self) {
+        self.erase_to_end_of_line();
+        for i in (self.cursor_row + 1)..self.row_count {
+            if let Some(row) = self.row_mut(i) {
+                for cell in row.iter_mut() {
+                    *cell = Cell::blank();
+                }
+            }
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Erase from start of screen to cursor (inclusive).
+    pub fn erase_to_start_of_screen(&mut self) {
+        self.erase_to_cursor();
+        for i in 0..self.cursor_row {
+            if let Some(row) = self.row_mut(i) {
+                for cell in row.iter_mut() {
+                    *cell = Cell::blank();
+                }
+            }
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Erase the entire screen.
+    pub fn erase_screen(&mut self) {
+        for i in 0..self.row_count {
+            if let Some(row) = self.row_mut(i) {
+                for cell in row.iter_mut() {
+                    *cell = Cell::blank();
+                }
+            }
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Set the scroll region (DECSTBM). Both are 0-indexed, top inclusive, bottom exclusive.
+    pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        self.scroll_top = top.min(self.row_count);
+        self.scroll_bottom = bottom.min(self.row_count).max(top + 1);
+    }
+
+    /// Reset the scroll region to the full screen.
+    pub fn reset_scroll_region(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.row_count;
+    }
+
+    /// Set the current text attributes from SGR parameters.
+    pub fn set_sgr(&mut self, params: &[u16]) {
+        if params.is_empty() {
+            self.fg = Color::Default;
+            self.bg = Color::Default;
+            self.attrs = Attr::default();
+            return;
+        }
+
+        let mut i = 0;
+        while i < params.len() {
+            match params[i] {
+                0 => {
+                    self.fg = Color::Default;
+                    self.bg = Color::Default;
+                    self.attrs = Attr::default();
+                }
+                1 => self.attrs.bold = true,
+                3 => self.attrs.italic = true,
+                4 => self.attrs.underline = true,
+                7 => self.attrs.reverse = true,
+                22 => self.attrs.bold = false,
+                23 => self.attrs.italic = false,
+                24 => self.attrs.underline = false,
+                27 => self.attrs.reverse = false,
+                38 => {
+                    // Foreground color
+                    if i + 1 < params.len() {
+                        match params[i + 1] {
+                            2 => {
+                                // Truecolor: 38;2;R;G;B
+                                if i + 4 < params.len() {
+                                    self.fg = Color::Rgb(
+                                        params[i + 2] as u8,
+                                        params[i + 3] as u8,
+                                        params[i + 4] as u8,
+                                    );
+                                    i += 4;
+                                }
+                            }
+                            5 if i + 2 < params.len() => {
+                                // 256-color: 38;5;N
+                                self.fg = Color::Indexed(params[i + 2] as u8);
+                                i += 2;
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                39 => self.fg = Color::Default,
+                48 => {
+                    // Background color
+                    if i + 1 < params.len() {
+                        match params[i + 1] {
+                            2 => {
+                                // Truecolor: 48;2;R;G;B
+                                if i + 4 < params.len() {
+                                    self.bg = Color::Rgb(
+                                        params[i + 2] as u8,
+                                        params[i + 3] as u8,
+                                        params[i + 4] as u8,
+                                    );
+                                    i += 4;
+                                }
+                            }
+                            5 if i + 2 < params.len() => {
+                                // 256-color: 48;5;N
+                                self.bg = Color::Indexed(params[i + 2] as u8);
+                                i += 2;
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                49 => self.bg = Color::Default,
+                30..=37 => {
+                    // Standard 16-color foreground
+                    self.fg = Color::Indexed(params[i] as u8 - 30);
+                }
+                90..=97 => {
+                    // Bright foreground
+                    self.fg = Color::Indexed(params[i] as u8 - 90 + 8);
+                }
+                40..=47 => {
+                    // Standard 16-color background
+                    self.bg = Color::Indexed(params[i] as u8 - 40);
+                }
+                100..=107 => {
+                    // Bright background
+                    self.bg = Color::Indexed(params[i] as u8 - 100 + 8);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// Save the current cursor position.
+    pub fn save_cursor(&mut self) {
+        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+    }
+
+    /// Restore the saved cursor position.
+    pub fn restore_cursor(&mut self) {
+        if let Some((row, col)) = self.saved_cursor {
+            self.move_cursor(row, col);
+        }
+    }
+}

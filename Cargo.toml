@@ -1,0 +1,23 @@
+[package]
+name = "lrmux"
+version = "0.1.0"
+edition = "2024"
+description = "A modern, fast, minimal-dependency terminal multiplexer"
+license = "MIT"
+repository = "https://github.com/roji-net/lrmux"
+keywords = ["terminal", "multiplexer", "tmux", "byobu"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+nix = { version = "0.30", features = ["term", "process", "event", "fs", "user"] }
+libc = "0.2"
+vte = "0.13"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
