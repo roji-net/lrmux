@@ -141,6 +141,8 @@ enum CliAction {
     RenameWindow { target: cmd::Target, name: String },
     /// `versions`: show client and all server versions.
     Versions,
+    /// `-v` / `--version`: this binary's version only.
+    ClientVersion,
     /// `--help` / `-h`, or `help [command]`. `Some` is the command topic.
     Help(Option<String>),
     /// Unrecognized subcommand — must not fall through to Default
@@ -221,6 +223,7 @@ fn parse_args() -> CliAction {
 
     match subcmd {
         Some("--help") | Some("-h") => CliAction::Help(None),
+        Some("--version") | Some("-v") => CliAction::ClientVersion,
         Some("help") => {
             let topic = subcmd_args
                 .iter()
@@ -910,6 +913,10 @@ fn run() -> io::Result<()> {
         )),
         CliAction::Versions => {
             print_versions();
+            Ok(())
+        }
+        CliAction::ClientVersion => {
+            println!("lrmux {}", crate::version::VERSION);
             Ok(())
         }
         CliAction::ControlMode { target } => run_control_mode(target.as_deref()),

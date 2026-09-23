@@ -58,6 +58,25 @@ impl ConnStream {
     pub fn is_ws(&self) -> bool {
         matches!(self, ConnStream::Ws(_))
     }
+
+    /// TLS and WebSocket are not a raw byte pipe. Reading or writing the
+    /// file descriptor directly bypasses the framing and corrupts the session.
+    pub fn is_framed(&self) -> bool {
+        matches!(
+            self,
+            ConnStream::TlsClient(_) | ConnStream::TlsServer(_) | ConnStream::Ws(_)
+        )
+    }
+
+    /// Ciphertext (or a WS frame) still queued above the socket.
+    /// The poll loop must watch POLLOUT even when the plaintext outbuf is empty.
+    pub fn wants_write(&self) -> bool {
+        match self {
+            ConnStream::TlsClient(s) => s.conn.wants_write(),
+            ConnStream::TlsServer(s) => s.conn.wants_write(),
+            ConnStream::Ws(_) | ConnStream::Unix(_) | ConnStream::Tcp(_) => false,
+        }
+    }
 }
 
 impl Read for ConnStream {
