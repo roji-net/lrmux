@@ -10,9 +10,9 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 
 use crate::ipc;
-use crate::proto::{self, ClientMsg, ServerMsg};
+use crate::proto::{self, ClientMsg, ServerMsg, SessionInfo};
 use crate::pty;
-use crate::server::session::Session;
+use crate::server::session::{Session, unix_now};
 use crate::server::state;
 use crate::server::window::Window;
 
@@ -358,7 +358,7 @@ pub fn run(
             if fds[li].revents & libc::POLLIN != 0 {
                 match accept_new_client(
                     &listeners[li],
-                    &sessions,
+                    &mut sessions,
                     grid_rows,
                     grid_cols,
                     &mut clients,
@@ -409,6 +409,8 @@ pub fn run(
         // We must NOT modify sessions/windows during this pass because
         // pty_map indices would become stale for subsequent PTYs.
         let mut pty_exits: Vec<(usize, usize, i32)> = Vec::new();
+        let mut pty_activity: Vec<(usize, usize)> = Vec::new();
+        let mut need_status_bar_all = false;
         for pty_i in 0..num_pty_fds {
             let pf = &fds[pty_base + pty_i];
             if pf.revents & libc::POLLIN != 0 {
@@ -434,6 +436,7 @@ pub fn run(
                         for q in osc_queries {
                             proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
                         }
+                        pty_activity.push((si, wi));
                     }
                     Ok((false, raw, osc_queries)) => {
                         let pane_id = pane.id;
@@ -460,6 +463,16 @@ pub fn run(
                         );
                     }
                 }
+            }
+        }
+
+        // Mark unseen activity on windows that produced output with no viewer.
+        for &(si, wi) in &pty_activity {
+            if si < sessions.len()
+                && wi < sessions[si].windows.len()
+                && note_window_output(&mut sessions, &clients, si, wi)
+            {
+                need_status_bar_all = true;
             }
         }
 
@@ -563,7 +576,7 @@ pub fn run(
         // Client input → parse frames → dispatch.
         let mut to_remove: Vec<usize> = Vec::new();
         let mut need_snapshot: Vec<usize> = Vec::new();
-        let mut need_status_bar_all = false;
+        // need_status_bar_all may already be set by PTY activity marking.
 
         for client_idx in 0..polled_clients {
             // Clients may have been removed during PTY processing (write
@@ -727,6 +740,11 @@ pub fn run(
                                                     &clients,
                                                     client_idx,
                                                 );
+                                                let new_aw = clients[client_idx].active_window;
+                                                if clear_window_activity(&mut sessions[si], new_aw)
+                                                {
+                                                    need_status_bar_all = true;
+                                                }
                                                 if !need_snapshot.contains(&client_idx) {
                                                     need_snapshot.push(client_idx);
                                                 }
@@ -746,6 +764,11 @@ pub fn run(
                                                     &clients,
                                                     client_idx,
                                                 );
+                                                let new_aw = clients[client_idx].active_window;
+                                                if clear_window_activity(&mut sessions[si], new_aw)
+                                                {
+                                                    need_status_bar_all = true;
+                                                }
                                                 if !need_snapshot.contains(&client_idx) {
                                                     need_snapshot.push(client_idx);
                                                 }
@@ -762,6 +785,12 @@ pub fn run(
                                                     &clients,
                                                     client_idx,
                                                 );
+                                                if clear_window_activity(
+                                                    &mut sessions[si],
+                                                    index as usize,
+                                                ) {
+                                                    need_status_bar_all = true;
+                                                }
                                                 if !need_snapshot.contains(&client_idx) {
                                                     need_snapshot.push(client_idx);
                                                 }
@@ -932,6 +961,9 @@ pub fn run(
                                                 clients[client_idx].session_idx =
                                                     (si + 1) % sessions.len();
                                                 clients[client_idx].active_window = 0;
+                                                let new_si = clients[client_idx].session_idx;
+                                                let _ =
+                                                    clear_window_activity(&mut sessions[new_si], 0);
                                                 if !need_snapshot.contains(&client_idx) {
                                                     need_snapshot.push(client_idx);
                                                 }
@@ -947,6 +979,9 @@ pub fn run(
                                                     si - 1
                                                 };
                                                 clients[client_idx].active_window = 0;
+                                                let new_si = clients[client_idx].session_idx;
+                                                let _ =
+                                                    clear_window_activity(&mut sessions[new_si], 0);
                                                 if !need_snapshot.contains(&client_idx) {
                                                     need_snapshot.push(client_idx);
                                                 }
@@ -961,6 +996,10 @@ pub fn run(
                                                     // Interactive client: switch just this one.
                                                     clients[client_idx].session_idx = idx;
                                                     clients[client_idx].active_window = 0;
+                                                    if clear_window_activity(&mut sessions[idx], 0)
+                                                    {
+                                                        // cleared; status bar broadcast follows
+                                                    }
                                                     if !need_snapshot.contains(&client_idx) {
                                                         need_snapshot.push(client_idx);
                                                     }
@@ -975,6 +1014,10 @@ pub fn run(
                                                             }
                                                         }
                                                     }
+                                                    let _ = clear_window_activity(
+                                                        &mut sessions[idx],
+                                                        0,
+                                                    );
                                                 }
                                                 need_status_bar_all = true;
                                             } else {
@@ -1033,11 +1076,10 @@ pub fn run(
                                         }
                                         ClientMsg::Identify { .. } => {}
                                         ClientMsg::ListSessions => {
-                                            let names: Vec<String> =
-                                                sessions.iter().map(|s| s.name.clone()).collect();
+                                            let list = build_session_list(&sessions, &clients);
                                             let msg =
                                                 proto::encode_server(&ServerMsg::SessionList {
-                                                    sessions: names,
+                                                    sessions: list,
                                                     address: crate::server::server_address()
                                                         .to_string(),
                                                 });
@@ -1787,6 +1829,67 @@ fn window_names(session: &Session) -> Vec<String> {
     session.windows.iter().map(|w| w.name.clone()).collect()
 }
 
+fn window_activity_flags(session: &Session) -> Vec<bool> {
+    session.windows.iter().map(|w| w.activity).collect()
+}
+
+/// Build SessionList payload from current server state.
+fn build_session_list(sessions: &[Session], clients: &[ClientConn]) -> Vec<SessionInfo> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(si, s)| {
+            let attached = clients
+                .iter()
+                .filter(|c| c.attach && !c.is_control && c.session_idx == si)
+                .count() as u16;
+            SessionInfo {
+                name: s.name.clone(),
+                attached,
+                created: s.created_at,
+                last_activity: s.last_activity,
+                has_activity: s.has_activity(),
+            }
+        })
+        .collect()
+}
+
+/// Record PTY output on a window: bump last_activity, and mark unseen
+/// activity when no interactive client is viewing that window.
+/// Returns true if a new activity flag was set (status bar should refresh).
+fn note_window_output(
+    sessions: &mut [Session],
+    clients: &[ClientConn],
+    si: usize,
+    wi: usize,
+) -> bool {
+    let now = unix_now();
+    sessions[si].last_activity = now;
+    let has_viewer = clients
+        .iter()
+        .any(|c| c.attach && !c.is_control && c.session_idx == si && c.active_window == wi);
+    if has_viewer {
+        return false;
+    }
+    let flag = &mut sessions[si].windows[wi].activity;
+    if !*flag {
+        *flag = true;
+        true
+    } else {
+        false
+    }
+}
+
+/// Clear unseen-activity on a window. Returns true if it was set.
+fn clear_window_activity(session: &mut Session, wi: usize) -> bool {
+    if wi < session.windows.len() && session.windows[wi].activity {
+        session.windows[wi].activity = false;
+        true
+    } else {
+        false
+    }
+}
+
 fn encode_status_bar(
     session: &Session,
     active: u16,
@@ -1800,6 +1903,7 @@ fn encode_status_bar(
         session_count,
         high_output,
         server: crate::server::server_name().to_string(),
+        activity: window_activity_flags(session),
     })
 }
 
@@ -2094,7 +2198,7 @@ fn tcp_auth_ok(is_tcp: bool, token: &str) -> bool {
 /// New clients default to session 0, window 0.
 fn accept_new_client(
     listener: &crate::ipc::ConnListener,
-    sessions: &[Session],
+    sessions: &mut [Session],
     grid_rows: u16,
     grid_cols: u16,
     clients: &mut Vec<ClientConn>,
@@ -2125,9 +2229,9 @@ fn accept_new_client(
                 Ok(ClientMsg::IdentifyControl { auth_token, .. }) => (false, true, auth_token),
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
-                    let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+                    let list = build_session_list(sessions, clients);
                     let msg = proto::encode_server(&ServerMsg::SessionList {
-                        sessions: names,
+                        sessions: list,
                         address: crate::server::server_address().to_string(),
                     });
                     let _ = proto::send(&mut stream, &msg);
@@ -2175,6 +2279,14 @@ fn accept_new_client(
             // New client defaults to session 0, window 0.
             let session_idx = 0usize;
             let active = 0usize;
+            // Viewing a window clears its unseen-activity marker.
+            if attach
+                && !is_control
+                && session_idx < sessions.len()
+                && active < sessions[session_idx].windows.len()
+            {
+                let _ = clear_window_activity(&mut sessions[session_idx], active);
+            }
             // Only send snapshot + status bar to interactive clients (attach=true).
             // CLI commands (attach=false) only need the IdentifyAck.
             if attach {

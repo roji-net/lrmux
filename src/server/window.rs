@@ -13,6 +13,9 @@ pub struct Window {
     pub id: u32,
     pub pane: Pane,
     pub name: String,
+    /// True when this window produced output while no interactive client
+    /// was viewing it. Cleared when any client focuses the window.
+    pub activity: bool,
 }
 
 impl Window {
@@ -21,6 +24,7 @@ impl Window {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             pane: Pane::new(rows, cols),
             name,
+            activity: false,
         }
     }
 
@@ -29,6 +33,7 @@ impl Window {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             pane: Pane::new_in_cwd(rows, cols, cwd),
             name,
+            activity: false,
         }
     }
 
@@ -43,6 +48,7 @@ impl Window {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             pane: Pane::new_with_command(rows, cols, command, cwd),
             name,
+            activity: false,
         }
     }
 
