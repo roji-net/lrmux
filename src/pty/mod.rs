@@ -147,9 +147,13 @@ pub fn child_cwd_full(pid: Pid) -> Option<String> {
         }
         const PROC_PIDVNODEPATHINFO: u32 = 9;
         const MAXPATHLEN: usize = 1024;
+        // vnode_info is 152 bytes on macOS (arm64 and x86_64).
+        // vnode_info_path = vnode_info (152) + char[MAXPATHLEN] (1024) = 1176.
+        // proc_vnodepathinfo = 2 * vnode_info_path = 2352.
+        const VNODE_INFO_SIZE: usize = 152;
         #[repr(C)]
         struct VnodeInfoPath {
-            _vi: [u8; 48],
+            _vi: [u8; VNODE_INFO_SIZE],
             path: [u8; MAXPATHLEN],
         }
         #[repr(C)]
@@ -159,11 +163,11 @@ pub fn child_cwd_full(pid: Pid) -> Option<String> {
         }
         let mut info = ProcVnodePathInfo {
             cdir: VnodeInfoPath {
-                _vi: [0u8; 48],
+                _vi: [0u8; VNODE_INFO_SIZE],
                 path: [0u8; MAXPATHLEN],
             },
             _rdir: VnodeInfoPath {
-                _vi: [0u8; 48],
+                _vi: [0u8; VNODE_INFO_SIZE],
                 path: [0u8; MAXPATHLEN],
             },
         };
