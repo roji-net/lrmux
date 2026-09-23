@@ -745,6 +745,7 @@ pub fn run(
                             active,
                             session_count: sc,
                             high_output: h,
+                            server,
                         } => {
                             // Track last window for Ctrl-A Ctrl-A toggle.
                             let new_active = Some(active as u8);
@@ -761,6 +762,7 @@ pub fn run(
                                 active as usize,
                                 &server_version,
                                 h,
+                                &server,
                             );
                             let mut stdout = io::stdout();
                             if let Some(ref msg) = flash_msg {
@@ -1343,13 +1345,14 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 
 /// Format the status bar text with colors.
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
-/// The session name is shown first, then the window list.
+/// Identity is `[session]@server`, then the window list.
 fn format_status_bar(
     session: &str,
     windows: &[String],
     active: usize,
     server_version: &str,
     high_output: bool,
+    server: &str,
 ) -> String {
     // Each sequence starts with `0;` so reverse/underline/italic from the
     // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
@@ -1384,14 +1387,18 @@ fn format_status_bar(
             parts.push(format!("{}:{}", i, name));
         }
     }
+    let identity = if server.is_empty() {
+        format!("{SESSION}{session}{BAR}")
+    } else {
+        format!("[{SESSION}{session}{BAR}]@{server}")
+    };
     format!(
-        "{}lrmux {}{}{} | {}{} | {}{}",
+        "{}lrmux {}{}{} | {} | {}{}",
         BAR,
         version_marker,
         server_hash,
         BAR,
-        SESSION,
-        session,
+        identity,
         parts.join("  "),
         RESET
     )
@@ -2054,4 +2061,34 @@ fn osc_reply_end(buf: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_bar_shows_server_next_to_session() {
+        let text = format_status_bar(
+            "lrmux",
+            &["zsh".into()],
+            0,
+            "abc",
+            false,
+            "infra-284-letsencrypt",
+        );
+        let visible = strip_ansi(&text);
+        assert!(
+            visible.contains("[lrmux]@infra-284-letsencrypt"),
+            "{visible}"
+        );
+    }
+
+    #[test]
+    fn status_bar_omits_empty_server() {
+        let text = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "");
+        let visible = strip_ansi(&text);
+        assert!(!visible.contains('@'), "{visible}");
+        assert!(visible.contains("lrmux"), "{visible}");
+    }
 }

@@ -110,10 +110,84 @@ pub fn connect_tcp_with(addr: &str, net: &NetworkConfig) -> io::Result<ConnStrea
     }
 }
 
-/// Bind a TCP listener at the given address.
+/// Bind a TCP listener.
+///
+/// `auto` and a trailing `+` (`0.0.0.0:17280+`) try that port and then the
+/// next ones until one is free. A plain `host:port` binds exactly that address.
 pub fn listen_tcp(addr: &str) -> io::Result<std::net::TcpListener> {
-    let listener = std::net::TcpListener::bind(addr)?;
-    Ok(listener)
+    let addr = addr.trim();
+    if addr.eq_ignore_ascii_case("auto") {
+        return listen_tcp_first_free("0.0.0.0", DEFAULT_TCP_PORT);
+    }
+    if let Some(base) = addr.strip_suffix('+') {
+        let (host, port) = split_bind_host_port(base.trim())?;
+        return listen_tcp_first_free(&host, port);
+    }
+    std::net::TcpListener::bind(addr)
+}
+
+/// First port tried by `tcp_listen = "auto"` / `0.0.0.0:17280+`.
+pub const DEFAULT_TCP_PORT: u16 = 17280;
+
+fn listen_tcp_first_free(host: &str, start: u16) -> io::Result<std::net::TcpListener> {
+    const SPAN: u32 = 1024;
+    if start == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP port scan needs a start port greater than 0",
+        ));
+    }
+    let last = (start as u32 + SPAN - 1).min(u16::MAX as u32);
+    let mut in_use = None;
+    for port in start as u32..=last {
+        let candidate = format!("{host}:{port}");
+        match std::net::TcpListener::bind(&candidate) {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => in_use = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(in_use.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("no free TCP port on {host} from {start} to {last}"),
+        )
+    }))
+}
+
+fn split_bind_host_port(addr: &str) -> io::Result<(String, u16)> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid TCP address '{addr}+'"),
+            )
+        })?;
+        let port = parse_port(port)?;
+        return Ok((format!("[{host}]"), port));
+    }
+    let (host, port) = addr.rsplit_once(':').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TCP address '{addr}+' (want host:port+)"),
+        )
+    })?;
+    if host.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TCP address '{addr}+'"),
+        ));
+    }
+    Ok((host.to_string(), parse_port(port)?))
+}
+
+fn parse_port(port: &str) -> io::Result<u16> {
+    port.parse::<u16>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TCP port '{port}'"),
+        )
+    })
 }
 
 /// Wrap an accepted plain TCP stream in TLS if required by policy/config.
@@ -172,5 +246,27 @@ pub fn auto_server_name() -> String {
             return candidate;
         }
         n += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plus_suffix_skips_a_busy_port() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let next = listen_tcp(&format!("127.0.0.1:{port}+")).unwrap();
+        let got = next.local_addr().unwrap().port();
+        assert!(got > port, "bound {got}, busy was {port}");
+    }
+
+    #[test]
+    fn exact_address_does_not_scan() {
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let err = listen_tcp(&format!("127.0.0.1:{port}")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     }
 }
