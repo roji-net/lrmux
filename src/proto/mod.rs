@@ -20,6 +20,28 @@ pub enum ClientMsg {
     Resize { rows: u16, cols: u16 },
     /// Client disconnecting.
     Detach,
+    /// Create a new window.
+    NewWindow,
+    /// Switch to next window.
+    NextWindow,
+    /// Switch to previous window.
+    PrevWindow,
+    /// Select window by index.
+    SelectWindow { index: u8 },
+    /// Kill the active pane/window.
+    KillPane,
+    /// Create a new session and switch to it. Optional name.
+    NewSession { name: Option<String> },
+    /// Switch to next session.
+    NextSession,
+    /// Switch to previous session.
+    PrevSession,
+    /// Select a session by name.
+    SelectSession { name: String },
+    /// Kill the current session (and all its windows).
+    KillSession,
+    /// Request list of sessions on this server (for the selector).
+    ListSessions,
 }
 
 /// Server → Client messages.
@@ -27,11 +49,14 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     /// Acknowledge identify, send initial grid dimensions.
     IdentifyAck { rows: u16, cols: u16 },
-    /// Full grid snapshot (sent on first connect or after resize).
+    /// Full grid snapshot (sent on first connect, window switch, or after resize).
     GridSnapshot {
         rows: u16,
         cols: u16,
         cells: Vec<Cell>,
+        cursor_row: u16,
+        cursor_col: u16,
+        cursor_visible: bool,
     },
     /// Dirty rows update (sent after PTY output is parsed into the grid).
     GridUpdate {
@@ -44,6 +69,14 @@ pub enum ServerMsg {
     PaneExit { code: u8 },
     /// Error message.
     Error { msg: String },
+    /// Status bar content (session name, window list, active window).
+    StatusBarUpdate {
+        session: String,
+        windows: Vec<String>,
+        active: u16,
+    },
+    /// List of session names on this server (response to ListSessions).
+    SessionList { sessions: Vec<String> },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -52,12 +85,25 @@ const C_IDENTIFY: u8 = 0x01;
 const C_PANE_INPUT: u8 = 0x02;
 const C_RESIZE: u8 = 0x03;
 const C_DETACH: u8 = 0x04;
+const C_NEW_WINDOW: u8 = 0x05;
+const C_NEXT_WINDOW: u8 = 0x06;
+const C_PREV_WINDOW: u8 = 0x07;
+const C_SELECT_WINDOW: u8 = 0x08;
+const C_KILL_PANE: u8 = 0x09;
+const C_NEW_SESSION: u8 = 0x0a;
+const C_NEXT_SESSION: u8 = 0x0b;
+const C_PREV_SESSION: u8 = 0x0c;
+const C_SELECT_SESSION: u8 = 0x0f;
+const C_KILL_SESSION: u8 = 0x0e;
+const C_LIST_SESSIONS: u8 = 0x0d;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
 const S_GRID_UPDATE: u8 = 0x12;
 const S_PANE_EXIT: u8 = 0x13;
 const S_ERROR: u8 = 0x14;
+const S_STATUS_BAR: u8 = 0x15;
+const S_SESSION_LIST: u8 = 0x16;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -82,6 +128,50 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::Detach => {
             payload.push(C_DETACH);
         }
+        ClientMsg::NewWindow => {
+            payload.push(C_NEW_WINDOW);
+        }
+        ClientMsg::NextWindow => {
+            payload.push(C_NEXT_WINDOW);
+        }
+        ClientMsg::PrevWindow => {
+            payload.push(C_PREV_WINDOW);
+        }
+        ClientMsg::SelectWindow { index } => {
+            payload.push(C_SELECT_WINDOW);
+            payload.push(*index);
+        }
+        ClientMsg::KillPane => {
+            payload.push(C_KILL_PANE);
+        }
+        ClientMsg::NewSession { name } => {
+            payload.push(C_NEW_SESSION);
+            match name {
+                Some(n) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(n.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(n.as_bytes());
+                }
+                None => payload.push(0),
+            }
+        }
+        ClientMsg::NextSession => {
+            payload.push(C_NEXT_SESSION);
+        }
+        ClientMsg::PrevSession => {
+            payload.push(C_PREV_SESSION);
+        }
+        ClientMsg::SelectSession { name } => {
+            payload.push(C_SELECT_SESSION);
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+        }
+        ClientMsg::KillSession => {
+            payload.push(C_KILL_SESSION);
+        }
+        ClientMsg::ListSessions => {
+            payload.push(C_LIST_SESSIONS);
+        }
     }
     frame(payload)
 }
@@ -95,7 +185,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
         }
-        ServerMsg::GridSnapshot { rows, cols, cells } => {
+        ServerMsg::GridSnapshot {
+            rows,
+            cols,
+            cells,
+            cursor_row,
+            cursor_col,
+            cursor_visible,
+        } => {
             payload.push(S_GRID_SNAPSHOT);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
@@ -103,6 +200,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             for cell in cells {
                 encode_cell(&mut payload, cell);
             }
+            payload.extend_from_slice(&cursor_row.to_le_bytes());
+            payload.extend_from_slice(&cursor_col.to_le_bytes());
+            payload.push(*cursor_visible as u8);
         }
         ServerMsg::GridUpdate {
             dirty,
@@ -131,6 +231,29 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(S_ERROR);
             payload.extend_from_slice(&(msg.len() as u32).to_le_bytes());
             payload.extend_from_slice(msg.as_bytes());
+        }
+        ServerMsg::StatusBarUpdate {
+            session,
+            windows,
+            active,
+        } => {
+            payload.push(S_STATUS_BAR);
+            payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
+            payload.extend_from_slice(session.as_bytes());
+            payload.extend_from_slice(&(windows.len() as u32).to_le_bytes());
+            for name in windows {
+                payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
+            }
+            payload.extend_from_slice(&active.to_le_bytes());
+        }
+        ServerMsg::SessionList { sessions } => {
+            payload.push(S_SESSION_LIST);
+            payload.extend_from_slice(&(sessions.len() as u32).to_le_bytes());
+            for name in sessions {
+                payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(name.as_bytes());
+            }
         }
     }
     frame(payload)
@@ -221,6 +344,33 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             Ok(ClientMsg::Resize { rows, cols })
         }
         C_DETACH => Ok(ClientMsg::Detach),
+        C_NEW_WINDOW => Ok(ClientMsg::NewWindow),
+        C_NEXT_WINDOW => Ok(ClientMsg::NextWindow),
+        C_PREV_WINDOW => Ok(ClientMsg::PrevWindow),
+        C_SELECT_WINDOW => {
+            let index = read_u8(&mut r)?;
+            Ok(ClientMsg::SelectWindow { index })
+        }
+        C_KILL_PANE => Ok(ClientMsg::KillPane),
+        C_NEW_SESSION => {
+            let has_name = read_u8(&mut r)?;
+            if has_name != 0 {
+                let len = read_u32(&mut r)? as usize;
+                let name = String::from_utf8_lossy(&r[..len]).into_owned();
+                Ok(ClientMsg::NewSession { name: Some(name) })
+            } else {
+                Ok(ClientMsg::NewSession { name: None })
+            }
+        }
+        C_NEXT_SESSION => Ok(ClientMsg::NextSession),
+        C_PREV_SESSION => Ok(ClientMsg::PrevSession),
+        C_SELECT_SESSION => {
+            let len = read_u32(&mut r)? as usize;
+            let name = String::from_utf8_lossy(&r[..len]).into_owned();
+            Ok(ClientMsg::SelectSession { name })
+        }
+        C_KILL_SESSION => Ok(ClientMsg::KillSession),
+        C_LIST_SESSIONS => Ok(ClientMsg::ListSessions),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -246,7 +396,17 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             for _ in 0..count {
                 cells.push(decode_cell(&mut r)?);
             }
-            Ok(ServerMsg::GridSnapshot { rows, cols, cells })
+            let cursor_row = read_u16(&mut r)?;
+            let cursor_col = read_u16(&mut r)?;
+            let cursor_visible = read_u8(&mut r)? != 0;
+            Ok(ServerMsg::GridSnapshot {
+                rows,
+                cols,
+                cells,
+                cursor_row,
+                cursor_col,
+                cursor_visible,
+            })
         }
         S_GRID_UPDATE => {
             let dirty_count = read_u32(&mut r)? as usize;
@@ -279,6 +439,36 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let bytes = r[..len].to_vec();
             let msg = String::from_utf8_lossy(&bytes).into_owned();
             Ok(ServerMsg::Error { msg })
+        }
+        S_STATUS_BAR => {
+            let session_len = read_u32(&mut r)? as usize;
+            let session = String::from_utf8_lossy(&r[..session_len]).into_owned();
+            r = &r[session_len..];
+            let count = read_u32(&mut r)? as usize;
+            let mut windows = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = read_u32(&mut r)? as usize;
+                let bytes = r[..len].to_vec();
+                r = &r[len..];
+                windows.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            let active = read_u16(&mut r)?;
+            Ok(ServerMsg::StatusBarUpdate {
+                session,
+                windows,
+                active,
+            })
+        }
+        S_SESSION_LIST => {
+            let count = read_u32(&mut r)? as usize;
+            let mut sessions = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = read_u32(&mut r)? as usize;
+                let bytes = r[..len].to_vec();
+                r = &r[len..];
+                sessions.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            Ok(ServerMsg::SessionList { sessions })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

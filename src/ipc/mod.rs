@@ -47,3 +47,29 @@ pub fn server_exists(path: &Path) -> bool {
 pub fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
+
+/// Generate a unique server name by scanning existing sockets.
+/// Returns "default" if free, otherwise "server-2", "server-3", etc.
+pub fn auto_server_name() -> String {
+    let uid = unsafe { libc::getuid() };
+    let dir = format!("/tmp/lrmux-{uid}");
+    let existing: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let base = "default";
+    if !existing.iter().any(|n| n == base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("server-{n}");
+        if !existing.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
