@@ -6,6 +6,7 @@ use crate::grid::{Cell, Grid};
 use crate::pty::{Pty, PtySize, default_shell_argv};
 use crate::vt;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use std::ffi::CString;
 
 /// A single pane: PTY + grid + VT parser.
 pub struct Pane {
@@ -25,7 +26,30 @@ impl Pane {
     /// Spawn a new pane with the default shell.
     pub fn new(rows: u16, cols: u16) -> Self {
         let argv = default_shell_argv();
-        let pty = Pty::spawn(&argv, PtySize { rows, cols });
+        Self::new_with_argv(rows, cols, &argv, None)
+    }
+
+    /// Spawn a new pane with the default shell in a specific directory.
+    pub fn new_in_cwd(rows: u16, cols: u16, cwd: &str) -> Self {
+        let argv = default_shell_argv();
+        Self::new_with_argv(rows, cols, &argv, Some(cwd))
+    }
+
+    /// Spawn a new pane with a custom command string.
+    /// The command is split by whitespace and executed via the shell.
+    pub fn new_with_command(rows: u16, cols: u16, command: &str) -> Self {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let argv = vec![
+            CString::new(shell).unwrap(),
+            CString::new("-c").unwrap(),
+            CString::new(command).unwrap(),
+        ];
+        Self::new_with_argv(rows, cols, &argv, None)
+    }
+
+    /// Spawn a new pane with the given argv and optional working directory.
+    fn new_with_argv(rows: u16, cols: u16, argv: &[CString], cwd: Option<&str>) -> Self {
+        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd);
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {

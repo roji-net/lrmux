@@ -181,9 +181,7 @@ impl Renderer {
     /// Force a full redraw on next render by invalidating all prev cells.
     pub fn invalidate(&mut self) {
         for row in &mut self.prev {
-            for cell in row.iter_mut() {
-                *cell = Cell::blank();
-            }
+            row.fill(Cell::blank());
         }
         self.prev_cursor = (usize::MAX, usize::MAX);
     }

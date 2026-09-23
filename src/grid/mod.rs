@@ -85,9 +85,7 @@ impl Grid {
 
     /// Mark all rows as dirty.
     pub fn mark_all_dirty(&mut self) {
-        for d in &mut self.dirty {
-            *d = true;
-        }
+        self.dirty.fill(true);
     }
 
     /// Take the dirty row set, returning a vector of dirty row indices
@@ -311,9 +309,7 @@ impl Grid {
         let (crow, ccol) = (self.cursor_row, self.cursor_col);
         if let Some(row) = self.rows.get_mut(crow) {
             let start = ccol.min(row.len());
-            for cell in &mut row[start..] {
-                *cell = Cell::blank();
-            }
+            row[start..].fill(Cell::blank());
         }
         self.mark_dirty(crow);
     }
@@ -326,9 +322,7 @@ impl Grid {
                 return;
             }
             let end = ccol.min(row.len() - 1);
-            for cell in &mut row[..=end] {
-                *cell = Cell::blank();
-            }
+            row[..=end].fill(Cell::blank());
         }
         self.mark_dirty(crow);
     }
@@ -337,9 +331,7 @@ impl Grid {
     pub fn erase_line(&mut self) {
         let crow = self.cursor_row;
         if let Some(row) = self.row_mut(crow) {
-            for cell in row.iter_mut() {
-                *cell = Cell::blank();
-            }
+            row.fill(Cell::blank());
         }
         self.mark_dirty(crow);
     }
@@ -349,9 +341,7 @@ impl Grid {
         self.erase_to_end_of_line();
         for i in (self.cursor_row + 1)..self.row_count {
             if let Some(row) = self.row_mut(i) {
-                for cell in row.iter_mut() {
-                    *cell = Cell::blank();
-                }
+                row.fill(Cell::blank());
             }
             self.mark_dirty(i);
         }
@@ -362,9 +352,7 @@ impl Grid {
         self.erase_to_cursor();
         for i in 0..self.cursor_row {
             if let Some(row) = self.row_mut(i) {
-                for cell in row.iter_mut() {
-                    *cell = Cell::blank();
-                }
+                row.fill(Cell::blank());
             }
             self.mark_dirty(i);
         }
@@ -374,9 +362,7 @@ impl Grid {
     pub fn erase_screen(&mut self) {
         for i in 0..self.row_count {
             if let Some(row) = self.row_mut(i) {
-                for cell in row.iter_mut() {
-                    *cell = Cell::blank();
-                }
+                row.fill(Cell::blank());
             }
             self.mark_dirty(i);
         }
