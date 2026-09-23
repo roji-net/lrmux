@@ -218,7 +218,8 @@ If no server is running, start a headless one first.\n\
         usage: "    \
 lrmux new-server [-s <name>] [--tcp <addr>] [--ws <addr>] [--headless] [-CC] [--] [<cmd> [args...]]",
         body: "\
--s, --server <name>    Server name (default: an unused local name)\n\
+-s, --server <name>    Server name (default: an unused local name).\n    \
+The first session gets this name too.\n\
 --tcp <addr>           Listen address, e.g. 0.0.0.0:17281.\n    \
 A trailing + (0.0.0.0:17280+) binds the first free port from there.\n    \
 This is where the server binds. The local client still\n    \

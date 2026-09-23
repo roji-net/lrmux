@@ -1787,6 +1787,22 @@ fn window_names(session: &Session) -> Vec<String> {
     session.windows.iter().map(|w| w.name.clone()).collect()
 }
 
+fn encode_status_bar(
+    session: &Session,
+    active: u16,
+    session_count: u16,
+    high_output: bool,
+) -> Vec<u8> {
+    proto::encode_server(&ServerMsg::StatusBarUpdate {
+        session: session.name.clone(),
+        windows: window_names(session),
+        active,
+        session_count,
+        high_output,
+        server: crate::server::server_name().to_string(),
+    })
+}
+
 /// Broadcast status bar to all clients (per-client, using each client's session + active window).
 fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
     let mut i = 0;
@@ -1796,13 +1812,12 @@ fn broadcast_status_bar(clients: &mut Vec<ClientConn>, sessions: &[Session]) {
             i += 1;
             continue;
         }
-        let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
-            session: sessions[si].name.clone(),
-            windows: window_names(&sessions[si]),
-            active: clients[i].active_window as u16,
-            session_count: sessions.len() as u16,
-            high_output: clients[i].suppressed,
-        });
+        let msg = encode_status_bar(
+            &sessions[si],
+            clients[i].active_window as u16,
+            sessions.len() as u16,
+            clients[i].suppressed,
+        );
         if !client_send(&mut clients[i], &msg) {
             clients.remove(i);
         } else {
@@ -1817,13 +1832,12 @@ fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
     if si >= sessions.len() || client.is_control {
         return;
     }
-    let msg = proto::encode_server(&ServerMsg::StatusBarUpdate {
-        session: sessions[si].name.clone(),
-        windows: window_names(&sessions[si]),
-        active: client.active_window as u16,
-        session_count: sessions.len() as u16,
-        high_output: client.suppressed,
-    });
+    let msg = encode_status_bar(
+        &sessions[si],
+        client.active_window as u16,
+        sessions.len() as u16,
+        client.suppressed,
+    );
     let _ = client_send(client, &msg);
 }
 
@@ -2045,13 +2059,7 @@ fn handshake_first_client(
     let _ = window.pane.take_dirty_rows(); // snapshot already has full state
 
     // Send status bar.
-    let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
-        session: session.name.clone(),
-        windows: vec![window.name.clone()],
-        active: 0,
-        session_count: 1,
-        high_output: false,
-    });
+    let status = encode_status_bar(&session, 0, 1, false);
     proto::send(&mut client, &status)?;
 
     let mut conn = ClientConn::new(client, true);
@@ -2190,13 +2198,8 @@ fn accept_new_client(
 
                 // Send status bar.
                 if let Some(session) = sessions.get(session_idx) {
-                    let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
-                        session: session.name.clone(),
-                        windows: window_names(session),
-                        active: active as u16,
-                        session_count: sessions.len() as u16,
-                        high_output: false,
-                    });
+                    let status =
+                        encode_status_bar(session, active as u16, sessions.len() as u16, false);
                     let _ = proto::send(&mut stream, &status);
                 }
             }
