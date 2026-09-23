@@ -746,6 +746,7 @@ pub fn run(
                             session_count: sc,
                             high_output: h,
                             server,
+                            activity,
                         } => {
                             // Track last window for Ctrl-A Ctrl-A toggle.
                             let new_active = Some(active as u8);
@@ -763,6 +764,7 @@ pub fn run(
                                 &server_version,
                                 h,
                                 &server,
+                                &activity,
                             );
                             let mut stdout = io::stdout();
                             if let Some(ref msg) = flash_msg {
@@ -795,7 +797,9 @@ pub fn run(
                         } => {
                             if pending_session_chooser {
                                 pending_session_chooser = false;
-                                if let Some(name) = show_session_chooser(&sessions) {
+                                let names: Vec<String> =
+                                    sessions.iter().map(|s| s.name.clone()).collect();
+                                if let Some(name) = show_session_chooser(&names) {
                                     let msg = proto::encode_client(&ClientMsg::SelectSession {
                                         name: name.clone(),
                                     });
@@ -1345,6 +1349,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 
 /// Format the status bar text with colors.
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
+/// Inactive windows with pending activity get a red bullet prefix.
 /// Identity is `[session]@server`, then the window list.
 fn format_status_bar(
     session: &str,
@@ -1353,6 +1358,7 @@ fn format_status_bar(
     server_version: &str,
     high_output: bool,
     server: &str,
+    activity: &[bool],
 ) -> String {
     // Each sequence starts with `0;` so reverse/underline/italic from the
     // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
@@ -1362,6 +1368,8 @@ fn format_status_bar(
     const ACTIVE: &str = "\x1b[0;1;44;93m"; // reset, bold, bg blue, bright yellow
     // Session name: bold bright cyan on blue.
     const SESSION: &str = "\x1b[0;1;44;96m"; // reset, bold, bg blue, bright cyan
+    // Activity bullet: bold bright red on blue.
+    const ACTIVITY: &str = "\x1b[0;1;44;91m";
     const RESET: &str = "\x1b[0m";
     const WARN: &str = "\x1b[0;1;44;31m"; // reset, bold red on blue
 
@@ -1381,8 +1389,11 @@ fn format_status_bar(
 
     let mut parts: Vec<String> = Vec::new();
     for (i, name) in windows.iter().enumerate() {
+        let has_act = activity.get(i).copied().unwrap_or(false);
         if i == active {
             parts.push(format!("{}{}:{}*{}{}", ACTIVE, i, name, BAR, burst_marker));
+        } else if has_act {
+            parts.push(format!("{ACTIVITY}●{BAR}{}:{}", i, name));
         } else {
             parts.push(format!("{}:{}", i, name));
         }
@@ -2076,6 +2087,7 @@ mod tests {
             "abc",
             false,
             "infra-284-letsencrypt",
+            &[],
         );
         let visible = strip_ansi(&text);
         assert!(
@@ -2086,9 +2098,25 @@ mod tests {
 
     #[test]
     fn status_bar_omits_empty_server() {
-        let text = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "");
+        let text = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
         let visible = strip_ansi(&text);
         assert!(!visible.contains('@'), "{visible}");
         assert!(visible.contains("lrmux"), "{visible}");
+    }
+
+    #[test]
+    fn status_bar_marks_inactive_window_activity() {
+        let text = format_status_bar(
+            "lrmux",
+            &["zsh".into(), "vim".into()],
+            0,
+            "abc",
+            false,
+            "srv",
+            &[false, true],
+        );
+        let visible = strip_ansi(&text);
+        assert!(visible.contains("●1:vim"), "{visible}");
+        assert!(!visible.contains("●0:"), "{visible}");
     }
 }
