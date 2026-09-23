@@ -219,17 +219,53 @@ pub fn cert_fingerprint_hex(cert_path: &Path) -> io::Result<String> {
 }
 
 /// Perform a TLS server handshake on an accepted TCP stream.
+///
+/// The listening socket is non-blocking, and on macOS the accepted socket
+/// inherits that. `complete_io` treats `WouldBlock` as a failed handshake
+/// and the server would drop the client (lrmux or telnet) immediately.
+/// Force blocking I/O with a short timeout for the handshake only.
 pub fn wrap_server(
     mut tcp: TcpStream,
     config: Arc<ServerConfig>,
 ) -> io::Result<StreamOwned<ServerConnection, TcpStream>> {
+    tcp.set_nonblocking(false)?;
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    tcp.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::other(format!("tls server conn: {e}")))?;
     while conn.is_handshaking() {
-        conn.complete_io(&mut tcp)
-            .map_err(|e| io::Error::other(format!("tls handshake: {e}")))?;
+        conn.complete_io(&mut tcp).map_err(handshake_io_error)?;
     }
+    tcp.set_read_timeout(None)?;
+    tcp.set_write_timeout(None)?;
     Ok(StreamOwned::new(conn, tcp))
+}
+
+/// Turn a mid-handshake failure into something an operator can act on.
+/// Plaintext clients (telnet, nc) hit this and are closed; that is expected.
+fn handshake_io_error(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
+        return io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out");
+    }
+    let msg = e.to_string();
+    let lower = msg.to_ascii_lowercase();
+    let not_tls = e.kind() == io::ErrorKind::UnexpectedEof
+        || e.kind() == io::ErrorKind::ConnectionReset
+        || e.kind() == io::ErrorKind::InvalidData
+        || lower.contains("corrupt")
+        || lower.contains("invalidcontenttype")
+        || lower.contains("no tls")
+        || lower.contains("unexpected eof")
+        || lower.contains("connection reset")
+        || lower.contains("peer closed");
+    if not_tls {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("connection closed: peer did not speak TLS (this port requires TLS). {msg}"),
+        )
+    } else {
+        io::Error::other(format!("tls handshake: {msg}"))
+    }
 }
 
 /// Perform a TLS client handshake to `addr`.
