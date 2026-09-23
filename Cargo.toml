@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "A modern, fast, minimal-dependency terminal multiplexer"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/roji-net/lrmux"
+homepage = "https://github.com/roji-net/lrmux"
 keywords = ["terminal", "multiplexer", "tmux", "byobu"]
 categories = ["command-line-utilities", "development-tools"]
 

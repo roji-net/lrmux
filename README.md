@@ -36,11 +36,33 @@ Other goals:
 
 ## Install
 
+**From crates.io** (needs a Rust toolchain, edition 2024):
+
+```sh
+cargo install lrmux
+```
+
+**From GitHub Releases** (prebuilt binaries, no Rust required) — macOS ARM,
+Linux amd64, and Linux ARM:
+
+```sh
+# Example: macOS Apple Silicon
+curl -fsSL -o lrmux.tgz \
+  https://github.com/roji-net/lrmux/releases/latest/download/lrmux-VERSION-aarch64-apple-darwin.tar.gz
+tar -xzf lrmux.tgz
+sudo install -m 755 lrmux-*/lrmux /usr/local/bin/lrmux
+```
+
+Replace `VERSION` and the target triple to match the asset on the
+[Releases](https://github.com/roji-net/lrmux/releases) page
+(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, or
+`aarch64-apple-darwin`).
+
+**From source:**
+
 ```sh
 cargo install --path .
 ```
-
-Requires a recent Rust toolchain (edition 2024).
 
 ## Quick start
 
