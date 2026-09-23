@@ -7,6 +7,20 @@ use std::io::{self, Read, Write};
 
 use crate::grid::{Attr, Cell, Color};
 
+/// Metadata for one session in a `SessionList` response.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub name: String,
+    /// Number of interactive (non-control) attached clients.
+    pub attached: u16,
+    /// Unix epoch seconds when the session was created.
+    pub created: u64,
+    /// Unix epoch seconds of the last PTY output in any window.
+    pub last_activity: u64,
+    /// True if any window has output the user may not have seen.
+    pub has_activity: bool,
+}
+
 // ── Message types ───────────────────────────────────────────────────
 
 /// Client → Server messages.
@@ -163,10 +177,13 @@ pub enum ServerMsg {
         high_output: bool,
         /// Server name. Empty on messages from an older server.
         server: String,
+        /// Per-window pending-activity flags (same length as `windows`).
+        /// Empty on messages from an older server.
+        activity: Vec<bool>,
     },
-    /// List of session names + server address (response to ListSessions).
+    /// List of sessions + server address (response to ListSessions).
     SessionList {
-        sessions: Vec<String>,
+        sessions: Vec<SessionInfo>,
         address: String,
     },
     /// Captured window content (response to CaptureWindow).
@@ -557,6 +574,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             session_count,
             high_output,
             server,
+            activity,
         } => {
             payload.push(S_STATUS_BAR);
             payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
@@ -571,13 +589,20 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(*high_output as u8);
             payload.extend_from_slice(&(server.len() as u32).to_le_bytes());
             payload.extend_from_slice(server.as_bytes());
+            for &flag in activity {
+                payload.push(flag as u8);
+            }
         }
         ServerMsg::SessionList { sessions, address } => {
             payload.push(S_SESSION_LIST);
             payload.extend_from_slice(&(sessions.len() as u32).to_le_bytes());
-            for name in sessions {
-                payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                payload.extend_from_slice(name.as_bytes());
+            for info in sessions {
+                payload.extend_from_slice(&(info.name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(info.name.as_bytes());
+                payload.extend_from_slice(&info.attached.to_le_bytes());
+                payload.extend_from_slice(&info.created.to_le_bytes());
+                payload.extend_from_slice(&info.last_activity.to_le_bytes());
+                payload.push(info.has_activity as u8);
             }
             payload.extend_from_slice(&(address.len() as u32).to_le_bytes());
             payload.extend_from_slice(address.as_bytes());
@@ -1073,6 +1098,17 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             }
             // Optional: older servers stop after `high_output`.
             let server = read_optional_string(&mut r)?;
+            // Optional: per-window activity flags (one byte each).
+            let mut activity = Vec::with_capacity(windows.len());
+            for _ in 0..windows.len() {
+                if r.is_empty() {
+                    break;
+                }
+                activity.push(read_u8(&mut r)? != 0);
+            }
+            while activity.len() < windows.len() {
+                activity.push(false);
+            }
             Ok(ServerMsg::StatusBarUpdate {
                 session,
                 windows,
@@ -1080,6 +1116,7 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 session_count,
                 high_output,
                 server,
+                activity,
             })
         }
         S_SESSION_LIST => {
@@ -1087,14 +1124,36 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let mut sessions = Vec::with_capacity(count);
             for _ in 0..count {
                 let len = read_u32(&mut r)? as usize;
-                let bytes = r[..len].to_vec();
+                if r.len() < len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated session name",
+                    ));
+                }
+                let name = String::from_utf8_lossy(&r[..len]).into_owned();
                 r = &r[len..];
-                sessions.push(String::from_utf8_lossy(&bytes).into_owned());
+                let attached = read_u16(&mut r)?;
+                let created = read_u64(&mut r)?;
+                let last_activity = read_u64(&mut r)?;
+                let has_activity = read_u8(&mut r)? != 0;
+                sessions.push(SessionInfo {
+                    name,
+                    attached,
+                    created,
+                    last_activity,
+                    has_activity,
+                });
             }
             let address = if r.is_empty() {
                 "unknown".to_string()
             } else {
                 let len = read_u32(&mut r)? as usize;
+                if r.len() < len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated address",
+                    ));
+                }
                 String::from_utf8_lossy(&r[..len]).into_owned()
             };
             Ok(ServerMsg::SessionList { sessions, address })
@@ -1239,6 +1298,18 @@ fn read_u32(r: &mut &[u8]) -> io::Result<u32> {
     Ok(val)
 }
 
+fn read_u64(r: &mut &[u8]) -> io::Result<u64> {
+    if r.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "expected 8 bytes",
+        ));
+    }
+    let val = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
+    *r = &r[8..];
+    Ok(val)
+}
+
 /// Write a framed message to a stream.
 pub fn send<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.write_all(bytes)?;
@@ -1254,19 +1325,49 @@ mod tests {
     fn status_bar_roundtrip_includes_server_name() {
         let msg = ServerMsg::StatusBarUpdate {
             session: "lrmux".into(),
-            windows: vec!["zsh".into()],
+            windows: vec!["zsh".into(), "vim".into()],
             active: 0,
             session_count: 1,
             high_output: false,
             server: "infra".into(),
+            activity: vec![false, true],
         };
         let bytes = encode_server(&msg);
         match decode_server(&mut &bytes[..]).unwrap() {
             ServerMsg::StatusBarUpdate {
-                session, server, ..
+                session,
+                server,
+                activity,
+                ..
             } => {
                 assert_eq!(session, "lrmux");
                 assert_eq!(server, "infra");
+                assert_eq!(activity, vec![false, true]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_list_roundtrip_includes_metadata() {
+        let msg = ServerMsg::SessionList {
+            sessions: vec![SessionInfo {
+                name: "dev".into(),
+                attached: 2,
+                created: 1_700_000_000,
+                last_activity: 1_700_000_100,
+                has_activity: true,
+            }],
+            address: "/tmp/lrmux-1/default".into(),
+        };
+        let bytes = encode_server(&msg);
+        match decode_server(&mut &bytes[..]).unwrap() {
+            ServerMsg::SessionList { sessions, address } => {
+                assert_eq!(address, "/tmp/lrmux-1/default");
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].name, "dev");
+                assert_eq!(sessions[0].attached, 2);
+                assert!(sessions[0].has_activity);
             }
             other => panic!("unexpected {other:?}"),
         }

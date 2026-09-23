@@ -1417,7 +1417,13 @@ fn cmd_discover() -> io::Result<()> {
     for e in lan {
         println!("{}", e.display_label());
         for s in &e.sessions {
-            println!("  {s}");
+            let status = if s.attached > 0 {
+                "attached"
+            } else {
+                "detached"
+            };
+            let act = if s.has_activity { " ●" } else { "" };
+            println!("  {} ({status}){act}", s.name);
         }
     }
     Ok(())
@@ -1431,7 +1437,10 @@ fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::SessionList { sessions, address }) => Ok((address, sessions)),
+        Ok(ServerMsg::SessionList { sessions, address }) => {
+            let names = sessions.into_iter().map(|s| s.name).collect();
+            Ok((address, names))
+        }
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "expected SessionList",
@@ -1478,16 +1487,25 @@ fn list_sessions(server: Option<&str>) -> io::Result<()> {
     for e in &entries {
         for s in &e.sessions {
             any = true;
-            let tag = if e.is_lan() { "lan" } else { "local" };
-            if multi {
-                println!("{}:{} @ {} [{tag}]", e.name, s, e.address);
+            let tag = if e.is_this_machine() { "local" } else { "lan" };
+            let status = if s.attached > 0 {
+                "attached"
             } else {
-                println!("{s} @ {} [{tag}]", e.address);
+                "detached"
+            };
+            let act = if s.has_activity { " ●" } else { "" };
+            if multi {
+                println!(
+                    "{}:{} @ {} [{tag}] ({status}){act}",
+                    e.name, s.name, e.address
+                );
+            } else {
+                println!("{} @ {} [{tag}] ({status}){act}", s.name, e.address);
             }
         }
         if e.sessions.is_empty() {
             any = true;
-            let tag = if e.is_lan() { "lan" } else { "local" };
+            let tag = if e.is_this_machine() { "local" } else { "lan" };
             println!("{} @ {} [{tag}] (no sessions)", e.name, e.address);
         }
     }
