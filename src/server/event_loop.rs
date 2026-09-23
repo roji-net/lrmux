@@ -271,6 +271,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                     )
                 };
                 if n > 0 {
+                    crate::log::debug(&format!("read {} bytes from client {}", n, client_idx));
                     clients[client_idx]
                         .buf
                         .extend_from_slice(&buf[..n as usize]);
@@ -282,8 +283,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         let si = clients[client_idx].session_idx;
                                         let aw = clients[client_idx].active_window;
                                         if si < sessions.len() && aw < sessions[si].windows.len() {
-                                            let _ =
-                                                sessions[si].windows[aw].pane.write_input(&data);
+                                            let pane = &mut sessions[si].windows[aw].pane;
+                                            let translated = translate_cursor_keys(
+                                                &data,
+                                                pane.grid.app_cursor_keys,
+                                            );
+                                            let _ = pane.write_input(&translated);
                                         }
                                     }
                                     ClientMsg::Resize { rows, cols } => {
@@ -693,6 +698,12 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         window,
                                         keys,
                                     } => {
+                                        crate::log::info(&format!(
+                                            "SendKeys: session={:?} window={:?} keys_len={}",
+                                            session,
+                                            window,
+                                            keys.len()
+                                        ));
                                         // Find the target session by name, or use the first.
                                         let si = match session {
                                             Some(ref name) => {
@@ -714,10 +725,35 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             if let Some(wi) = wi
                                                 && wi < sessions[si].windows.len()
                                             {
+                                                crate::log::info(&format!(
+                                                    "SendKeys: writing {} bytes to session '{}' window {}",
+                                                    keys.len(),
+                                                    sessions[si].name,
+                                                    wi
+                                                ));
+                                                let translated = translate_cursor_keys(
+                                                    &keys,
+                                                    sessions[si].windows[wi]
+                                                        .pane
+                                                        .grid
+                                                        .app_cursor_keys,
+                                                );
                                                 let _ = sessions[si].windows[wi]
                                                     .pane
-                                                    .write_input(&keys);
+                                                    .write_input(&translated);
+                                            } else {
+                                                crate::log::warn(&format!(
+                                                    "SendKeys: window index {} out of range (session '{}' has {} windows)",
+                                                    wi.unwrap_or(0),
+                                                    sessions[si].name,
+                                                    sessions[si].windows.len()
+                                                ));
                                             }
+                                        } else {
+                                            crate::log::warn(&format!(
+                                                "SendKeys: session {:?} not found",
+                                                session
+                                            ));
                                         }
                                     }
                                     ClientMsg::GetLog => {
@@ -825,6 +861,39 @@ fn kill_all_children(sessions: &[Session]) {
 /// Default name for a new window.
 fn default_window_name() -> String {
     "shell".to_string()
+}
+
+/// Translate normal cursor keys to application cursor keys when the mode is active.
+/// When `app_cursor_keys` is true:
+/// - \x1b[A/B/C/D → \x1bOA/B/C/D (arrow keys)
+/// - \x1b[H → \x1bOH (Home)
+/// - \x1b[F → \x1bOF (End)
+///
+/// This handles the DECCKM (cursor key mode) that programs like htop and zsh enable.
+fn translate_cursor_keys(data: &[u8], app_cursor_keys: bool) -> Vec<u8> {
+    if !app_cursor_keys {
+        return data.to_vec();
+    }
+    // Look for \x1b[A, \x1b[B, \x1b[C, \x1b[D (arrows) and \x1b[H, \x1b[F (Home/End).
+    // Translate the intermediate '[' to 'O' when in application cursor keys mode.
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 2 < data.len()
+            && data[i] == 0x1b
+            && data[i + 1] == b'['
+            && matches!(data[i + 2], b'A' | b'B' | b'C' | b'D' | b'H' | b'F')
+        {
+            result.push(0x1b);
+            result.push(b'O');
+            result.push(data[i + 2]);
+            i += 3;
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    result
 }
 
 /// Generate a default session name based on the current directory.
@@ -1042,6 +1111,8 @@ fn handshake_first_client(
     let mut conn = ClientConn::new(client);
     conn.session_idx = 0;
     conn.active_window = 0;
+    // Set the stream to non-blocking for the poll loop.
+    let _ = conn.stream.set_nonblocking(true);
 
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
@@ -1130,6 +1201,11 @@ fn accept_new_client(
             let mut conn = ClientConn::new(stream);
             conn.session_idx = session_idx;
             conn.active_window = active;
+            // Set the stream back to non-blocking for the poll loop.
+            // It was set to blocking for the handshake (proto::decode_client
+            // uses read_exact which needs blocking mode), but the poll loop
+            // uses libc::read which must not block.
+            let _ = conn.stream.set_nonblocking(true);
             crate::log::info(&format!(
                 "client connected: session_idx={session_idx}, window={active}, total clients={}",
                 clients.len() + 1

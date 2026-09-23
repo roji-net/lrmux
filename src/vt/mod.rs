@@ -123,6 +123,16 @@ impl Perform for VtHandler<'_> {
                 let n = param(0, 1) as usize;
                 self.grid.scroll_down(n);
             }
+            'L' => {
+                // IL - insert lines at cursor
+                let n = param(0, 1) as usize;
+                self.grid.insert_lines(n);
+            }
+            'M' => {
+                // DL - delete lines at cursor
+                let n = param(0, 1) as usize;
+                self.grid.delete_lines(n);
+            }
 
             // DECSTBM - set scroll region
             'r' => {
@@ -137,23 +147,27 @@ impl Perform for VtHandler<'_> {
                 self.grid.move_cursor(top.saturating_sub(1), 0);
             }
 
-            // Cursor visibility
+            // Cursor visibility and private modes
             'h' => {
-                // SM - set mode (e.g., ?25 = show cursor, ?1049 = alt screen)
+                // SM - set mode (e.g., ?25 = show cursor, ?1 = app cursor keys)
                 if intermediates.contains(&b'?') {
                     for m in &p {
-                        if *m == 25 {
-                            self.grid.cursor_visible = true;
+                        match *m {
+                            1 => self.grid.app_cursor_keys = true,
+                            25 => self.grid.cursor_visible = true,
+                            _ => {}
                         }
                     }
                 }
             }
             'l' => {
-                // RM - reset mode (e.g., ?25 = hide cursor)
+                // RM - reset mode (e.g., ?25 = hide cursor, ?1 = normal cursor keys)
                 if intermediates.contains(&b'?') {
                     for m in &p {
-                        if *m == 25 {
-                            self.grid.cursor_visible = false;
+                        match *m {
+                            1 => self.grid.app_cursor_keys = false,
+                            25 => self.grid.cursor_visible = false,
+                            _ => {}
                         }
                     }
                 }

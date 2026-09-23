@@ -36,6 +36,9 @@ pub struct Grid {
     wrap_pending: bool,
     /// Saved cursor position (for DECSC/DECRC).
     saved_cursor: Option<(usize, usize)>,
+    /// Application cursor keys mode (DECCKM). When true, arrow keys
+    /// should be translated from \x1b[A/B/C/D to \x1bOA/B/C/D.
+    pub app_cursor_keys: bool,
     /// Rows modified since the last render. The renderer uses this to
     /// skip unchanged rows instead of scanning the entire grid.
     dirty: Vec<bool>,
@@ -61,6 +64,7 @@ impl Grid {
             scroll_bottom: rows,
             wrap_pending: false,
             saved_cursor: None,
+            app_cursor_keys: false,
             dirty: vec![true; rows],
         };
         grid.scroll_bottom = rows;
@@ -300,6 +304,60 @@ impl Grid {
         self.rows[self.scroll_top..self.scroll_bottom].rotate_right(n);
 
         for i in self.scroll_top..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Insert n blank lines at the cursor row, scrolling lines within the
+    /// scroll region down. Lines that scroll off the bottom are lost.
+    /// (IL — Insert Line, CSI L)
+    pub fn insert_lines(&mut self, n: usize) {
+        let cursor = self.cursor_row;
+        if cursor < self.scroll_top || cursor >= self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom - cursor);
+        if n == 0 {
+            return;
+        }
+
+        // Rotate the region [cursor..scroll_bottom] right by n.
+        // This brings the bottom n rows to the top of the region.
+        self.rows[cursor..self.scroll_bottom].rotate_right(n);
+        // Blank the first n rows of the region (the newly inserted blanks).
+        let blank_row = vec![Cell::blank(); self.cols];
+        for i in 0..n {
+            self.rows[cursor + i] = blank_row.clone();
+        }
+
+        for i in cursor..self.scroll_bottom {
+            self.mark_dirty(i);
+        }
+    }
+
+    /// Delete n lines at the cursor row, scrolling lines within the scroll
+    /// region up. Blank lines appear at the bottom of the scroll region.
+    /// (DL — Delete Line, CSI M)
+    pub fn delete_lines(&mut self, n: usize) {
+        let cursor = self.cursor_row;
+        if cursor < self.scroll_top || cursor >= self.scroll_bottom {
+            return;
+        }
+        let n = n.min(self.scroll_bottom - cursor);
+        if n == 0 {
+            return;
+        }
+
+        // Rotate the region [cursor..scroll_bottom] left by n.
+        // This brings rows after cursor up by n positions.
+        self.rows[cursor..self.scroll_bottom].rotate_left(n);
+        // Blank the last n rows of the region (the newly freed space).
+        let blank_row = vec![Cell::blank(); self.cols];
+        for i in 0..n {
+            self.rows[self.scroll_bottom - 1 - i] = blank_row.clone();
+        }
+
+        for i in cursor..self.scroll_bottom {
             self.mark_dirty(i);
         }
     }
