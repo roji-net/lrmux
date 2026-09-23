@@ -36,9 +36,15 @@ impl Pty {
         };
 
         // Set LRMUX env var so the child process knows it's inside lrmux.
-        // The child inherits this via fork; we unset it in the parent after.
+        // Also set LRMUX_SERVER so nested lrmux commands know which server
+        // to connect to.
+        // The child inherits these via fork; we unset them in the parent after.
         // Safety: we are single-threaded here (before fork), no race possible.
-        unsafe { std::env::set_var("LRMUX", "1") };
+        let server_name = crate::server::server_name();
+        unsafe {
+            std::env::set_var("LRMUX", "1");
+            std::env::set_var("LRMUX_SERVER", server_name);
+        }
 
         let result = unsafe { forkpty(Some(&winsize), None) }.expect("forkpty failed");
 
@@ -60,9 +66,12 @@ impl Pty {
                 }
             }
             ForkptyResult::Parent { master, child } => {
-                // Unset in the parent so the server process doesn't have it.
+                // Unset in the parent so the server process doesn't have them.
                 // Safety: single-threaded, no race.
-                unsafe { std::env::remove_var("LRMUX") };
+                unsafe {
+                    std::env::remove_var("LRMUX");
+                    std::env::remove_var("LRMUX_SERVER");
+                }
                 Pty {
                     master,
                     child_pid: child,

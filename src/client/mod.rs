@@ -65,6 +65,7 @@ pub fn run(
     socket_path: &std::path::Path,
     new_session: Option<Option<String>>,
     select_session: Option<String>,
+    command: Option<String>,
 ) -> io::Result<()> {
     // Connect to the server.
     let mut stream = ipc::connect(socket_path)?;
@@ -88,7 +89,11 @@ pub fn run(
 
     // Get terminal size and send Identify.
     let (rows, cols) = terminal::get_size();
-    let identify = proto::encode_client(&ClientMsg::Identify { rows, cols });
+    let identify = proto::encode_client(&ClientMsg::Identify {
+        rows,
+        cols,
+        attach: true,
+    });
     proto::send(&mut stream, &identify)?;
 
     // Wait for IdentifyAck to get grid dimensions.
@@ -146,7 +151,19 @@ pub fn run(
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd });
+        let msg = proto::encode_client(&ClientMsg::NewSession {
+            name,
+            cwd,
+            command: command.clone(),
+        });
+        proto::send(&mut stream, &msg)?;
+    } else if let Some(ref cmd) = command {
+        // Not creating a new session, but a command was specified.
+        // Create a new window with that command.
+        let msg = proto::encode_client(&ClientMsg::NewWindowIn {
+            session: None,
+            command: Some(cmd.clone()),
+        });
         proto::send(&mut stream, &msg)?;
     }
     // If requested, switch to an existing session by name.
@@ -176,6 +193,8 @@ pub fn run(
     // replayed there is history, not new scroll-off — emitting \x1b[NS
     // would scroll the just-rendered content off the screen.
     let mut skip_terminal_scroll = false;
+    // Reason for exiting the relay loop, printed after terminal restoration.
+    let mut exit_reason: Option<String> = None;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -459,6 +478,7 @@ pub fn run(
                     if detach {
                         let msg = proto::encode_client(&ClientMsg::Detach);
                         proto::send(&mut stream, &msg)?;
+                        exit_reason = Some("detached".to_string());
                         break;
                     }
                     if enter_copy_mode {
@@ -722,6 +742,7 @@ pub fn run(
                             }
                         }
                         ServerMsg::PaneExit { .. } => {
+                            exit_reason = Some("session ended (last pane exited)".to_string());
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
@@ -754,30 +775,57 @@ pub fn run(
                             renderer.render(&mut stdout, &mut grid)?;
                         }
                         ServerMsg::Error { msg } => {
-                            eprintln!("\r\nlrmux: server error: {msg}\r");
+                            exit_reason = Some(format!("server error: {msg}"));
                             break;
                         }
                     }
                 }
             } else if n == 0 {
+                // Server closed the connection (EOF).
+                let sock_path = socket_path.to_string_lossy();
+                if !std::path::Path::new(&*sock_path).exists() {
+                    exit_reason = Some("server shut down".to_string());
+                } else {
+                    exit_reason = Some(format!(
+                        "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                    ));
+                }
                 break;
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() != io::ErrorKind::WouldBlock {
+                    exit_reason = Some(format!("read error from server: {err}"));
                     break;
                 }
             }
         }
 
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            // stdin closed — terminal gone, just exit.
             break;
         }
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            // Server socket hung up. Check if the server is still alive
+            // to give the user a clue about why we disconnected.
+            let sock_path = socket_path.to_string_lossy();
+            if !std::path::Path::new(&*sock_path).exists() {
+                exit_reason = Some("server shut down".to_string());
+            } else {
+                exit_reason = Some(format!(
+                    "disconnected from server (socket still present — server may have crashed). Check log at {sock_path}.log"
+                ));
+            }
             break;
         }
     }
 
     restore_terminal();
+    // Drop the raw mode guard before printing the exit reason so the
+    // terminal is in cooked mode (ONLCR) and newlines work normally.
+    drop(_raw_guard);
+    if let Some(reason) = exit_reason {
+        eprintln!("lrmux: {reason}");
+    }
     Ok(())
 }
 
@@ -900,6 +948,7 @@ fn process_prefix(
                             &ClientMsg::NewSession {
                                 name: None,
                                 cwd: None,
+                                command: None,
                             },
                         )?;
                     }

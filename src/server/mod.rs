@@ -8,13 +8,35 @@ mod window;
 
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::ipc;
 use crate::log;
 
+/// The server name (socket file name), set once at startup.
+/// Used by PTY spawn to set LRMUX_SERVER in the child environment.
+static SERVER_NAME: OnceLock<String> = OnceLock::new();
+
+/// Get the server name (for child process env vars).
+pub fn server_name() -> &'static str {
+    SERVER_NAME.get().map(|s| s.as_str()).unwrap_or("default")
+}
+
 /// Start the server: bind the socket, run the event loop.
-pub fn run(socket_path: &Path) -> io::Result<()> {
-    let listener = ipc::listen(socket_path)?;
+/// If `tcp_addr` is provided, also listen on TCP.
+/// If `headless` is true, create a default session without waiting for
+/// the first client (used by `lrmux start-server`).
+pub fn run(socket_path: &Path, tcp_addr: Option<&str>, headless: bool) -> io::Result<()> {
+    let unix_listener = ipc::listen(socket_path)?;
+
+    // Build the listeners list (Unix + optional TCP).
+    let mut listeners: Vec<ipc::ConnListener> = vec![ipc::ConnListener::Unix(unix_listener)];
+    if let Some(addr) = tcp_addr {
+        let tcp_listener = ipc::listen_tcp(addr)?;
+        log::info(&format!("server also listening on TCP {addr}"));
+        eprintln!("lrmux: server listening on TCP {addr}");
+        listeners.push(ipc::ConnListener::Tcp(tcp_listener));
+    }
 
     // Initialize logging.
     let uid = unsafe { libc::getuid() };
@@ -23,6 +45,7 @@ pub fn run(socket_path: &Path) -> io::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("default");
+    let _ = SERVER_NAME.set(server_name.to_string());
     let syslog = std::env::var("LRMUX_SYSLOG").ok().and_then(|s| {
         let parts: Vec<&str> = s.rsplitn(2, ':').collect();
         if parts.len() == 2 {
@@ -58,7 +81,7 @@ pub fn run(socket_path: &Path) -> io::Result<()> {
     // If the event loop panics, we log it and exit with an error
     // (state file is kept for crash analysis).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_loop::run(listener, socket_path)
+        event_loop::run(listeners, socket_path, headless)
     }));
 
     match result {

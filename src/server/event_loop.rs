@@ -6,8 +6,6 @@
 // A status bar (1 row) is reserved at the bottom of the client terminal.
 
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg};
@@ -18,17 +16,19 @@ use crate::server::window::Window;
 
 /// A connected client.
 struct ClientConn {
-    stream: UnixStream,
+    stream: crate::ipc::ConnStream,
     fd: i32,
     buf: Vec<u8>,
     /// Which session this client is attached to.
     session_idx: usize,
     /// This client's active window index within its session (per-client, not shared).
     active_window: usize,
+    /// Whether this is an interactive (attached) client or a short-lived CLI client.
+    attach: bool,
 }
 
 impl ClientConn {
-    fn new(stream: UnixStream) -> Self {
+    fn new(stream: crate::ipc::ConnStream, attach: bool) -> Self {
         let fd = stream.as_raw_fd();
         Self {
             stream,
@@ -36,6 +36,7 @@ impl ClientConn {
             buf: Vec::new(),
             session_idx: 0,
             active_window: 0,
+            attach,
         }
     }
 }
@@ -45,49 +46,68 @@ impl ClientConn {
 /// Phase 4: multiple sessions, multiple windows, multiple clients, prefix-key commands.
 /// Each client has its own active session and active window. The server persists until
 /// all sessions are closed.
-pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<()> {
-    // Wait for the first client to determine terminal size.
-    // Retry on bad connections (e.g. ListSessions queries from the selector,
-    // or connections that send unexpected data).
-    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = loop {
-        let (stream, _) = listener.accept()?;
-        match handshake_first_client(stream) {
-            Ok(result) => break result,
-            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                // KillServer received during initial handshake — shut down.
-                crate::log::info("KillServer during initial handshake, shutting down");
-                ipc::cleanup(socket_path);
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!(
-                    "lrmux server: initial handshake failed ({e}), waiting for next client..."
-                );
-                continue;
+pub fn run(
+    listeners: Vec<crate::ipc::ConnListener>,
+    socket_path: &std::path::Path,
+    headless: bool,
+) -> io::Result<()> {
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
+        // Headless mode: create a default session (24x80) without waiting
+        // for the first client. Used by `lrmux start-server` for testing
+        // and remote management.
+        let session_name = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "session".to_string());
+        let session = Session::new(session_name, 24, 80);
+        crate::log::info("server started in headless mode (24x80)");
+        (24u16, 80u16, vec![session], vec![])
+    } else {
+        // Normal mode: wait for the first client to determine terminal size.
+        // Retry on bad connections (e.g. ListSessions queries from the selector,
+        // or connections that send unexpected data).
+        loop {
+            // Accept from any listener (Unix or TCP).
+            let stream = accept_from_any(&listeners)?;
+            match handshake_first_client(stream) {
+                Ok(result) => break result,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                    crate::log::info("KillServer during initial handshake, shutting down");
+                    ipc::cleanup(socket_path);
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lrmux server: initial handshake failed ({e}), waiting for next client..."
+                    );
+                    continue;
+                }
             }
         }
     };
 
-    // Set listener to non-blocking so we can poll it alongside clients.
-    listener.set_nonblocking(true)?;
-    let listener_fd = listener.as_raw_fd();
+    // Set all listeners to non-blocking so we can poll them alongside clients.
+    for l in &listeners {
+        l.set_nonblocking(true)?;
+    }
+    let listener_fds: Vec<i32> = listeners.iter().map(|l| l.as_raw_fd()).collect();
 
     // Periodic state save counter (save every ~1000 iterations ≈ 10s).
     let mut iter_count: u32 = 0;
 
     loop {
-        // Build pollfd array: listener + all window PTY fds (across all sessions) + all client fds.
-        // We need a mapping from pollfd index to (session_idx, window_idx).
+        // Build pollfd array: listeners + all window PTY fds + all client fds.
         let mut pty_map: Vec<(usize, usize)> = Vec::new();
-        let mut fds = Vec::with_capacity(1 + 64 + clients.len());
-        fds.push(libc::pollfd {
-            fd: listener_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        let mut fds = Vec::with_capacity(listener_fds.len() + 64 + clients.len());
+        for &lfd in &listener_fds {
+            fds.push(libc::pollfd {
+                fd: lfd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         for (si, session) in sessions.iter().enumerate() {
             for (wi, w) in session.windows.iter().enumerate() {
-                // Skip exited panes — their child is dead, no more PTY output.
                 if w.pane.is_exited() {
                     continue;
                 }
@@ -119,23 +139,31 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
 
         let polled_clients = clients.len();
 
-        // Listener readable → accept new client.
-        if fds[0].revents & libc::POLLIN != 0 {
-            match accept_new_client(&listener, &sessions, grid_rows, grid_cols, &mut clients) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                    // KillServer received — shut down gracefully.
-                    crate::log::info("KillServer received, shutting down");
-                    kill_all_children(&sessions);
-                    state::save_state(socket_path, &sessions);
-                    broadcast_to_all(
-                        &mut clients,
-                        &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
-                    );
-                    ipc::cleanup(socket_path);
-                    return Ok(());
+        // Listeners readable → accept new client from any listener.
+        for (li, _lfd) in listener_fds.iter().enumerate() {
+            if fds[li].revents & libc::POLLIN != 0 {
+                match accept_new_client(
+                    &listeners[li],
+                    &sessions,
+                    grid_rows,
+                    grid_cols,
+                    &mut clients,
+                ) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                        // KillServer received — shut down gracefully.
+                        crate::log::info("KillServer received, shutting down");
+                        kill_all_children(&sessions);
+                        state::save_state(socket_path, &sessions);
+                        broadcast_to_all(
+                            &mut clients,
+                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        );
+                        ipc::cleanup(socket_path);
+                        return Ok(());
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
 
@@ -260,7 +288,16 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
         let mut need_status_bar_all = false;
 
         for client_idx in 0..polled_clients {
+            // Clients may have been removed during PTY processing (write
+            // failures). Bounds-check before indexing.
+            if client_idx >= clients.len() {
+                break;
+            }
             let pf = &fds[1 + num_pty_fds + client_idx];
+            crate::log::debug(&format!(
+                "client {} poll revents=0x{:x} fd={}",
+                client_idx, pf.revents, pf.fd
+            ));
             if pf.revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 8192];
                 let n = unsafe {
@@ -468,7 +505,7 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                             need_status_bar_all = true;
                                         }
                                     }
-                                    ClientMsg::NewSession { name, cwd } => {
+                                    ClientMsg::NewSession { name, cwd, command } => {
                                         // Use the CWD from the client message if provided
                                         // (e.g. from `lrmux new-session` CLI). Otherwise,
                                         // fall back to the CWD of the active window's child.
@@ -516,10 +553,39 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         crate::log::info(&format!(
                                             "new session '{new_name}' created (index {new_si})"
                                         ));
-                                        clients[client_idx].session_idx = new_si;
-                                        clients[client_idx].active_window = 0;
-                                        if !need_snapshot.contains(&client_idx) {
-                                            need_snapshot.push(client_idx);
+                                        // If a command was specified, replace the
+                                        // default shell window with a window running
+                                        // that command.
+                                        if let Some(ref cmd) = command {
+                                            let win = Window::new_with_command(
+                                                grid_rows,
+                                                grid_cols,
+                                                default_window_name(),
+                                                cmd,
+                                            );
+                                            // Replace the first window (default shell)
+                                            // with the command window.
+                                            sessions[new_si].windows[0] = win;
+                                        }
+                                        // Switch the sending client to the new session.
+                                        if clients[client_idx].attach {
+                                            clients[client_idx].session_idx = new_si;
+                                            clients[client_idx].active_window = 0;
+                                            if !need_snapshot.contains(&client_idx) {
+                                                need_snapshot.push(client_idx);
+                                            }
+                                        }
+                                        // Also switch all other attached clients
+                                        // (auto-switch to new session).
+                                        for (ci, c) in clients.iter_mut().enumerate() {
+                                            if ci != client_idx
+                                                && c.attach
+                                                && !need_snapshot.contains(&ci)
+                                            {
+                                                c.session_idx = new_si;
+                                                c.active_window = 0;
+                                                need_snapshot.push(ci);
+                                            }
                                         }
                                         need_status_bar_all = true;
                                     }
@@ -551,12 +617,30 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
                                         if let Some(idx) =
                                             sessions.iter().position(|s| s.name == name)
                                         {
-                                            clients[client_idx].session_idx = idx;
-                                            clients[client_idx].active_window = 0;
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
+                                            if clients[client_idx].attach {
+                                                // Interactive client: switch just this one.
+                                                clients[client_idx].session_idx = idx;
+                                                clients[client_idx].active_window = 0;
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                            } else {
+                                                // CLI client: switch all attached clients.
+                                                for (ci, c) in clients.iter_mut().enumerate() {
+                                                    if c.attach {
+                                                        c.session_idx = idx;
+                                                        c.active_window = 0;
+                                                        if !need_snapshot.contains(&ci) {
+                                                            need_snapshot.push(ci);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             need_status_bar_all = true;
+                                        } else {
+                                            crate::log::warn(&format!(
+                                                "SelectSession: session '{name}' not found"
+                                            ));
                                         }
                                     }
                                     ClientMsg::KillSession => {
@@ -782,6 +866,186 @@ pub fn run(listener: UnixListener, socket_path: &std::path::Path) -> io::Result<
             }
             if pf.revents & (libc::POLLHUP | libc::POLLERR) != 0 && !to_remove.contains(&client_idx)
             {
+                // On POLLHUP, try one more read — the peer may have sent data
+                // before closing (e.g. CLI commands that send a message and exit).
+                let mut buf = [0u8; 8192];
+                let n = unsafe {
+                    libc::read(
+                        clients[client_idx].fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    crate::log::debug(&format!(
+                        "read {} bytes from client {} on POLLHUP",
+                        n, client_idx
+                    ));
+                    clients[client_idx]
+                        .buf
+                        .extend_from_slice(&buf[..n as usize]);
+                    // Process any complete frames before removing the client.
+                    while let Ok(Some(msg)) = try_parse_frame(&mut clients[client_idx].buf) {
+                        crate::log::debug(&format!(
+                            "client {} POLLHUP frame processed: {:?}",
+                            client_idx, msg
+                        ));
+                        // Handle simple non-attach messages that don't need
+                        // the full client context.
+                        match msg {
+                            ClientMsg::NewWindowIn { session, command } => {
+                                let si = match session {
+                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
+                                    None => {
+                                        if sessions.is_empty() {
+                                            None
+                                        } else {
+                                            Some(0)
+                                        }
+                                    }
+                                };
+                                if let Some(si) = si {
+                                    let win = match command {
+                                        Some(ref cmd) => Window::new_with_command(
+                                            grid_rows,
+                                            grid_cols,
+                                            default_window_name(),
+                                            cmd,
+                                        ),
+                                        None => {
+                                            Window::new(grid_rows, grid_cols, default_window_name())
+                                        }
+                                    };
+                                    sessions[si].windows.push(win);
+                                    need_status_bar_all = true;
+                                    crate::log::info(&format!(
+                                        "new window {} in session '{}' (from POLLHUP)",
+                                        sessions[si].windows.len() - 1,
+                                        sessions[si].name
+                                    ));
+                                }
+                            }
+                            ClientMsg::NewSession { name, cwd, command } => {
+                                let cwd_full = cwd.or_else(|| {
+                                    let si = clients[client_idx].session_idx;
+                                    let wi = clients[client_idx].active_window;
+                                    if si < sessions.len() && wi < sessions[si].windows.len() {
+                                        let pane = &sessions[si].windows[wi].pane;
+                                        if !pane.exited {
+                                            pty::child_cwd_full(pane.pty.child_pid)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let session_name = name.unwrap_or_else(|| match &cwd_full {
+                                    Some(cwd) => {
+                                        let base = std::path::Path::new(cwd)
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "session".to_string());
+                                        ensure_unique_session_name(&base, &sessions)
+                                    }
+                                    None => default_session_name(&sessions),
+                                });
+                                let session = match &cwd_full {
+                                    Some(cwd) => {
+                                        Session::new_in_cwd(session_name, grid_rows, grid_cols, cwd)
+                                    }
+                                    None => Session::new(session_name, grid_rows, grid_cols),
+                                };
+                                sessions.push(session);
+                                let new_si = sessions.len() - 1;
+                                // If a command was specified, replace the default
+                                // shell window with a command window.
+                                if let Some(ref cmd) = command {
+                                    let win = Window::new_with_command(
+                                        grid_rows,
+                                        grid_cols,
+                                        default_window_name(),
+                                        cmd,
+                                    );
+                                    sessions[new_si].windows[0] = win;
+                                }
+                                // Auto-switch all attached clients to the new session.
+                                for c in &mut *clients {
+                                    if c.attach {
+                                        c.session_idx = new_si;
+                                        c.active_window = 0;
+                                    }
+                                }
+                                need_status_bar_all = true;
+                                crate::log::info(&format!(
+                                    "new session '{}' created (index {}, from POLLHUP)",
+                                    sessions.last().unwrap().name,
+                                    new_si
+                                ));
+                            }
+                            ClientMsg::SendKeys {
+                                session,
+                                window,
+                                keys,
+                            } => {
+                                crate::log::info(&format!(
+                                    "SendKeys: session={:?} window={:?} keys_len={} (from POLLHUP)",
+                                    session,
+                                    window,
+                                    keys.len()
+                                ));
+                                let si = match session {
+                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
+                                    None => Some(0),
+                                };
+                                if let Some(si) = si
+                                    && let Some(session) = sessions.get_mut(si)
+                                {
+                                    let wi = match window {
+                                        Some(w) => Some(w as usize),
+                                        None => Some(clients[client_idx].active_window),
+                                    };
+                                    if let Some(wi) = wi
+                                        && let Some(window) = session.windows.get_mut(wi)
+                                    {
+                                        let translated = translate_cursor_keys(
+                                            &keys,
+                                            window.pane.grid.app_cursor_keys,
+                                        );
+                                        let _ = window.pane.write_input(&translated);
+                                        crate::log::info(&format!(
+                                            "SendKeys: writing {} bytes to session '{}' window {}",
+                                            translated.len(),
+                                            session.name,
+                                            wi
+                                        ));
+                                    }
+                                }
+                            }
+                            ClientMsg::SelectSession { name } => {
+                                if let Some(idx) = sessions.iter().position(|s| s.name == name) {
+                                    for c in &mut *clients {
+                                        if c.attach {
+                                            c.session_idx = idx;
+                                            c.active_window = 0;
+                                        }
+                                    }
+                                    need_status_bar_all = true;
+                                    crate::log::info(&format!(
+                                        "SelectSession: switched to '{name}' (from POLLHUP)"
+                                    ));
+                                } else {
+                                    crate::log::warn(&format!(
+                                        "SelectSession: session '{name}' not found (from POLLHUP)"
+                                    ));
+                                }
+                            }
+                            _ => {
+                                // Other messages are ignored on POLLHUP.
+                            }
+                        }
+                    }
+                }
                 to_remove.push(client_idx);
             }
         }
@@ -1040,12 +1304,12 @@ fn send_all_snapshots(clients: &mut Vec<ClientConn>, sessions: &[Session]) -> io
 /// Returns Err if the connection is not an Identify (e.g. ListSessions query or bad data).
 /// The caller should retry by accepting the next connection.
 fn handshake_first_client(
-    stream: UnixStream,
+    stream: crate::ipc::ConnStream,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = stream;
 
     let (client_rows, client_cols) = match proto::decode_client(&mut client) {
-        Ok(ClientMsg::Identify { rows, cols }) => (rows, cols),
+        Ok(ClientMsg::Identify { rows, cols, .. }) => (rows, cols),
         Ok(ClientMsg::ListSessions) => {
             // Respond with empty session list (no sessions yet) and signal retry.
             let msg = proto::encode_server(&ServerMsg::SessionList { sessions: vec![] });
@@ -1108,11 +1372,9 @@ fn handshake_first_client(
     });
     proto::send(&mut client, &status)?;
 
-    let mut conn = ClientConn::new(client);
+    let mut conn = ClientConn::new(client, true);
     conn.session_idx = 0;
     conn.active_window = 0;
-    // Set the stream to non-blocking for the poll loop.
-    let _ = conn.stream.set_nonblocking(true);
 
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
@@ -1120,18 +1382,18 @@ fn handshake_first_client(
 /// Accept a new client, do the handshake, and add it to the clients list.
 /// New clients default to session 0, window 0.
 fn accept_new_client(
-    listener: &UnixListener,
+    listener: &crate::ipc::ConnListener,
     sessions: &[Session],
     grid_rows: u16,
     grid_cols: u16,
     clients: &mut Vec<ClientConn>,
 ) -> io::Result<()> {
     match listener.accept() {
-        Ok((mut stream, _)) => {
+        Ok(mut stream) => {
             stream.set_nonblocking(false)?;
 
-            match proto::decode_client(&mut stream) {
-                Ok(ClientMsg::Identify { .. }) => {}
+            let attach = match proto::decode_client(&mut stream) {
+                Ok(ClientMsg::Identify { attach: a, .. }) => a,
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
                     let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
@@ -1155,7 +1417,7 @@ fn accept_new_client(
                     );
                     return Ok(());
                 }
-            }
+            };
 
             // Send IdentifyAck with grid dimensions.
             let ack = proto::encode_server(&ServerMsg::IdentifyAck {
@@ -1169,43 +1431,42 @@ fn accept_new_client(
             // New client defaults to session 0, window 0.
             let session_idx = 0usize;
             let active = 0usize;
-            if let Some(session) = sessions.get(session_idx)
-                && let Some(window) = session.windows.get(active)
-            {
-                let pane = &window.pane;
-                let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-                let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-                    rows: pane.rows,
-                    cols: pane.cols,
-                    cells: pane.snapshot(),
-                    cursor_row,
-                    cursor_col,
-                    cursor_visible,
-                });
-                if proto::send(&mut stream, &snapshot).is_err() {
-                    return Ok(());
+            // Only send snapshot + status bar to interactive clients (attach=true).
+            // CLI commands (attach=false) only need the IdentifyAck.
+            if attach {
+                if let Some(session) = sessions.get(session_idx)
+                    && let Some(window) = session.windows.get(active)
+                {
+                    let pane = &window.pane;
+                    let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+                    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+                        rows: pane.rows,
+                        cols: pane.cols,
+                        cells: pane.snapshot(),
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                    });
+                    if proto::send(&mut stream, &snapshot).is_err() {
+                        return Ok(());
+                    }
+                }
+
+                // Send status bar.
+                if let Some(session) = sessions.get(session_idx) {
+                    let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
+                        session: session.name.clone(),
+                        windows: window_names(session),
+                        active: active as u16,
+                        session_count: sessions.len() as u16,
+                    });
+                    let _ = proto::send(&mut stream, &status);
                 }
             }
 
-            // Send status bar.
-            if let Some(session) = sessions.get(session_idx) {
-                let status = proto::encode_server(&ServerMsg::StatusBarUpdate {
-                    session: session.name.clone(),
-                    windows: window_names(session),
-                    active: active as u16,
-                    session_count: sessions.len() as u16,
-                });
-                let _ = proto::send(&mut stream, &status);
-            }
-
-            let mut conn = ClientConn::new(stream);
+            let mut conn = ClientConn::new(stream, attach);
             conn.session_idx = session_idx;
             conn.active_window = active;
-            // Set the stream back to non-blocking for the poll loop.
-            // It was set to blocking for the handshake (proto::decode_client
-            // uses read_exact which needs blocking mode), but the poll loop
-            // uses libc::read which must not block.
-            let _ = conn.stream.set_nonblocking(true);
             crate::log::info(&format!(
                 "client connected: session_idx={session_idx}, window={active}, total clients={}",
                 clients.len() + 1
@@ -1330,7 +1591,8 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             }
             let rows = u16::from_le_bytes([data[0], data[1]]);
             let cols = u16::from_le_bytes([data[2], data[3]]);
-            ClientMsg::Identify { rows, cols }
+            let attach = data.get(4).copied().unwrap_or(1) != 0;
+            ClientMsg::Identify { rows, cols, attach }
         }
         0x02 => ClientMsg::PaneInput {
             data: data.to_vec(),
@@ -1361,7 +1623,8 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x09 => ClientMsg::KillPane,
         0x0a => {
-            // NewSession: name flag + optional name, then cwd flag + optional cwd
+            // NewSession: name flag + optional name, then cwd flag + optional cwd,
+            // then command flag + optional command.
             if data.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -1411,11 +1674,36 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                         "NewSession cwd truncated",
                     ));
                 }
+                let c = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+                pos += len;
+                Some(c)
+            } else {
+                pos += 1; // skip the 0 flag
+                None
+            };
+            let command = if pos < data.len() && data[pos] != 0 {
+                pos += 1;
+                if data.len() < pos + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession command needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                pos += 4;
+                if data.len() < pos + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "NewSession command truncated",
+                    ));
+                }
                 Some(String::from_utf8_lossy(&data[pos..pos + len]).into_owned())
             } else {
                 None
             };
-            ClientMsg::NewSession { name, cwd }
+            ClientMsg::NewSession { name, cwd, command }
         }
         0x0b => ClientMsg::NextSession,
         0x0c => ClientMsg::PrevSession,
@@ -1650,4 +1938,39 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
     };
     Ok(Some(msg))
+}
+
+/// Accept a connection from any of the given listeners (blocking).
+/// Used during the initial handshake to wait for the first client
+/// from either a Unix or TCP listener.
+fn accept_from_any(listeners: &[crate::ipc::ConnListener]) -> io::Result<crate::ipc::ConnStream> {
+    if listeners.len() == 1 {
+        return listeners[0].accept();
+    }
+    // Poll all listener fds and accept from the first ready one.
+    let mut fds: Vec<libc::pollfd> = listeners
+        .iter()
+        .map(|l| libc::pollfd {
+            fd: l.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+        }
+        return Err(err);
+    }
+    for (i, fd) in fds.iter().enumerate() {
+        if fd.revents & libc::POLLIN != 0 {
+            return listeners[i].accept();
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "no listener ready",
+    ))
 }

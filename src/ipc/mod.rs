@@ -1,8 +1,12 @@
-// IPC: Unix socket transport (abstracted for future TCP).
+// IPC: Unix socket and TCP transport.
+
+pub mod stream;
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+
+pub use stream::{ConnListener, ConnStream};
 
 /// Compute the socket path for a given server name.
 /// Format: /tmp/lrmux-<UID>/<server-name>
@@ -36,6 +40,18 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
 /// Connect to a server at the given socket path.
 pub fn connect(path: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(path)
+}
+
+/// Connect to a server via TCP. Returns a ConnStream.
+pub fn connect_tcp(addr: &str) -> io::Result<ConnStream> {
+    let stream = std::net::TcpStream::connect(addr)?;
+    Ok(ConnStream::Tcp(stream))
+}
+
+/// Bind a TCP listener at the given address.
+pub fn listen_tcp(addr: &str) -> io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    Ok(listener)
 }
 
 /// Check if a server is listening at the given path.

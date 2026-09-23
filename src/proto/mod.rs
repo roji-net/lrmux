@@ -13,7 +13,8 @@ use crate::grid::{Attr, Cell, Color};
 #[derive(Debug)]
 pub enum ClientMsg {
     /// Initial handshake: client terminal size.
-    Identify { rows: u16, cols: u16 },
+    /// `attach: false` for CLI commands (no snapshot needed).
+    Identify { rows: u16, cols: u16, attach: bool },
     /// Raw keystrokes from the client's stdin → forward to PTY.
     PaneInput { data: Vec<u8> },
     /// Client terminal resized.
@@ -34,6 +35,7 @@ pub enum ClientMsg {
     NewSession {
         name: Option<String>,
         cwd: Option<String>,
+        command: Option<String>,
     },
     /// Switch to next session.
     NextSession,
@@ -159,10 +161,11 @@ const S_LOG_CONTENT: u8 = 0x19;
 pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
     let mut payload = Vec::new();
     match msg {
-        ClientMsg::Identify { rows, cols } => {
+        ClientMsg::Identify { rows, cols, attach } => {
             payload.push(C_IDENTIFY);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
+            payload.push(if *attach { 1 } else { 0 });
         }
         ClientMsg::PaneInput { data } => {
             payload.push(C_PANE_INPUT);
@@ -192,7 +195,7 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::KillPane => {
             payload.push(C_KILL_PANE);
         }
-        ClientMsg::NewSession { name, cwd } => {
+        ClientMsg::NewSession { name, cwd, command } => {
             payload.push(C_NEW_SESSION);
             match name {
                 Some(n) => {
@@ -203,6 +206,14 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
                 None => payload.push(0),
             }
             match cwd {
+                Some(c) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(c.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match command {
                 Some(c) => {
                     payload.push(1);
                     payload.extend_from_slice(&(c.len() as u32).to_le_bytes());
@@ -488,7 +499,8 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
         C_IDENTIFY => {
             let rows = read_u16(&mut r)?;
             let cols = read_u16(&mut r)?;
-            Ok(ClientMsg::Identify { rows, cols })
+            let attach = r.first().copied().unwrap_or(1) != 0;
+            Ok(ClientMsg::Identify { rows, cols, attach })
         }
         C_PANE_INPUT => Ok(ClientMsg::PaneInput { data: r.to_vec() }),
         C_RESIZE => {
@@ -520,7 +532,14 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             } else {
                 None
             };
-            Ok(ClientMsg::NewSession { name, cwd })
+            let has_cmd = read_u8(&mut r)?;
+            let command = if has_cmd != 0 {
+                let len = read_u32(&mut r)? as usize;
+                Some(String::from_utf8_lossy(&r[..len]).into_owned())
+            } else {
+                None
+            };
+            Ok(ClientMsg::NewSession { name, cwd, command })
         }
         C_NEXT_SESSION => Ok(ClientMsg::NextSession),
         C_PREV_SESSION => Ok(ClientMsg::PrevSession),
