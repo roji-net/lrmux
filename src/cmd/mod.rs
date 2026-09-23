@@ -366,8 +366,10 @@ Remote clients need the same secret via config, LRMUX_PSK, or --psk.",
         name: "versions",
         aliases: &["version"],
         summary: "Show client and server versions",
-        usage: "    lrmux versions",
-        body: "Print this binary's version and the version of each running local server.",
+        usage: "    lrmux versions\n    lrmux -v\n    lrmux --version",
+        body: "\
+`lrmux -v` and `lrmux --version` print only this binary's version.\n\
+`lrmux versions` also queries every running local server.",
     },
     CommandSpec {
         name: "control-mode",
@@ -439,8 +441,9 @@ COMMANDS:\n",
 lrmux -- <cmd> [args]    Create a new window running <cmd> and attach\n\
 \n\
 GLOBAL OPTIONS:\n    \
---tcp <host:port>    Connect over TCP (client commands: attach, ls, kill-server, …)\n    \
+    --tcp <host:port>    Connect over TCP (client commands: attach, ls, kill-server, …)\n    \
 --psk <secret>       Pre-shared key for this process\n    \
+-v, --version        Print this binary's version\n    \
 -h, --help           This help, or `lrmux <command> --help` for one command\n\
 \n\
 On `new-server`, `--tcp` is the listen address, not a connect target.\n    \

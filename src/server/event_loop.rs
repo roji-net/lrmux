@@ -6,7 +6,7 @@
 // A status bar (1 row) is reserved at the bottom of the client terminal.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 
 use crate::ipc;
@@ -114,7 +114,34 @@ fn client_send(client: &mut ClientConn, bytes: &[u8]) -> bool {
 /// Write as much buffered data to the client socket as possible without
 /// blocking. Returns false on write error (client should be disconnected).
 /// Leftover data stays in outbuf and is retried when POLLOUT fires.
+///
+/// TLS and WebSocket must go through `ConnStream`. A raw `send` on those
+/// fds writes plaintext (or unframed bytes) and the peer's handshake blows up
+/// on the next grid update.
 fn flush_client_outbuf(client: &mut ClientConn) -> bool {
+    if client.stream.is_framed() {
+        while !client.outbuf.is_empty() {
+            match client.stream.write(&client.outbuf) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    client.outbuf.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+        return match client.stream.flush() {
+            Ok(()) => true,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                true
+            }
+            Err(_) => false,
+        };
+    }
     while !client.outbuf.is_empty() {
         let n = unsafe {
             libc::send(
@@ -137,6 +164,46 @@ fn flush_client_outbuf(client: &mut ClientConn) -> bool {
         }
     }
     true
+}
+
+/// Append bytes currently available on the client socket to `client.buf`.
+///
+/// `Ok(true)` means at least one byte was appended. `Ok(false)` is EOF.
+/// `WouldBlock` means nothing was ready.
+fn read_into_client_buf(client: &mut ClientConn) -> io::Result<bool> {
+    let mut buf = [0u8; 8192];
+    let framed = client.stream.is_framed();
+    let mut got = false;
+    loop {
+        if framed {
+            match client.stream.read(&mut buf) {
+                Ok(0) => return Ok(got),
+                Ok(n) => {
+                    got = true;
+                    client.buf.extend_from_slice(&buf[..n]);
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return if got { Ok(true) } else { Err(e) };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let n = unsafe { libc::read(client.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n > 0 {
+            client.buf.extend_from_slice(&buf[..n as usize]);
+            return Ok(true);
+        }
+        if n == 0 {
+            return Ok(false);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
 }
 
 /// Run the server event loop.
@@ -266,7 +333,7 @@ pub fn run(
                 // for suppressed clients — the level-triggered writable
                 // event is what triggers their snapshot resync.
                 events: libc::POLLIN
-                    | if c.outbuf.is_empty() && !c.suppressed {
+                    | if c.outbuf.is_empty() && !c.stream.wants_write() && !c.suppressed {
                         0
                     } else {
                         libc::POLLOUT
@@ -510,241 +577,427 @@ pub fn run(
                 client_idx, pf.revents, pf.fd
             ));
             if pf.revents & libc::POLLIN != 0 {
-                let mut buf = [0u8; 8192];
-                let n = unsafe {
-                    libc::read(
-                        clients[client_idx].fd,
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                    )
-                };
-                if n > 0 {
-                    crate::log::debug(&format!("read {} bytes from client {}", n, client_idx));
-                    clients[client_idx]
-                        .buf
-                        .extend_from_slice(&buf[..n as usize]);
-                    loop {
-                        match try_parse_frame(&mut clients[client_idx].buf) {
-                            Ok(Some(msg)) => {
-                                match msg {
-                                    ClientMsg::PaneInput { data } => {
-                                        let si = clients[client_idx].session_idx;
-                                        let aw = clients[client_idx].active_window;
-                                        if si < sessions.len() && aw < sessions[si].windows.len() {
-                                            let pane = &mut sessions[si].windows[aw].pane;
-                                            let translated = translate_cursor_keys(
-                                                &data,
-                                                pane.grid.app_cursor_keys,
-                                            );
-                                            let _ = pane.write_input(&translated);
-                                        }
-                                    }
-                                    ClientMsg::Resize { rows, cols } => {
-                                        // Explicit canonical resize (Prefix F).
-                                        // Only resize the current session's panes, not all sessions.
-                                        let si = clients[client_idx].session_idx;
-                                        let new_grid_rows = rows.saturating_sub(1);
-                                        let new_grid_cols = cols;
-                                        if si < sessions.len() {
-                                            for w in &mut sessions[si].windows {
-                                                w.pane.resize(new_grid_rows, new_grid_cols);
-                                            }
-                                        }
-                                        // Update global grid size if the first session was resized
-                                        // (used for new windows/sessions created after this point).
-                                        if si == 0 {
-                                            grid_rows = new_grid_rows;
-                                            grid_cols = new_grid_cols;
-                                        }
-                                        // Send snapshots to all clients viewing this session.
-                                        for (ci, client) in clients.iter().enumerate() {
-                                            if client.session_idx == si
-                                                && !need_snapshot.contains(&ci)
+                match read_into_client_buf(&mut clients[client_idx]) {
+                    Ok(true) => {
+                        crate::log::debug(&format!("read from client {client_idx}"));
+                        loop {
+                            match try_parse_frame(&mut clients[client_idx].buf) {
+                                Ok(Some(msg)) => {
+                                    match msg {
+                                        ClientMsg::PaneInput { data } => {
+                                            let si = clients[client_idx].session_idx;
+                                            let aw = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && aw < sessions[si].windows.len()
                                             {
-                                                need_snapshot.push(ci);
+                                                let pane = &mut sessions[si].windows[aw].pane;
+                                                let translated = translate_cursor_keys(
+                                                    &data,
+                                                    pane.grid.app_cursor_keys,
+                                                );
+                                                let _ = pane.write_input(&translated);
                                             }
                                         }
-                                        need_status_bar_all = true;
-                                    }
-                                    ClientMsg::Refresh => {
-                                        // Ctrl-A r: force a full resync of the current view
-                                        // and exit high-output suppression for this client.
-                                        let ci = client_idx;
-                                        clients[ci].suppressed = false;
-                                        if !need_snapshot.contains(&ci) {
-                                            need_snapshot.push(ci);
-                                        }
-                                        need_status_bar_all = true;
-                                        crate::log::info(&format!(
-                                            "client fd {} requested refresh",
-                                            clients[ci].fd
-                                        ));
-                                    }
-                                    ClientMsg::TermOscReply { pane_id, data } => {
-                                        // Real TTY answered OSC 10/11 — cache palette + inject.
-                                        if let Some((si, wi)) = find_pane_by_id(&sessions, pane_id)
-                                        {
-                                            sessions[si].windows[wi]
-                                                .pane
-                                                .note_osc_color_reply(&data);
-                                            let _ =
-                                                sessions[si].windows[wi].pane.write_input(&data);
-                                        }
-                                    }
-                                    ClientMsg::TermPalette { fg, bg } => {
-                                        let pal = super::capture::TerminalPalette { fg, bg };
-                                        clients[client_idx].palette = pal;
-                                        seed_pane_palette(
-                                            &mut sessions,
-                                            clients[client_idx].session_idx,
-                                            clients[client_idx].active_window,
-                                            pal,
-                                        );
-                                    }
-                                    ClientMsg::Detach => {
-                                        to_remove.push(client_idx);
-                                        break;
-                                    }
-                                    ClientMsg::NewWindow => {
-                                        let si = clients[client_idx].session_idx;
-                                        if si < sessions.len() {
-                                            // Get the CWD of the active window's child
-                                            // process so the new window opens in the
-                                            // same directory.
-                                            let aw = clients[client_idx].active_window;
-                                            let cwd = if aw < sessions[si].windows.len() {
-                                                let pane = &sessions[si].windows[aw].pane;
-                                                if !pane.exited {
-                                                    pty::child_cwd_full(pane.pty.child_pid)
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            };
-                                            let win = match cwd {
-                                                Some(ref dir) => Window::new_in_cwd(
-                                                    grid_rows,
-                                                    grid_cols,
-                                                    default_window_name(),
-                                                    dir,
-                                                ),
-                                                None => Window::new(
-                                                    grid_rows,
-                                                    grid_cols,
-                                                    default_window_name(),
-                                                ),
-                                            };
-                                            sessions[si].windows.push(win);
-                                            let new_wi = sessions[si].windows.len() - 1;
-                                            let sname = sessions[si].name.clone();
-                                            crate::log::info(&format!(
-                                                "new window {new_wi} in session '{sname}'"
-                                            ));
-                                            clients[client_idx].active_window = new_wi;
-                                            seed_client_focus_palette(
-                                                &mut sessions,
-                                                &clients,
-                                                client_idx,
-                                            );
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
-                                            }
-                                            need_status_bar_all = true;
-                                        }
-                                    }
-                                    ClientMsg::NextWindow => {
-                                        let si = clients[client_idx].session_idx;
-                                        if si < sessions.len() && !sessions[si].windows.is_empty() {
-                                            let aw = clients[client_idx].active_window;
-                                            clients[client_idx].active_window =
-                                                (aw + 1) % sessions[si].windows.len();
-                                            seed_client_focus_palette(
-                                                &mut sessions,
-                                                &clients,
-                                                client_idx,
-                                            );
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
-                                            }
-                                        }
-                                    }
-                                    ClientMsg::PrevWindow => {
-                                        let si = clients[client_idx].session_idx;
-                                        if si < sessions.len() && !sessions[si].windows.is_empty() {
-                                            let aw = clients[client_idx].active_window;
-                                            let len = sessions[si].windows.len();
-                                            clients[client_idx].active_window =
-                                                if aw == 0 { len - 1 } else { aw - 1 };
-                                            seed_client_focus_palette(
-                                                &mut sessions,
-                                                &clients,
-                                                client_idx,
-                                            );
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
-                                            }
-                                        }
-                                    }
-                                    ClientMsg::SelectWindow { index } => {
-                                        let si = clients[client_idx].session_idx;
-                                        if si < sessions.len()
-                                            && (index as usize) < sessions[si].windows.len()
-                                        {
-                                            clients[client_idx].active_window = index as usize;
-                                            seed_client_focus_palette(
-                                                &mut sessions,
-                                                &clients,
-                                                client_idx,
-                                            );
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
-                                            }
-                                        }
-                                    }
-                                    ClientMsg::KillPane => {
-                                        let si = clients[client_idx].session_idx;
-                                        let wi = clients[client_idx].active_window;
-                                        if si >= sessions.len() {
-                                            continue;
-                                        }
-                                        let session = &mut sessions[si];
-                                        if wi >= session.windows.len() {
-                                            continue;
-                                        }
-                                        let session_name = session.name.clone();
-                                        crate::log::info(&format!(
-                                            "kill pane: session '{session_name}' window {wi}"
-                                        ));
-                                        if session.windows.len() > 1 {
-                                            session.windows.remove(wi);
-                                            // Fix up all clients' active_window in this session.
-                                            for c in &mut clients {
-                                                if c.session_idx == si {
-                                                    if c.active_window == wi {
-                                                        c.active_window =
-                                                            wi.min(session.windows.len() - 1);
-                                                    } else if c.active_window > wi {
-                                                        c.active_window -= 1;
-                                                    }
+                                        ClientMsg::Resize { rows, cols } => {
+                                            // Explicit canonical resize (Prefix F).
+                                            // Only resize the current session's panes, not all sessions.
+                                            let si = clients[client_idx].session_idx;
+                                            let new_grid_rows = rows.saturating_sub(1);
+                                            let new_grid_cols = cols;
+                                            if si < sessions.len() {
+                                                for w in &mut sessions[si].windows {
+                                                    w.pane.resize(new_grid_rows, new_grid_cols);
                                                 }
                                             }
-                                            for ci in 0..clients.len() {
-                                                if !need_snapshot.contains(&ci) {
+                                            // Update global grid size if the first session was resized
+                                            // (used for new windows/sessions created after this point).
+                                            if si == 0 {
+                                                grid_rows = new_grid_rows;
+                                                grid_cols = new_grid_cols;
+                                            }
+                                            // Send snapshots to all clients viewing this session.
+                                            for (ci, client) in clients.iter().enumerate() {
+                                                if client.session_idx == si
+                                                    && !need_snapshot.contains(&ci)
+                                                {
                                                     need_snapshot.push(ci);
                                                 }
                                             }
                                             need_status_bar_all = true;
-                                        } else {
-                                            // Last window in this session — remove the session.
+                                        }
+                                        ClientMsg::Refresh => {
+                                            // Ctrl-A r: force a full resync of the current view
+                                            // and exit high-output suppression for this client.
+                                            let ci = client_idx;
+                                            clients[ci].suppressed = false;
+                                            if !need_snapshot.contains(&ci) {
+                                                need_snapshot.push(ci);
+                                            }
+                                            need_status_bar_all = true;
                                             crate::log::info(&format!(
-                                                "last window in session '{session_name}' killed, removing session"
+                                                "client fd {} requested refresh",
+                                                clients[ci].fd
+                                            ));
+                                        }
+                                        ClientMsg::TermOscReply { pane_id, data } => {
+                                            // Real TTY answered OSC 10/11 — cache palette + inject.
+                                            if let Some((si, wi)) =
+                                                find_pane_by_id(&sessions, pane_id)
+                                            {
+                                                sessions[si].windows[wi]
+                                                    .pane
+                                                    .note_osc_color_reply(&data);
+                                                let _ = sessions[si].windows[wi]
+                                                    .pane
+                                                    .write_input(&data);
+                                            }
+                                        }
+                                        ClientMsg::TermPalette { fg, bg } => {
+                                            let pal = super::capture::TerminalPalette { fg, bg };
+                                            clients[client_idx].palette = pal;
+                                            seed_pane_palette(
+                                                &mut sessions,
+                                                clients[client_idx].session_idx,
+                                                clients[client_idx].active_window,
+                                                pal,
+                                            );
+                                        }
+                                        ClientMsg::Detach => {
+                                            to_remove.push(client_idx);
+                                            break;
+                                        }
+                                        ClientMsg::NewWindow => {
+                                            let si = clients[client_idx].session_idx;
+                                            if si < sessions.len() {
+                                                // Get the CWD of the active window's child
+                                                // process so the new window opens in the
+                                                // same directory.
+                                                let aw = clients[client_idx].active_window;
+                                                let cwd = if aw < sessions[si].windows.len() {
+                                                    let pane = &sessions[si].windows[aw].pane;
+                                                    if !pane.exited {
+                                                        pty::child_cwd_full(pane.pty.child_pid)
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                let win = match cwd {
+                                                    Some(ref dir) => Window::new_in_cwd(
+                                                        grid_rows,
+                                                        grid_cols,
+                                                        default_window_name(),
+                                                        dir,
+                                                    ),
+                                                    None => Window::new(
+                                                        grid_rows,
+                                                        grid_cols,
+                                                        default_window_name(),
+                                                    ),
+                                                };
+                                                sessions[si].windows.push(win);
+                                                let new_wi = sessions[si].windows.len() - 1;
+                                                let sname = sessions[si].name.clone();
+                                                crate::log::info(&format!(
+                                                    "new window {new_wi} in session '{sname}'"
+                                                ));
+                                                clients[client_idx].active_window = new_wi;
+                                                seed_client_focus_palette(
+                                                    &mut sessions,
+                                                    &clients,
+                                                    client_idx,
+                                                );
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                                need_status_bar_all = true;
+                                            }
+                                        }
+                                        ClientMsg::NextWindow => {
+                                            let si = clients[client_idx].session_idx;
+                                            if si < sessions.len()
+                                                && !sessions[si].windows.is_empty()
+                                            {
+                                                let aw = clients[client_idx].active_window;
+                                                clients[client_idx].active_window =
+                                                    (aw + 1) % sessions[si].windows.len();
+                                                seed_client_focus_palette(
+                                                    &mut sessions,
+                                                    &clients,
+                                                    client_idx,
+                                                );
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                            }
+                                        }
+                                        ClientMsg::PrevWindow => {
+                                            let si = clients[client_idx].session_idx;
+                                            if si < sessions.len()
+                                                && !sessions[si].windows.is_empty()
+                                            {
+                                                let aw = clients[client_idx].active_window;
+                                                let len = sessions[si].windows.len();
+                                                clients[client_idx].active_window =
+                                                    if aw == 0 { len - 1 } else { aw - 1 };
+                                                seed_client_focus_palette(
+                                                    &mut sessions,
+                                                    &clients,
+                                                    client_idx,
+                                                );
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                            }
+                                        }
+                                        ClientMsg::SelectWindow { index } => {
+                                            let si = clients[client_idx].session_idx;
+                                            if si < sessions.len()
+                                                && (index as usize) < sessions[si].windows.len()
+                                            {
+                                                clients[client_idx].active_window = index as usize;
+                                                seed_client_focus_palette(
+                                                    &mut sessions,
+                                                    &clients,
+                                                    client_idx,
+                                                );
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                            }
+                                        }
+                                        ClientMsg::KillPane => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si >= sessions.len() {
+                                                continue;
+                                            }
+                                            let session = &mut sessions[si];
+                                            if wi >= session.windows.len() {
+                                                continue;
+                                            }
+                                            let session_name = session.name.clone();
+                                            crate::log::info(&format!(
+                                                "kill pane: session '{session_name}' window {wi}"
+                                            ));
+                                            if session.windows.len() > 1 {
+                                                session.windows.remove(wi);
+                                                // Fix up all clients' active_window in this session.
+                                                for c in &mut clients {
+                                                    if c.session_idx == si {
+                                                        if c.active_window == wi {
+                                                            c.active_window =
+                                                                wi.min(session.windows.len() - 1);
+                                                        } else if c.active_window > wi {
+                                                            c.active_window -= 1;
+                                                        }
+                                                    }
+                                                }
+                                                for ci in 0..clients.len() {
+                                                    if !need_snapshot.contains(&ci) {
+                                                        need_snapshot.push(ci);
+                                                    }
+                                                }
+                                                need_status_bar_all = true;
+                                            } else {
+                                                // Last window in this session — remove the session.
+                                                crate::log::info(&format!(
+                                                    "last window in session '{session_name}' killed, removing session"
+                                                ));
+                                                sessions.remove(si);
+                                                if sessions.is_empty() {
+                                                    crate::log::info(
+                                                        "last session closed, shutting down server",
+                                                    );
+                                                    broadcast_to_all(
+                                                        &mut clients,
+                                                        &proto::encode_server(
+                                                            &ServerMsg::PaneExit { code: 0 },
+                                                        ),
+                                                    );
+                                                    shutdown_flush(&mut clients);
+                                                    ipc::cleanup(socket_path);
+                                                    return Ok(());
+                                                }
+                                                // Fix up all clients' session indices.
+                                                for c in &mut clients {
+                                                    if c.session_idx == si {
+                                                        c.session_idx = 0;
+                                                        c.active_window = 0;
+                                                    } else if c.session_idx > si {
+                                                        c.session_idx -= 1;
+                                                    }
+                                                }
+                                                for ci in 0..clients.len() {
+                                                    if !need_snapshot.contains(&ci) {
+                                                        need_snapshot.push(ci);
+                                                    }
+                                                }
+                                                need_status_bar_all = true;
+                                            }
+                                        }
+                                        ClientMsg::NewSession { name, cwd, command } => {
+                                            // Use the CWD from the client message if provided
+                                            // (e.g. from `lrmux new-session` CLI). Otherwise,
+                                            // fall back to the CWD of the active window's child.
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            let cwd_full = cwd.or_else(|| {
+                                                if si < sessions.len()
+                                                    && wi < sessions[si].windows.len()
+                                                {
+                                                    let pane = &sessions[si].windows[wi].pane;
+                                                    if !pane.exited {
+                                                        pty::child_cwd_full(pane.pty.child_pid)
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            let session_name =
+                                                name.unwrap_or_else(|| match &cwd_full {
+                                                    Some(cwd) => {
+                                                        let base = std::path::Path::new(cwd)
+                                                            .file_name()
+                                                            .map(|n| {
+                                                                n.to_string_lossy().into_owned()
+                                                            })
+                                                            .unwrap_or_else(|| {
+                                                                "session".to_string()
+                                                            });
+                                                        ensure_unique_session_name(&base, &sessions)
+                                                    }
+                                                    None => default_session_name(&sessions),
+                                                });
+                                            let session = match &cwd_full {
+                                                Some(cwd) => Session::new_in_cwd(
+                                                    session_name,
+                                                    grid_rows,
+                                                    grid_cols,
+                                                    cwd,
+                                                ),
+                                                None => {
+                                                    Session::new(session_name, grid_rows, grid_cols)
+                                                }
+                                            };
+                                            sessions.push(session);
+                                            let new_si = sessions.len() - 1;
+                                            let new_name = sessions[new_si].name.clone();
+                                            crate::log::info(&format!(
+                                                "new session '{new_name}' created (index {new_si})"
+                                            ));
+                                            // If a command was specified, replace the
+                                            // default shell window with a window running
+                                            // that command.
+                                            if let Some(ref cmd) = command {
+                                                let win = Window::new_with_command(
+                                                    grid_rows,
+                                                    grid_cols,
+                                                    default_window_name(),
+                                                    cmd,
+                                                    cwd_full.as_deref(),
+                                                );
+                                                // Replace the first window (default shell)
+                                                // with the command window.
+                                                sessions[new_si].windows[0] = win;
+                                            }
+                                            // Switch the sending client to the new session.
+                                            if clients[client_idx].attach {
+                                                clients[client_idx].session_idx = new_si;
+                                                clients[client_idx].active_window = 0;
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                            }
+                                            // Also switch all other attached clients
+                                            // (auto-switch to new session).
+                                            for (ci, c) in clients.iter_mut().enumerate() {
+                                                if ci != client_idx
+                                                    && c.attach
+                                                    && !need_snapshot.contains(&ci)
+                                                {
+                                                    c.session_idx = new_si;
+                                                    c.active_window = 0;
+                                                    need_snapshot.push(ci);
+                                                }
+                                            }
+                                            need_status_bar_all = true;
+                                        }
+                                        ClientMsg::NextSession => {
+                                            if sessions.len() > 1 {
+                                                let si = clients[client_idx].session_idx;
+                                                clients[client_idx].session_idx =
+                                                    (si + 1) % sessions.len();
+                                                clients[client_idx].active_window = 0;
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                                need_status_bar_all = true;
+                                            }
+                                        }
+                                        ClientMsg::PrevSession => {
+                                            if sessions.len() > 1 {
+                                                let si = clients[client_idx].session_idx;
+                                                clients[client_idx].session_idx = if si == 0 {
+                                                    sessions.len() - 1
+                                                } else {
+                                                    si - 1
+                                                };
+                                                clients[client_idx].active_window = 0;
+                                                if !need_snapshot.contains(&client_idx) {
+                                                    need_snapshot.push(client_idx);
+                                                }
+                                                need_status_bar_all = true;
+                                            }
+                                        }
+                                        ClientMsg::SelectSession { name } => {
+                                            if let Some(idx) =
+                                                sessions.iter().position(|s| s.name == name)
+                                            {
+                                                if clients[client_idx].attach {
+                                                    // Interactive client: switch just this one.
+                                                    clients[client_idx].session_idx = idx;
+                                                    clients[client_idx].active_window = 0;
+                                                    if !need_snapshot.contains(&client_idx) {
+                                                        need_snapshot.push(client_idx);
+                                                    }
+                                                } else {
+                                                    // CLI client: switch all attached clients.
+                                                    for (ci, c) in clients.iter_mut().enumerate() {
+                                                        if c.attach {
+                                                            c.session_idx = idx;
+                                                            c.active_window = 0;
+                                                            if !need_snapshot.contains(&ci) {
+                                                                need_snapshot.push(ci);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                need_status_bar_all = true;
+                                            } else {
+                                                crate::log::warn(&format!(
+                                                    "SelectSession: session '{name}' not found"
+                                                ));
+                                            }
+                                        }
+                                        ClientMsg::KillSession => {
+                                            let si = clients[client_idx].session_idx;
+                                            if si >= sessions.len() {
+                                                continue;
+                                            }
+                                            let name = sessions[si].name.clone();
+                                            crate::log::info(&format!(
+                                                "session '{name}' killed by client, removing"
                                             ));
                                             sessions.remove(si);
                                             if sessions.is_empty() {
                                                 crate::log::info(
                                                     "last session closed, shutting down server",
                                                 );
+                                                kill_all_children(&sessions);
                                                 broadcast_to_all(
                                                     &mut clients,
                                                     &proto::encode_server(&ServerMsg::PaneExit {
@@ -771,161 +1024,27 @@ pub fn run(
                                             }
                                             need_status_bar_all = true;
                                         }
-                                    }
-                                    ClientMsg::NewSession { name, cwd, command } => {
-                                        // Use the CWD from the client message if provided
-                                        // (e.g. from `lrmux new-session` CLI). Otherwise,
-                                        // fall back to the CWD of the active window's child.
-                                        let si = clients[client_idx].session_idx;
-                                        let wi = clients[client_idx].active_window;
-                                        let cwd_full = cwd.or_else(|| {
-                                            if si < sessions.len()
-                                                && wi < sessions[si].windows.len()
-                                            {
-                                                let pane = &sessions[si].windows[wi].pane;
-                                                if !pane.exited {
-                                                    pty::child_cwd_full(pane.pty.child_pid)
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                        let session_name =
-                                            name.unwrap_or_else(|| match &cwd_full {
-                                                Some(cwd) => {
-                                                    let base = std::path::Path::new(cwd)
-                                                        .file_name()
-                                                        .map(|n| n.to_string_lossy().into_owned())
-                                                        .unwrap_or_else(|| "session".to_string());
-                                                    ensure_unique_session_name(&base, &sessions)
-                                                }
-                                                None => default_session_name(&sessions),
-                                            });
-                                        let session = match &cwd_full {
-                                            Some(cwd) => Session::new_in_cwd(
-                                                session_name,
-                                                grid_rows,
-                                                grid_cols,
-                                                cwd,
-                                            ),
-                                            None => {
-                                                Session::new(session_name, grid_rows, grid_cols)
-                                            }
-                                        };
-                                        sessions.push(session);
-                                        let new_si = sessions.len() - 1;
-                                        let new_name = sessions[new_si].name.clone();
-                                        crate::log::info(&format!(
-                                            "new session '{new_name}' created (index {new_si})"
-                                        ));
-                                        // If a command was specified, replace the
-                                        // default shell window with a window running
-                                        // that command.
-                                        if let Some(ref cmd) = command {
-                                            let win = Window::new_with_command(
-                                                grid_rows,
-                                                grid_cols,
-                                                default_window_name(),
-                                                cmd,
-                                                cwd_full.as_deref(),
-                                            );
-                                            // Replace the first window (default shell)
-                                            // with the command window.
-                                            sessions[new_si].windows[0] = win;
-                                        }
-                                        // Switch the sending client to the new session.
-                                        if clients[client_idx].attach {
-                                            clients[client_idx].session_idx = new_si;
-                                            clients[client_idx].active_window = 0;
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
-                                            }
-                                        }
-                                        // Also switch all other attached clients
-                                        // (auto-switch to new session).
-                                        for (ci, c) in clients.iter_mut().enumerate() {
-                                            if ci != client_idx
-                                                && c.attach
-                                                && !need_snapshot.contains(&ci)
-                                            {
-                                                c.session_idx = new_si;
-                                                c.active_window = 0;
-                                                need_snapshot.push(ci);
-                                            }
-                                        }
-                                        need_status_bar_all = true;
-                                    }
-                                    ClientMsg::NextSession => {
-                                        if sessions.len() > 1 {
+                                        ClientMsg::RenameSession { name } => {
                                             let si = clients[client_idx].session_idx;
-                                            clients[client_idx].session_idx =
-                                                (si + 1) % sessions.len();
-                                            clients[client_idx].active_window = 0;
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
+                                            if si < sessions.len() {
+                                                sessions[si].name = name;
+                                                need_status_bar_all = true;
                                             }
-                                            need_status_bar_all = true;
                                         }
-                                    }
-                                    ClientMsg::PrevSession => {
-                                        if sessions.len() > 1 {
-                                            let si = clients[client_idx].session_idx;
-                                            clients[client_idx].session_idx =
-                                                if si == 0 { sessions.len() - 1 } else { si - 1 };
-                                            clients[client_idx].active_window = 0;
-                                            if !need_snapshot.contains(&client_idx) {
-                                                need_snapshot.push(client_idx);
-                                            }
-                                            need_status_bar_all = true;
+                                        ClientMsg::Identify { .. } => {}
+                                        ClientMsg::ListSessions => {
+                                            let names: Vec<String> =
+                                                sessions.iter().map(|s| s.name.clone()).collect();
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::SessionList {
+                                                    sessions: names,
+                                                    address: crate::server::server_address()
+                                                        .to_string(),
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
                                         }
-                                    }
-                                    ClientMsg::SelectSession { name } => {
-                                        if let Some(idx) =
-                                            sessions.iter().position(|s| s.name == name)
-                                        {
-                                            if clients[client_idx].attach {
-                                                // Interactive client: switch just this one.
-                                                clients[client_idx].session_idx = idx;
-                                                clients[client_idx].active_window = 0;
-                                                if !need_snapshot.contains(&client_idx) {
-                                                    need_snapshot.push(client_idx);
-                                                }
-                                            } else {
-                                                // CLI client: switch all attached clients.
-                                                for (ci, c) in clients.iter_mut().enumerate() {
-                                                    if c.attach {
-                                                        c.session_idx = idx;
-                                                        c.active_window = 0;
-                                                        if !need_snapshot.contains(&ci) {
-                                                            need_snapshot.push(ci);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            need_status_bar_all = true;
-                                        } else {
-                                            crate::log::warn(&format!(
-                                                "SelectSession: session '{name}' not found"
-                                            ));
-                                        }
-                                    }
-                                    ClientMsg::KillSession => {
-                                        let si = clients[client_idx].session_idx;
-                                        if si >= sessions.len() {
-                                            continue;
-                                        }
-                                        let name = sessions[si].name.clone();
-                                        crate::log::info(&format!(
-                                            "session '{name}' killed by client, removing"
-                                        ));
-                                        sessions.remove(si);
-                                        if sessions.is_empty() {
-                                            crate::log::info(
-                                                "last session closed, shutting down server",
-                                            );
-                                            kill_all_children(&sessions);
+                                        ClientMsg::KillServer => {
+                                            eprintln!("lrmux: KillServer received, shutting down.");
                                             broadcast_to_all(
                                                 &mut clients,
                                                 &proto::encode_server(&ServerMsg::PaneExit {
@@ -934,339 +1053,290 @@ pub fn run(
                                             );
                                             shutdown_flush(&mut clients);
                                             ipc::cleanup(socket_path);
+                                            eprintln!("lrmux: server stopped.");
                                             return Ok(());
                                         }
-                                        // Fix up all clients' session indices.
-                                        for c in &mut clients {
-                                            if c.session_idx == si {
-                                                c.session_idx = 0;
-                                                c.active_window = 0;
-                                            } else if c.session_idx > si {
-                                                c.session_idx -= 1;
-                                            }
-                                        }
-                                        for ci in 0..clients.len() {
-                                            if !need_snapshot.contains(&ci) {
-                                                need_snapshot.push(ci);
-                                            }
-                                        }
-                                        need_status_bar_all = true;
-                                    }
-                                    ClientMsg::RenameSession { name } => {
-                                        let si = clients[client_idx].session_idx;
-                                        if si < sessions.len() {
-                                            sessions[si].name = name;
-                                            need_status_bar_all = true;
-                                        }
-                                    }
-                                    ClientMsg::Identify { .. } => {}
-                                    ClientMsg::ListSessions => {
-                                        let names: Vec<String> =
-                                            sessions.iter().map(|s| s.name.clone()).collect();
-                                        let msg = proto::encode_server(&ServerMsg::SessionList {
-                                            sessions: names,
-                                            address: crate::server::server_address().to_string(),
-                                        });
-                                        let _ = client_send(&mut clients[client_idx], &msg);
-                                    }
-                                    ClientMsg::KillServer => {
-                                        eprintln!("lrmux: KillServer received, shutting down.");
-                                        broadcast_to_all(
-                                            &mut clients,
-                                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
-                                        );
-                                        shutdown_flush(&mut clients);
-                                        ipc::cleanup(socket_path);
-                                        eprintln!("lrmux: server stopped.");
-                                        return Ok(());
-                                    }
-                                    ClientMsg::NewWindowIn { session, command } => {
-                                        // Find the target session by name, or use the first.
-                                        let si = match session {
-                                            Some(ref name) => {
-                                                sessions.iter().position(|s| &s.name == name)
-                                            }
-                                            None => {
-                                                if sessions.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(0)
+                                        ClientMsg::NewWindowIn { session, command } => {
+                                            // Find the target session by name, or use the first.
+                                            let si = match session {
+                                                Some(ref name) => {
+                                                    sessions.iter().position(|s| &s.name == name)
                                                 }
-                                            }
-                                        };
-                                        if let Some(si) = si {
-                                            let win = match command {
-                                                Some(ref cmd) => Window::new_with_command(
-                                                    grid_rows,
-                                                    grid_cols,
-                                                    default_window_name(),
-                                                    cmd,
-                                                    None,
-                                                ),
-                                                None => Window::new(
-                                                    grid_rows,
-                                                    grid_cols,
-                                                    default_window_name(),
-                                                ),
-                                            };
-                                            sessions[si].windows.push(win);
-                                            need_status_bar_all = true;
-                                        }
-                                    }
-                                    ClientMsg::CaptureWindow {
-                                        session,
-                                        window,
-                                        format,
-                                        colors,
-                                        term_fg,
-                                        term_bg,
-                                    } => {
-                                        // Find the target session by name, or use the first.
-                                        let si = match session {
-                                            Some(ref name) => {
-                                                sessions.iter().position(|s| &s.name == name)
-                                            }
-                                            None => {
-                                                if sessions.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(0)
+                                                None => {
+                                                    if sessions.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(0)
+                                                    }
                                                 }
-                                            }
-                                        };
-                                        let fmt = super::capture::CaptureFormat::from_u8(format);
-                                        let content = if let Some(si) = si {
-                                            let wi = match window {
-                                                Some(w) => Some(w as usize),
-                                                None => Some(clients[client_idx].active_window),
                                             };
-                                            if let Some(wi) = wi
-                                                && wi < sessions[si].windows.len()
-                                            {
-                                                let palette = resolve_capture_palette(
-                                                    &sessions, &clients, si, wi, term_fg, term_bg,
-                                                );
-                                                Some(super::capture::render_pane(
-                                                    &sessions[si].windows[wi].pane,
-                                                    fmt,
-                                                    colors,
-                                                    false,
-                                                    palette,
-                                                ))
-                                            } else {
-                                                None
+                                            if let Some(si) = si {
+                                                let win = match command {
+                                                    Some(ref cmd) => Window::new_with_command(
+                                                        grid_rows,
+                                                        grid_cols,
+                                                        default_window_name(),
+                                                        cmd,
+                                                        None,
+                                                    ),
+                                                    None => Window::new(
+                                                        grid_rows,
+                                                        grid_cols,
+                                                        default_window_name(),
+                                                    ),
+                                                };
+                                                sessions[si].windows.push(win);
+                                                need_status_bar_all = true;
                                             }
-                                        } else {
-                                            None
-                                        };
-                                        let msg = proto::encode_server(&ServerMsg::WindowCapture {
-                                            content: content.unwrap_or_default(),
-                                        });
-                                        let _ = client_send(&mut clients[client_idx], &msg);
-                                    }
-                                    ClientMsg::SendKeys {
-                                        session,
-                                        window,
-                                        keys,
-                                    } => {
-                                        crate::log::info(&format!(
-                                            "SendKeys: session={:?} window={:?} keys_len={}",
+                                        }
+                                        ClientMsg::CaptureWindow {
                                             session,
                                             window,
-                                            keys.len()
-                                        ));
-                                        // Find the target session by name, or use the first.
-                                        let si = match session {
-                                            Some(ref name) => {
-                                                sessions.iter().position(|s| &s.name == name)
-                                            }
-                                            None => {
-                                                if sessions.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(0)
+                                            format,
+                                            colors,
+                                            term_fg,
+                                            term_bg,
+                                        } => {
+                                            // Find the target session by name, or use the first.
+                                            let si = match session {
+                                                Some(ref name) => {
+                                                    sessions.iter().position(|s| &s.name == name)
                                                 }
-                                            }
-                                        };
-                                        if let Some(si) = si {
-                                            let wi = match window {
-                                                Some(w) => Some(w as usize),
-                                                None => Some(clients[client_idx].active_window),
+                                                None => {
+                                                    if sessions.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(0)
+                                                    }
+                                                }
                                             };
-                                            if let Some(wi) = wi
-                                                && wi < sessions[si].windows.len()
-                                            {
-                                                crate::log::info(&format!(
-                                                    "SendKeys: writing {} bytes to session '{}' window {}",
-                                                    keys.len(),
-                                                    sessions[si].name,
-                                                    wi
-                                                ));
-                                                let translated = translate_cursor_keys(
-                                                    &keys,
-                                                    sessions[si].windows[wi]
+                                            let fmt =
+                                                super::capture::CaptureFormat::from_u8(format);
+                                            let content = if let Some(si) = si {
+                                                let wi = match window {
+                                                    Some(w) => Some(w as usize),
+                                                    None => Some(clients[client_idx].active_window),
+                                                };
+                                                if let Some(wi) = wi
+                                                    && wi < sessions[si].windows.len()
+                                                {
+                                                    let palette = resolve_capture_palette(
+                                                        &sessions, &clients, si, wi, term_fg,
+                                                        term_bg,
+                                                    );
+                                                    Some(super::capture::render_pane(
+                                                        &sessions[si].windows[wi].pane,
+                                                        fmt,
+                                                        colors,
+                                                        false,
+                                                        palette,
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::WindowCapture {
+                                                    content: content.unwrap_or_default(),
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
+                                        ClientMsg::SendKeys {
+                                            session,
+                                            window,
+                                            keys,
+                                        } => {
+                                            crate::log::info(&format!(
+                                                "SendKeys: session={:?} window={:?} keys_len={}",
+                                                session,
+                                                window,
+                                                keys.len()
+                                            ));
+                                            // Find the target session by name, or use the first.
+                                            let si = match session {
+                                                Some(ref name) => {
+                                                    sessions.iter().position(|s| &s.name == name)
+                                                }
+                                                None => {
+                                                    if sessions.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(0)
+                                                    }
+                                                }
+                                            };
+                                            if let Some(si) = si {
+                                                let wi = match window {
+                                                    Some(w) => Some(w as usize),
+                                                    None => Some(clients[client_idx].active_window),
+                                                };
+                                                if let Some(wi) = wi
+                                                    && wi < sessions[si].windows.len()
+                                                {
+                                                    crate::log::info(&format!(
+                                                        "SendKeys: writing {} bytes to session '{}' window {}",
+                                                        keys.len(),
+                                                        sessions[si].name,
+                                                        wi
+                                                    ));
+                                                    let translated = translate_cursor_keys(
+                                                        &keys,
+                                                        sessions[si].windows[wi]
+                                                            .pane
+                                                            .grid
+                                                            .app_cursor_keys,
+                                                    );
+                                                    let _ = sessions[si].windows[wi]
                                                         .pane
-                                                        .grid
-                                                        .app_cursor_keys,
-                                                );
-                                                let _ = sessions[si].windows[wi]
-                                                    .pane
-                                                    .write_input(&translated);
+                                                        .write_input(&translated);
+                                                } else {
+                                                    crate::log::warn(&format!(
+                                                        "SendKeys: window index {} out of range (session '{}' has {} windows)",
+                                                        wi.unwrap_or(0),
+                                                        sessions[si].name,
+                                                        sessions[si].windows.len()
+                                                    ));
+                                                }
                                             } else {
                                                 crate::log::warn(&format!(
-                                                    "SendKeys: window index {} out of range (session '{}' has {} windows)",
-                                                    wi.unwrap_or(0),
-                                                    sessions[si].name,
-                                                    sessions[si].windows.len()
+                                                    "SendKeys: session {:?} not found",
+                                                    session
                                                 ));
                                             }
-                                        } else {
-                                            crate::log::warn(&format!(
-                                                "SendKeys: session {:?} not found",
-                                                session
-                                            ));
                                         }
-                                    }
-                                    ClientMsg::GetLog => {
-                                        let lines = crate::log::get_ring_log();
-                                        let msg =
-                                            proto::encode_server(&ServerMsg::LogContent { lines });
-                                        let _ = client_send(&mut clients[client_idx], &msg);
-                                    }
-                                    ClientMsg::SetPsk { psk } => {
-                                        if !clients[client_idx].attach
-                                            && !clients[client_idx].is_control
-                                        {
-                                            let msg = proto::encode_server(&ServerMsg::Error {
-                                                msg: "SetPsk requires an attached client".into(),
-                                            });
+                                        ClientMsg::GetLog => {
+                                            let lines = crate::log::get_ring_log();
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::LogContent {
+                                                    lines,
+                                                });
                                             let _ = client_send(&mut clients[client_idx], &msg);
-                                        } else {
-                                            crate::server::set_runtime_psk(psk.clone());
-                                            if let Err(e) = crate::config::persist_psk(&psk) {
-                                                crate::log::warn(&format!(
-                                                    "failed to persist PSK to config: {e}"
-                                                ));
+                                        }
+                                        ClientMsg::SetPsk { psk } => {
+                                            if !clients[client_idx].attach
+                                                && !clients[client_idx].is_control
+                                            {
+                                                let msg = proto::encode_server(&ServerMsg::Error {
+                                                    msg: "SetPsk requires an attached client"
+                                                        .into(),
+                                                });
+                                                let _ = client_send(&mut clients[client_idx], &msg);
+                                            } else {
+                                                crate::server::set_runtime_psk(psk.clone());
+                                                if let Err(e) = crate::config::persist_psk(&psk) {
+                                                    crate::log::warn(&format!(
+                                                        "failed to persist PSK to config: {e}"
+                                                    ));
+                                                }
+                                                crate::log::info("PSK updated via SetPsk");
+                                                let msg =
+                                                    proto::encode_server(&ServerMsg::PskUpdated);
+                                                let _ = client_send(&mut clients[client_idx], &msg);
                                             }
-                                            crate::log::info("PSK updated via SetPsk");
-                                            let msg = proto::encode_server(&ServerMsg::PskUpdated);
-                                            let _ = client_send(&mut clients[client_idx], &msg);
                                         }
-                                    }
-                                    ClientMsg::IdentifyControl {
-                                        rows,
-                                        cols,
-                                        auth_token,
-                                    } => {
-                                        if !check_tcp_auth(&clients[client_idx], &auth_token) {
-                                            let msg = proto::encode_server(&ServerMsg::Error {
-                                                msg: "authentication failed".into(),
-                                            });
-                                            let _ = client_send(&mut clients[client_idx], &msg);
-                                            to_remove.push(client_idx);
-                                            break;
-                                        }
-                                        // Control mode client: mark as control
-                                        // and emit the initial state right away,
-                                        // like real tmux -CC does after the DCS.
-                                        clients[client_idx].is_control = true;
-                                        clients[client_idx].attach = false;
-                                        // Send IdentifyAck with the requested grid size.
-                                        let msg = proto::encode_server(&ServerMsg::IdentifyAck {
+                                        ClientMsg::IdentifyControl {
                                             rows,
                                             cols,
-                                            version: crate::version::VERSION.to_string(),
-                                            address: crate::server::server_address().to_string(),
-                                        });
-                                        let _ = client_send(&mut clients[client_idx], &msg);
-                                        send_control_initial_state(
-                                            &mut clients[client_idx],
-                                            &sessions,
-                                        );
-                                    }
-                                    ClientMsg::ControlCommand { line } => {
-                                        // Resume fast-forward only once the client
-                                        // has drained enough that a new flood won't
-                                        // immediately re-trip the cap. Clearing on
-                                        // every select-pane/send while still behind
-                                        // oscillates and freezes iTerm2.
-                                        if clients[client_idx].suppressed
-                                            && clients[client_idx].outbuf.len()
-                                                <= CLIENT_SUPPRESS_LOW
-                                        {
-                                            clients[client_idx].suppressed = false;
-                                            crate::log::info(&format!(
-                                                "control client fd {} resumed after fast-forward",
-                                                clients[client_idx].fd
-                                            ));
-                                            send_control_notify(
+                                            auth_token,
+                                        } => {
+                                            if !check_tcp_auth(&clients[client_idx], &auth_token) {
+                                                let msg = proto::encode_server(&ServerMsg::Error {
+                                                    msg: "authentication failed".into(),
+                                                });
+                                                let _ = client_send(&mut clients[client_idx], &msg);
+                                                to_remove.push(client_idx);
+                                                break;
+                                            }
+                                            // Control mode client: mark as control
+                                            // and emit the initial state right away,
+                                            // like real tmux -CC does after the DCS.
+                                            clients[client_idx].is_control = true;
+                                            clients[client_idx].attach = false;
+                                            // Send IdentifyAck with the requested grid size.
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::IdentifyAck {
+                                                    rows,
+                                                    cols,
+                                                    version: crate::version::VERSION.to_string(),
+                                                    address: crate::server::server_address()
+                                                        .to_string(),
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                            send_control_initial_state(
                                                 &mut clients[client_idx],
-                                                "%message lrmux: output resumed",
+                                                &sessions,
                                             );
                                         }
-                                        // Parse and execute a tmux-style command.
-                                        let mut pending_affinities = None;
-                                        if handle_control_command(
-                                            &mut clients[client_idx],
-                                            &mut sessions,
-                                            &line,
-                                            socket_path,
-                                            &mut pending_affinities,
-                                        ) {
-                                            shutdown = true;
-                                        }
-                                        if let Some((si, value)) = pending_affinities
-                                            && migrate_affinity_sessions(
+                                        ClientMsg::ControlCommand { line } => {
+                                            // Resume fast-forward only once the client
+                                            // has drained enough that a new flood won't
+                                            // immediately re-trip the cap. Clearing on
+                                            // every select-pane/send while still behind
+                                            // oscillates and freezes iTerm2.
+                                            if clients[client_idx].suppressed
+                                                && clients[client_idx].outbuf.len()
+                                                    <= CLIENT_SUPPRESS_LOW
+                                            {
+                                                clients[client_idx].suppressed = false;
+                                                crate::log::info(&format!(
+                                                    "control client fd {} resumed after fast-forward",
+                                                    clients[client_idx].fd
+                                                ));
+                                                send_control_notify(
+                                                    &mut clients[client_idx],
+                                                    "%message lrmux: output resumed",
+                                                );
+                                            }
+                                            // Parse and execute a tmux-style command.
+                                            let mut pending_affinities = None;
+                                            if handle_control_command(
+                                                &mut clients[client_idx],
                                                 &mut sessions,
-                                                si,
-                                                &value,
-                                                &mut clients,
-                                            )
-                                        {
-                                            broadcast_control_notify(
-                                                &mut clients,
-                                                "%sessions-changed",
-                                            );
+                                                &line,
+                                                socket_path,
+                                                &mut pending_affinities,
+                                            ) {
+                                                shutdown = true;
+                                            }
+                                            if let Some((si, value)) = pending_affinities
+                                                && migrate_affinity_sessions(
+                                                    &mut sessions,
+                                                    si,
+                                                    &value,
+                                                    &mut clients,
+                                                )
+                                            {
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    "%sessions-changed",
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Ok(None) => break,
-                            Err(_) => {
-                                to_remove.push(client_idx);
-                                break;
+                                Ok(None) => break,
+                                Err(_) => {
+                                    to_remove.push(client_idx);
+                                    break;
+                                }
                             }
                         }
                     }
-                } else if n == 0 {
-                    to_remove.push(client_idx);
-                } else {
-                    let err = io::Error::last_os_error();
-                    if err.kind() != io::ErrorKind::WouldBlock {
-                        to_remove.push(client_idx);
-                    }
+                    Ok(false) => to_remove.push(client_idx),
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => to_remove.push(client_idx),
                 }
             }
             if pf.revents & (libc::POLLHUP | libc::POLLERR) != 0 && !to_remove.contains(&client_idx)
             {
                 // On POLLHUP, try one more read — the peer may have sent data
                 // before closing (e.g. CLI commands that send a message and exit).
-                let mut buf = [0u8; 8192];
-                let n = unsafe {
-                    libc::read(
-                        clients[client_idx].fd,
-                        buf.as_mut_ptr() as *mut _,
-                        buf.len(),
-                    )
-                };
-                if n > 0 {
-                    crate::log::debug(&format!(
-                        "read {} bytes from client {} on POLLHUP",
-                        n, client_idx
-                    ));
-                    clients[client_idx]
-                        .buf
-                        .extend_from_slice(&buf[..n as usize]);
+                if matches!(read_into_client_buf(&mut clients[client_idx]), Ok(true)) {
+                    crate::log::debug(&format!("read from client {client_idx} on POLLHUP"));
                     // Process any complete frames before removing the client.
                     while let Ok(Some(msg)) = try_parse_frame(&mut clients[client_idx].buf) {
                         crate::log::debug(&format!(
