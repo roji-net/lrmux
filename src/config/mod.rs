@@ -336,6 +336,65 @@ pub fn generate_psk() -> io::Result<String> {
     Ok(base64url(&buf))
 }
 
+/// Stable server identity (UUID v4), generated once and persisted at
+/// `~/.config/lrmux/server.id`. Peers dedup on this id — TCP ports are
+/// auto-assigned and change across restarts.
+pub fn server_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(load_or_create_server_id)
+}
+
+fn load_or_create_server_id() -> String {
+    let path = config_dir().join("server.id");
+    if let Ok(s) = fs::read_to_string(&path) {
+        let s = s.trim();
+        if is_uuid(s) {
+            return s.to_string();
+        }
+    }
+    let id = uuid_v4();
+    let _ = fs::create_dir_all(config_dir());
+    if let Err(e) = fs::write(&path, format!("{id}\n")) {
+        eprintln!("lrmux: warning: cannot persist {}: {e}", path.display());
+    }
+    id
+}
+
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    if fill_random(&mut b).is_err() {
+        // Last-resort entropy: mixer of time and pid. Still unique in
+        // practice; only reachable when /dev/urandom is unavailable.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = sha2::Sha256::new();
+        use sha2::Digest;
+        h.update(nanos.to_le_bytes());
+        h.update(std::process::id().to_le_bytes());
+        b.copy_from_slice(&h.finalize()[..16]);
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+    let mut s = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
 fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     let mut f = fs::File::open("/dev/urandom")?;
@@ -366,4 +425,24 @@ fn base64url(data: &[u8]) -> String {
         out.push(T[((n >> 6) & 63) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_v4_is_valid_and_versioned() {
+        let id = uuid_v4();
+        assert!(is_uuid(&id), "bad uuid: {id}");
+        assert_eq!(id.as_bytes()[14], b'4');
+        assert!(matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    #[test]
+    fn is_uuid_rejects_malformed() {
+        assert!(!is_uuid(""));
+        assert!(!is_uuid("not-a-uuid"));
+        assert!(!is_uuid("8b2f0a1e4c3d4e5f9a0b1c2d3e4f5a6b")); // no dashes
+    }
 }
