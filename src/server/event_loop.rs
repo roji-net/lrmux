@@ -215,13 +215,19 @@ pub fn run(
     listeners: Vec<crate::ipc::ConnListener>,
     socket_path: &std::path::Path,
     headless: bool,
+    manager: bool,
     discovery_sock: Option<std::net::UdpSocket>,
 ) -> io::Result<()> {
     // Capture once at startup. Probes (ListSessions) and failed first
     // handshakes must not consume / lose `new-server -- cmd` options.
     let boot = take_bootstrap();
 
-    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if manager {
+        // Manager role: pure directory/broker, no sessions, no waiting
+        // for a first client. Stays up until killed.
+        crate::log::info("server started in manager mode (no sessions)");
+        (24u16, 80u16, Vec::new(), Vec::new())
+    } else if headless {
         // Headless mode: create a default session (24x80) without waiting
         // for the first client. Used by `lrmux new-server --headless`
         // (`start-server` is the same) for testing and remote management.
@@ -295,16 +301,38 @@ pub fn run(
     let announce_on = crate::server::network().announce && announce_tcp_port != 0;
     let mut next_announce = announce_on.then(std::time::Instant::now);
 
-    // Peer directory: held when this node is a directory or accepts
-    // registrations. Fed by UDP announces and Register messages, and
-    // verified over TCP when [peers] poll = true.
+    // Peer directory: held when this node is a manager, a directory, or
+    // accepts registrations. Fed by UDP announces and Register messages,
+    // and verified over TCP when [peers] poll = true.
     let peers_cfg = &crate::config::global().peers;
-    let mut peer_cache = (peers_cfg.directory || peers_cfg.accept_registrations)
+    let mut peer_cache = (manager || peers_cfg.directory || peers_cfg.accept_registrations)
         .then(|| crate::peers::PeerCache::load(peers_cfg.ttl_secs));
 
     // Register ourselves with configured managers (bounded, best-effort).
+    // Skip entries that resolve to our own listener — registering with
+    // ourselves would just wait out the timeout.
+    let own_tcp_addr = listeners.iter().find_map(|l| match l {
+        crate::ipc::ConnListener::Tcp(t) => t.local_addr().ok(),
+        _ => None,
+    });
     if announce_tcp_port != 0 {
         for m in &peers_cfg.managers {
+            if std::net::ToSocketAddrs::to_socket_addrs(m.as_str())
+                .ok()
+                .is_some_and(|mut it| {
+                    it.any(|a| {
+                        Some(a) == own_tcp_addr
+                            || (a.port() == announce_tcp_port
+                                && (a.ip().is_loopback()
+                                    || own_tcp_addr
+                                        .map(|o| o.ip().is_unspecified() || o.ip() == a.ip())
+                                        .unwrap_or(false)))
+                    })
+                })
+            {
+                crate::log::info(&format!("skipping self manager entry {m}"));
+                continue;
+            }
             match crate::peers::register(m, announce_tcp_port, announce_tls) {
                 Ok(()) => crate::log::info(&format!("registered with manager {m}")),
                 Err(e) => crate::log::warn(&format!("register with manager {m} failed: {e}")),
@@ -1187,14 +1215,28 @@ pub fn run(
                                             tls,
                                             fingerprint,
                                         } => {
+                                            let from = clients[client_idx].stream.peer_addr();
                                             let (ok, reason) = handle_register(
+                                                manager,
                                                 peer_cache.as_mut(),
-                                                clients[client_idx].stream.peer_addr(),
-                                                server_id,
-                                                name,
-                                                tcp_port,
-                                                tls,
-                                                fingerprint,
+                                                from,
+                                                crate::ipc::discovery::Announcement {
+                                                    name,
+                                                    addr: std::net::SocketAddr::new(
+                                                        from.map(|a| a.ip()).unwrap_or(
+                                                            std::net::IpAddr::V4(
+                                                                std::net::Ipv4Addr::UNSPECIFIED,
+                                                            ),
+                                                        ),
+                                                        tcp_port,
+                                                    ),
+                                                    tcp_port,
+                                                    tls,
+                                                    version: String::new(),
+                                                    fingerprint,
+                                                    server_id: Some(server_id),
+                                                    leaving: false,
+                                                },
                                             );
                                             let msg =
                                                 proto::encode_server(&ServerMsg::RegisterAck {
@@ -1740,7 +1782,9 @@ pub fn run(
         }
 
         // If no sessions and no clients, or kill-server was requested, exit.
-        if shutdown || (sessions.is_empty() && clients.is_empty()) {
+        // A manager stays up with no sessions and no clients — it is the
+        // rendezvous point other nodes register with and clients query.
+        if shutdown || (sessions.is_empty() && clients.is_empty() && !manager) {
             break;
         }
 
@@ -1819,32 +1863,19 @@ fn peer_to_info(e: &crate::peers::PeerEntry) -> proto::PeerInfo {
 /// accepted. The peer is verified asynchronously by the poll scheduler
 /// (new entries start with poll_at = now).
 fn handle_register(
+    manager: bool,
     cache: Option<&mut crate::peers::PeerCache>,
     peer_addr: Option<std::net::SocketAddr>,
-    server_id: String,
-    name: String,
-    tcp_port: u16,
-    tls: bool,
-    fingerprint: String,
+    ann: crate::ipc::discovery::Announcement,
 ) -> (bool, String) {
-    if !crate::config::global().peers.accept_registrations {
+    if !manager && !crate::config::global().peers.accept_registrations {
         return (false, "registrations disabled".to_string());
     }
-    let Some(from) = peer_addr else {
+    if peer_addr.is_none() {
         return (false, "no remote address (unix client)".to_string());
-    };
+    }
     let Some(cache) = cache else {
         return (false, "directory not enabled".to_string());
-    };
-    let ann = crate::ipc::discovery::Announcement {
-        name,
-        addr: std::net::SocketAddr::new(from.ip(), tcp_port),
-        tcp_port,
-        tls,
-        version: String::new(),
-        fingerprint,
-        server_id: Some(server_id),
-        leaving: false,
     };
     cache.upsert_announce(&ann, crate::peers::PeerSource::Register);
     (true, String::new())
@@ -3332,10 +3363,13 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::SetPsk { psk }
         }
         _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown client msg type: {msg_type}"),
-            ));
+            // Newer messages (peer directory, relay, …) are not spelled
+            // out above — decode them with the shared proto decoder by
+            // re-prefixing the payload with its frame length.
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            framed.extend_from_slice(payload);
+            proto::decode_client(&mut &framed[..])?
         }
     };
     Ok(Some(msg))
