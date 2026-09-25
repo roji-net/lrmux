@@ -289,6 +289,12 @@ pub fn run(
     let announce_tls = crate::server::tls_server_config().is_some()
         && !matches!(crate::server::network().tls, crate::config::TlsMode::Off);
 
+    // Active announces (startup + heartbeat + leaving) when the config
+    // knob is on and a TCP port exists to point peers at. The deadline
+    // bounds poll() so heartbeats fire even on an idle server.
+    let announce_on = crate::server::network().announce && announce_tcp_port != 0;
+    let mut next_announce = announce_on.then(std::time::Instant::now);
+
     loop {
         // Build pollfd array: listeners + discovery + all window PTY fds + all client fds.
         let mut pty_map: Vec<(usize, usize)> = Vec::new();
@@ -342,13 +348,34 @@ pub fn run(
             });
         }
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        let timeout_ms = match next_announce {
+            Some(t) => t
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .clamp(0, i32::MAX as u128) as i32,
+            None => -1,
+        };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
             return Err(err);
+        }
+
+        // Announce heartbeat: broadcast (best-effort) + unicast to
+        // configured scan hosts. Errors inside announce() are ignored.
+        if let Some(t) = next_announce
+            && std::time::Instant::now() >= t
+        {
+            send_announce(
+                discovery_sock.as_ref(),
+                announce_tcp_port,
+                announce_tls,
+                false,
+            );
+            next_announce = Some(std::time::Instant::now() + ANNOUNCE_INTERVAL);
         }
 
         let polled_clients = clients.len();
@@ -367,6 +394,12 @@ pub fn run(
                     Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                         // KillServer received — shut down gracefully.
                         crate::log::info("KillServer received, shutting down");
+                        send_announce(
+                            discovery_sock.as_ref(),
+                            announce_tcp_port,
+                            announce_tls,
+                            true,
+                        );
                         kill_all_children(&sessions);
                         state::save_state(socket_path, &sessions);
                         broadcast_to_all(
@@ -398,6 +431,8 @@ pub fn run(
                         announce_tls,
                         crate::version::VERSION,
                         crate::server::tls_fingerprint(),
+                        crate::config::server_id(),
+                        false,
                     );
                     let _ = ds.send_to(&pkt, from);
                 }
@@ -1628,11 +1663,40 @@ pub fn run(
     }
 
     crate::log::info("no sessions and no clients remaining, server exiting");
+    send_announce(
+        discovery_sock.as_ref(),
+        announce_tcp_port,
+        announce_tls,
+        true,
+    );
     // Send SIGHUP to all remaining child processes before cleanup.
     kill_all_children(&sessions);
     state::save_state(socket_path, &sessions);
     ipc::cleanup(socket_path);
     Ok(())
+}
+
+/// Announce heartbeat cadence.
+const ANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Send an Announce (v2) to every well-known destination. No-op when
+/// `[network] announce` is off or there is no TCP port to advertise.
+/// `leaving` marks the graceful-shutdown flag.
+fn send_announce(sock: Option<&std::net::UdpSocket>, tcp_port: u16, tls: bool, leaving: bool) {
+    let net = &crate::config::global().network;
+    if !net.announce || tcp_port == 0 {
+        return;
+    }
+    let pkt = crate::ipc::discovery::encode_announce(
+        crate::server::server_name(),
+        tcp_port,
+        tls,
+        crate::version::VERSION,
+        crate::server::tls_fingerprint(),
+        crate::config::server_id(),
+        leaving,
+    );
+    crate::ipc::discovery::announce(sock, net.discovery_port, &net.scan, &pkt);
 }
 
 /// Send SIGHUP to all living child processes across all sessions.

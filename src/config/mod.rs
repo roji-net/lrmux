@@ -136,6 +136,11 @@ pub struct NetworkConfig {
     /// broadcast is unavailable (constrained platforms, AP client isolation) or off-subnet.
     #[serde(default)]
     pub scan: Vec<String>,
+    /// Actively announce this server on startup, periodically, and on
+    /// shutdown (broadcast best-effort + unicast to `scan` hosts).
+    /// Only does anything when a TCP listener is configured.
+    #[serde(default = "default_true")]
+    pub announce: bool,
     /// TLS policy for TCP connections.
     #[serde(default)]
     pub tls: TlsMode,
@@ -176,6 +181,7 @@ impl Default for NetworkConfig {
             discovery: false,
             discovery_port: default_discovery_port(),
             scan: Vec::new(),
+            announce: true,
             tls: TlsMode::Auto,
             psk: String::new(),
             auth_token: String::new(),
@@ -368,6 +374,31 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// UUID string ("8b2f0a1e-…") to its 16 raw bytes.
+pub fn uuid_to_bytes(s: &str) -> Option<[u8; 16]> {
+    if !is_uuid(s) {
+        return None;
+    }
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Raw 16 bytes to hyphenated UUID string.
+pub fn uuid_from_bytes(b: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
 fn uuid_v4() -> String {
     let mut b = [0u8; 16];
     if fill_random(&mut b).is_err() {
@@ -385,14 +416,7 @@ fn uuid_v4() -> String {
     }
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 1
-    let mut s = String::with_capacity(36);
-    for (i, byte) in b.iter().enumerate() {
-        if matches!(i, 4 | 6 | 8 | 10) {
-            s.push('-');
-        }
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
+    uuid_from_bytes(&b)
 }
 
 fn fill_random(buf: &mut [u8]) -> io::Result<()> {
