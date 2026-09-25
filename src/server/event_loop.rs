@@ -295,6 +295,23 @@ pub fn run(
     let announce_on = crate::server::network().announce && announce_tcp_port != 0;
     let mut next_announce = announce_on.then(std::time::Instant::now);
 
+    // Peer directory: held when this node is a directory or accepts
+    // registrations. Fed by UDP announces and Register messages, and
+    // verified over TCP when [peers] poll = true.
+    let peers_cfg = &crate::config::global().peers;
+    let mut peer_cache = (peers_cfg.directory || peers_cfg.accept_registrations)
+        .then(|| crate::peers::PeerCache::load(peers_cfg.ttl_secs));
+
+    // Register ourselves with configured managers (bounded, best-effort).
+    if announce_tcp_port != 0 {
+        for m in &peers_cfg.managers {
+            match crate::peers::register(m, announce_tcp_port, announce_tls) {
+                Ok(()) => crate::log::info(&format!("registered with manager {m}")),
+                Err(e) => crate::log::warn(&format!("register with manager {m} failed: {e}")),
+            }
+        }
+    }
+
     loop {
         // Build pollfd array: listeners + discovery + all window PTY fds + all client fds.
         let mut pty_map: Vec<(usize, usize)> = Vec::new();
@@ -415,26 +432,59 @@ pub fn run(
             }
         }
 
-        // Discovery UDP: respond to Discover probes with Announce.
+        // Discovery UDP: respond to Discover probes with Announce, and
+        // feed incoming Announces into the peer cache (skip our own).
         if let (Some(di), Some(ds)) = (discovery_idx, discovery_sock.as_ref())
             && fds[di].revents & libc::POLLIN != 0
-            && announce_tcp_port != 0
         {
             let mut buf = [0u8; 1500];
             while let Ok((n, from)) = ds.recv_from(&mut buf) {
-                if let Some(crate::ipc::discovery::ParsedPacket::Discover) =
-                    crate::ipc::discovery::parse_packet(&buf[..n], from)
-                {
-                    let pkt = crate::ipc::discovery::encode_announce(
-                        crate::server::server_name(),
-                        announce_tcp_port,
-                        announce_tls,
-                        crate::version::VERSION,
-                        crate::server::tls_fingerprint(),
-                        crate::config::server_id(),
-                        false,
-                    );
-                    let _ = ds.send_to(&pkt, from);
+                match crate::ipc::discovery::parse_packet(&buf[..n], from) {
+                    Some(crate::ipc::discovery::ParsedPacket::Discover)
+                        if announce_tcp_port != 0 =>
+                    {
+                        let pkt = crate::ipc::discovery::encode_announce(
+                            crate::server::server_name(),
+                            announce_tcp_port,
+                            announce_tls,
+                            crate::version::VERSION,
+                            crate::server::tls_fingerprint(),
+                            crate::config::server_id(),
+                            false,
+                        );
+                        let _ = ds.send_to(&pkt, from);
+                    }
+                    Some(crate::ipc::discovery::ParsedPacket::Announce(ann)) => {
+                        if ann.server_id.as_deref() != Some(crate::config::server_id())
+                            && let Some(cache) = peer_cache.as_mut()
+                        {
+                            cache.upsert_announce(&ann, crate::peers::PeerSource::Broadcast);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Peer polling: verify/refresh due entries over TCP. Synchronous
+        // but bounded (connect_timeout + read deadlines per stage).
+        if crate::config::global().peers.poll
+            && let Some(cache) = peer_cache.as_mut()
+        {
+            for key in cache.due_for_poll() {
+                let addr = cache
+                    .get(&key)
+                    .and_then(|e| e.addrs.first().map(|a| format!("{a}:{}", e.tcp_port)));
+                let Some(addr) = addr else { continue };
+                match crate::peers::poll_peer(&addr) {
+                    Ok((sessions, psk_ok)) => {
+                        cache.mark_verified(&key, sessions, "", psk_ok);
+                        crate::log::info(&format!("peer {addr} verified"));
+                    }
+                    Err(e) => {
+                        cache.mark_stale(&key);
+                        crate::log::info(&format!("peer {addr} poll failed: {e}"));
+                    }
                 }
             }
         }
@@ -1120,8 +1170,47 @@ pub fn run(
                                                 });
                                             let _ = client_send(&mut clients[client_idx], &msg);
                                         }
+                                        ClientMsg::ListPeers => {
+                                            let peers = peer_cache
+                                                .as_ref()
+                                                .map(|c| c.iter().map(peer_to_info).collect())
+                                                .unwrap_or_default();
+                                            let msg = proto::encode_server(&ServerMsg::PeerList {
+                                                peers,
+                                            });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
+                                        ClientMsg::Register {
+                                            server_id,
+                                            name,
+                                            tcp_port,
+                                            tls,
+                                            fingerprint,
+                                        } => {
+                                            let (ok, reason) = handle_register(
+                                                peer_cache.as_mut(),
+                                                clients[client_idx].stream.peer_addr(),
+                                                server_id,
+                                                name,
+                                                tcp_port,
+                                                tls,
+                                                fingerprint,
+                                            );
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::RegisterAck {
+                                                    ok,
+                                                    reason,
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
                                         ClientMsg::KillServer => {
                                             eprintln!("lrmux: KillServer received, shutting down.");
+                                            send_announce(
+                                                discovery_sock.as_ref(),
+                                                announce_tcp_port,
+                                                announce_tls,
+                                                true,
+                                            );
                                             broadcast_to_all(
                                                 &mut clients,
                                                 &proto::encode_server(&ServerMsg::PaneExit {
@@ -1660,6 +1749,10 @@ pub fn run(
         if iter_count.is_multiple_of(1000) && !sessions.is_empty() {
             state::save_state(socket_path, &sessions);
         }
+        if let Some(cache) = peer_cache.as_mut() {
+            cache.evict_expired();
+            cache.save_if_dirty();
+        }
     }
 
     crate::log::info("no sessions and no clients remaining, server exiting");
@@ -1697,6 +1790,64 @@ fn send_announce(sock: Option<&std::net::UdpSocket>, tcp_port: u16, tls: bool, l
         leaving,
     );
     crate::ipc::discovery::announce(sock, net.discovery_port, &net.scan, &pkt);
+}
+
+/// Flatten a cache entry for the wire (`PeerList`).
+fn peer_to_info(e: &crate::peers::PeerEntry) -> proto::PeerInfo {
+    let state = match e.state {
+        crate::peers::PeerState::Announced => "announced",
+        crate::peers::PeerState::Verified => "verified",
+        crate::peers::PeerState::Stale => "stale",
+    };
+    proto::PeerInfo {
+        server_id: e.server_id.clone(),
+        name: e.name.clone(),
+        addr: e
+            .addrs
+            .first()
+            .map(|a| format!("{a}:{}", e.tcp_port))
+            .unwrap_or_default(),
+        tls: e.tls,
+        fingerprint: e.fingerprint.clone(),
+        state: state.to_string(),
+        psk_ok: e.psk_ok,
+        sessions: e.sessions.clone(),
+    }
+}
+
+/// Handle a Register message: record the peer when registrations are
+/// accepted. The peer is verified asynchronously by the poll scheduler
+/// (new entries start with poll_at = now).
+fn handle_register(
+    cache: Option<&mut crate::peers::PeerCache>,
+    peer_addr: Option<std::net::SocketAddr>,
+    server_id: String,
+    name: String,
+    tcp_port: u16,
+    tls: bool,
+    fingerprint: String,
+) -> (bool, String) {
+    if !crate::config::global().peers.accept_registrations {
+        return (false, "registrations disabled".to_string());
+    }
+    let Some(from) = peer_addr else {
+        return (false, "no remote address (unix client)".to_string());
+    };
+    let Some(cache) = cache else {
+        return (false, "directory not enabled".to_string());
+    };
+    let ann = crate::ipc::discovery::Announcement {
+        name,
+        addr: std::net::SocketAddr::new(from.ip(), tcp_port),
+        tcp_port,
+        tls,
+        version: String::new(),
+        fingerprint,
+        server_id: Some(server_id),
+        leaving: false,
+    };
+    cache.upsert_announce(&ann, crate::peers::PeerSource::Register);
+    (true, String::new())
 }
 
 /// Send SIGHUP to all living child processes across all sessions.

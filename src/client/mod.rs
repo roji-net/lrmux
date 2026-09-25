@@ -854,6 +854,9 @@ pub fn run(
                             flash_deadline =
                                 Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                         }
+                        // Directory messages are answered by CLI paths, not
+                        // inside an attached session.
+                        ServerMsg::PeerList { .. } | ServerMsg::RegisterAck { .. } => {}
                     }
                 }
                 // Render once per socket batch instead of once per frame —

@@ -253,11 +253,13 @@ impl PeerCache {
     }
 
     /// Peers whose verification/refresh poll is due. Returns cache keys.
+    /// Stale peers are included — they keep retrying within their TTL
+    /// window so a temporarily unreachable peer recovers.
     pub fn due_for_poll(&self) -> Vec<String> {
         let now = now_epoch();
         self.peers
             .iter()
-            .filter(|(_, e)| e.poll_at <= now && e.state != PeerState::Stale)
+            .filter(|(_, e)| e.poll_at <= now)
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -291,6 +293,116 @@ impl PeerCache {
 /// Persisted cache path: `~/.config/lrmux/peers.toml`.
 pub fn peers_path() -> PathBuf {
     crate::config::config_dir().join("peers.toml")
+}
+
+/// Verification poll budget per peer — a dead peer costs the caller at
+/// most this much latency (connect + handshake + query).
+const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Poll one peer over TCP: Identify (auth) + ListSessions.
+/// Returns `(session names, psk_ok)` on success. `psk_ok` means our
+/// configured PSK was accepted — trivially true when we have none and
+/// the peer let us in anyway.
+///
+/// Synchronous and fully bounded: every stage uses connect_timeout or a
+/// poll()-based deadline so a dead peer cannot hang the caller.
+pub fn poll_peer(addr: &str) -> io::Result<(Vec<String>, bool)> {
+    use crate::proto::{ClientMsg, ServerMsg};
+
+    let mut stream = crate::ipc::connect_tcp_timeout(addr, POLL_TIMEOUT)?;
+    let psk = crate::config::effective_psk().to_string();
+    let ident = crate::proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+        auth_token: psk.clone(),
+    });
+    crate::proto::send(&mut stream, &ident)?;
+    let ack = crate::ipc::stream::decode_with_deadline(&mut stream, POLL_TIMEOUT, |r| {
+        crate::proto::decode_server(r)
+    })?;
+    match ack {
+        ServerMsg::IdentifyAck { .. } => {}
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to Identify",
+            ));
+        }
+    }
+
+    let msg = crate::proto::encode_client(&ClientMsg::ListSessions);
+    crate::proto::send(&mut stream, &msg)?;
+    let res = crate::ipc::stream::decode_with_deadline(&mut stream, POLL_TIMEOUT, |r| {
+        crate::proto::decode_server(r)
+    })?;
+    match res {
+        ServerMsg::SessionList { sessions, .. } => {
+            let names = sessions.into_iter().map(|s| s.name).collect();
+            Ok((names, !psk.is_empty()))
+        }
+        ServerMsg::Error { msg } => Err(io::Error::new(io::ErrorKind::InvalidData, msg)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected reply to ListSessions",
+        )),
+    }
+}
+
+/// Register this server with a manager (`[peers] managers` entries).
+/// Bounded and best-effort: a unreachable manager only delays startup
+/// by POLL_TIMEOUT each.
+pub fn register(addr: &str, tcp_port: u16, tls: bool) -> io::Result<()> {
+    use crate::proto::{ClientMsg, ServerMsg};
+
+    let mut stream = crate::ipc::connect_tcp_timeout(addr, POLL_TIMEOUT)?;
+    let ident = crate::proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+        auth_token: crate::config::effective_psk().to_string(),
+    });
+    crate::proto::send(&mut stream, &ident)?;
+    let ack = crate::ipc::stream::decode_with_deadline(&mut stream, POLL_TIMEOUT, |r| {
+        crate::proto::decode_server(r)
+    })?;
+    match ack {
+        ServerMsg::IdentifyAck { .. } => {}
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to Identify",
+            ));
+        }
+    }
+
+    let reg = crate::proto::encode_client(&ClientMsg::Register {
+        server_id: crate::config::server_id().to_string(),
+        name: crate::server::server_name().to_string(),
+        tcp_port,
+        tls,
+        fingerprint: crate::server::tls_fingerprint().to_string(),
+    });
+    crate::proto::send(&mut stream, &reg)?;
+    let res = crate::ipc::stream::decode_with_deadline(&mut stream, POLL_TIMEOUT, |r| {
+        crate::proto::decode_server(r)
+    })?;
+    match res {
+        ServerMsg::RegisterAck { ok: true, .. } => Ok(()),
+        ServerMsg::RegisterAck { reason, .. } => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, reason))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected reply to Register",
+        )),
+    }
 }
 
 #[cfg(test)]

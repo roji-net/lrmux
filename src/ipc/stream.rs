@@ -59,6 +59,17 @@ impl ConnStream {
         matches!(self, ConnStream::Ws(_))
     }
 
+    /// Remote address of the connection (None for Unix sockets).
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            ConnStream::Unix(_) => None,
+            ConnStream::Tcp(s) => s.peer_addr().ok(),
+            ConnStream::TlsClient(s) => s.sock.peer_addr().ok(),
+            ConnStream::TlsServer(s) => s.sock.peer_addr().ok(),
+            ConnStream::Ws(s) => s.peer_addr().ok(),
+        }
+    }
+
     /// TLS and WebSocket are not a raw byte pipe. Reading or writing the
     /// file descriptor directly bypasses the framing and corrupts the session.
     pub fn is_framed(&self) -> bool {
@@ -70,7 +81,7 @@ impl ConnStream {
 
     /// Poll until the socket is readable or `timeout` elapses.
     /// Returns Ok(false) on timeout. poll()-based because SO_RCVTIMEO is
-    /// unimplemented on some platforms — unimplemented on some platforms.
+    /// unimplemented on some platforms.
     pub fn wait_readable(&self, timeout: std::time::Duration) -> io::Result<bool> {
         wait_io(self.as_raw_fd(), libc::POLLIN, timeout)
     }

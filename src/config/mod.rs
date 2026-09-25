@@ -23,6 +23,8 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub peers: PeersConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -172,6 +174,48 @@ pub struct NetworkConfig {
 
 fn default_discovery_port() -> u16 {
     17280
+}
+
+fn default_peer_ttl() -> u64 {
+    600
+}
+
+/// Peer directory / SessionManager knobs.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PeersConfig {
+    /// Hold a peer cache and answer ListPeers (directory role).
+    /// `lrmux manager` implies this.
+    #[serde(default)]
+    pub directory: bool,
+    /// Verify/refresh announced and registered peers over TCP.
+    #[serde(default = "default_true")]
+    pub poll: bool,
+    /// Peer entry TTL in seconds. Entries not refreshed within the TTL
+    /// are evicted; refresh polls are jittered inside [0.5, 0.9] * ttl.
+    #[serde(default = "default_peer_ttl")]
+    pub ttl_secs: u64,
+    /// Managers to Register with on startup, "host:port" entries.
+    #[serde(default)]
+    pub managers: Vec<String>,
+    /// Accept Register messages from other nodes on this server.
+    #[serde(default)]
+    pub accept_registrations: bool,
+    /// Allow authenticated RelayOpen byte pipes through this node.
+    #[serde(default)]
+    pub relay: bool,
+}
+
+impl Default for PeersConfig {
+    fn default() -> Self {
+        Self {
+            directory: false,
+            poll: true,
+            ttl_secs: default_peer_ttl(),
+            managers: Vec::new(),
+            accept_registrations: false,
+            relay: false,
+        }
+    }
 }
 
 impl Default for NetworkConfig {

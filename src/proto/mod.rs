@@ -21,6 +21,25 @@ pub struct SessionInfo {
     pub has_activity: bool,
 }
 
+/// One peer in a `PeerList` response — a flattened view of the
+/// directory's cache entry.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    /// Stable UUID (empty for v1-only peers that never sent one).
+    pub server_id: String,
+    pub name: String,
+    /// "host:port" connect string for the peer's TCP listener.
+    pub addr: String,
+    pub tls: bool,
+    pub fingerprint: String,
+    /// "announced" | "verified" | "stale"
+    pub state: String,
+    /// The directory could authenticate to this peer with our PSK.
+    pub psk_ok: bool,
+    /// Session names from the last verified poll.
+    pub sessions: Vec<String>,
+}
+
 // ── Message types ───────────────────────────────────────────────────
 
 /// Client → Server messages.
@@ -127,6 +146,18 @@ pub enum ClientMsg {
     /// Set / replace the server PSK (hot-apply + persist). Scaffolding for
     /// in-session network setup; fullscreen config editor comes later.
     SetPsk { psk: String },
+    /// Request the peer table from a directory node (SessionManager).
+    /// Requires an authenticated connection.
+    ListPeers,
+    /// Register this server with a directory node. Peers announce over
+    /// UDP too, but registration works where broadcast can't reach.
+    Register {
+        server_id: String,
+        name: String,
+        tcp_port: u16,
+        tls: bool,
+        fingerprint: String,
+    },
 }
 
 /// Server → Client messages.
@@ -202,6 +233,10 @@ pub enum ServerMsg {
     },
     /// Acknowledge SetPsk (PSK was applied on the server).
     PskUpdated,
+    /// Peer table (response to ListPeers).
+    PeerList { peers: Vec<PeerInfo> },
+    /// Acknowledge Register (response to Register).
+    RegisterAck { ok: bool, reason: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -233,6 +268,8 @@ const C_REFRESH: u8 = 0x18;
 const C_TERM_OSC_REPLY: u8 = 0x19;
 const C_TERM_PALETTE: u8 = 0x1a;
 const C_SET_PSK: u8 = 0x1b;
+const C_LIST_PEERS: u8 = 0x1c;
+const C_REGISTER: u8 = 0x1d;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -247,6 +284,8 @@ const S_LOG_CONTENT: u8 = 0x19;
 const S_CONTROL_NOTIFY: u8 = 0x1a;
 const S_TERM_OSC_QUERY: u8 = 0x1b;
 const S_PSK_UPDATED: u8 = 0x1c;
+const S_PEER_LIST: u8 = 0x1d;
+const S_REGISTER_ACK: u8 = 0x1e;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -487,6 +526,26 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.extend_from_slice(&(psk.len() as u32).to_le_bytes());
             payload.extend_from_slice(psk.as_bytes());
         }
+        ClientMsg::ListPeers => {
+            payload.push(C_LIST_PEERS);
+        }
+        ClientMsg::Register {
+            server_id,
+            name,
+            tcp_port,
+            tls,
+            fingerprint,
+        } => {
+            payload.push(C_REGISTER);
+            payload.extend_from_slice(&(server_id.len() as u32).to_le_bytes());
+            payload.extend_from_slice(server_id.as_bytes());
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&tcp_port.to_le_bytes());
+            payload.push(if *tls { 1 } else { 0 });
+            payload.extend_from_slice(&(fingerprint.len() as u32).to_le_bytes());
+            payload.extend_from_slice(fingerprint.as_bytes());
+        }
     }
     frame(payload)
 }
@@ -637,6 +696,35 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
         }
         ServerMsg::PskUpdated => {
             payload.push(S_PSK_UPDATED);
+        }
+        ServerMsg::PeerList { peers } => {
+            payload.push(S_PEER_LIST);
+            payload.extend_from_slice(&(peers.len() as u32).to_le_bytes());
+            for p in peers {
+                payload.extend_from_slice(&(p.server_id.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.server_id.as_bytes());
+                payload.extend_from_slice(&(p.name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.name.as_bytes());
+                payload.extend_from_slice(&(p.addr.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.addr.as_bytes());
+                payload.push(if p.tls { 1 } else { 0 });
+                payload.extend_from_slice(&(p.fingerprint.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.fingerprint.as_bytes());
+                payload.extend_from_slice(&(p.state.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.state.as_bytes());
+                payload.push(if p.psk_ok { 1 } else { 0 });
+                payload.extend_from_slice(&(p.sessions.len() as u32).to_le_bytes());
+                for s in &p.sessions {
+                    payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        ServerMsg::RegisterAck { ok, reason } => {
+            payload.push(S_REGISTER_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
         }
     }
     frame(payload)
@@ -976,6 +1064,21 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
             let psk = String::from_utf8_lossy(&r[..len]).into_owned();
             Ok(ClientMsg::SetPsk { psk })
         }
+        C_LIST_PEERS => Ok(ClientMsg::ListPeers),
+        C_REGISTER => {
+            let server_id = read_len_string(&mut r)?;
+            let name = read_len_string(&mut r)?;
+            let tcp_port = read_u16(&mut r)?;
+            let tls = read_u8(&mut r)? != 0;
+            let fingerprint = read_len_string(&mut r)?;
+            Ok(ClientMsg::Register {
+                server_id,
+                name,
+                tcp_port,
+                tls,
+                fingerprint,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -1195,6 +1298,40 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             })
         }
         S_PSK_UPDATED => Ok(ServerMsg::PskUpdated),
+        S_PEER_LIST => {
+            let count = read_u32(&mut r)? as usize;
+            let mut peers = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let server_id = read_len_string(&mut r)?;
+                let name = read_len_string(&mut r)?;
+                let addr = read_len_string(&mut r)?;
+                let tls = read_u8(&mut r)? != 0;
+                let fingerprint = read_len_string(&mut r)?;
+                let state = read_len_string(&mut r)?;
+                let psk_ok = read_u8(&mut r)? != 0;
+                let n = read_u32(&mut r)? as usize;
+                let mut sessions = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    sessions.push(read_len_string(&mut r)?);
+                }
+                peers.push(PeerInfo {
+                    server_id,
+                    name,
+                    addr,
+                    tls,
+                    fingerprint,
+                    state,
+                    psk_ok,
+                    sessions,
+                });
+            }
+            Ok(ServerMsg::PeerList { peers })
+        }
+        S_REGISTER_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::RegisterAck { ok, reason })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -1240,6 +1377,20 @@ fn decode_attr(r: &mut &[u8]) -> io::Result<Attr> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Mandatory u32-length-prefixed string (fails on truncation).
+fn read_len_string(r: &mut &[u8]) -> io::Result<String> {
+    let len = read_u32(r)? as usize;
+    if r.len() < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated string",
+        ));
+    }
+    let s = String::from_utf8_lossy(&r[..len]).into_owned();
+    *r = &r[len..];
+    Ok(s)
+}
 
 /// Read a length-prefixed UTF-8 string if enough bytes remain; else empty.
 /// Used for optional trailing auth_token on Identify (backward compatible).
@@ -1368,6 +1519,73 @@ mod tests {
                 assert_eq!(sessions[0].name, "dev");
                 assert_eq!(sessions[0].attached, 2);
                 assert!(sessions[0].has_activity);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_messages_roundtrip() {
+        let reg = encode_client(&ClientMsg::Register {
+            server_id: "8b2f0a1e-4c3d-4e5f-9a0b-1c2d3e4f5a6b".into(),
+            name: "work".into(),
+            tcp_port: 17280,
+            tls: true,
+            fingerprint: "ab00".into(),
+        });
+        match decode_client(&mut &reg[..]).unwrap() {
+            ClientMsg::Register {
+                server_id,
+                name,
+                tcp_port,
+                tls,
+                fingerprint,
+            } => {
+                assert_eq!(server_id, "8b2f0a1e-4c3d-4e5f-9a0b-1c2d3e4f5a6b");
+                assert_eq!(name, "work");
+                assert_eq!(tcp_port, 17280);
+                assert!(tls);
+                assert_eq!(fingerprint, "ab00");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let bytes = encode_client(&ClientMsg::ListPeers);
+        assert!(matches!(
+            decode_client(&mut &bytes[..]).unwrap(),
+            ClientMsg::ListPeers
+        ));
+
+        let list = encode_server(&ServerMsg::PeerList {
+            peers: vec![PeerInfo {
+                server_id: "id".into(),
+                name: "work".into(),
+                addr: "10.0.0.7:17280".into(),
+                tls: true,
+                fingerprint: "ff".into(),
+                state: "verified".into(),
+                psk_ok: true,
+                sessions: vec!["main".into(), "music".into()],
+            }],
+        });
+        match decode_server(&mut &list[..]).unwrap() {
+            ServerMsg::PeerList { peers } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].addr, "10.0.0.7:17280");
+                assert_eq!(peers[0].sessions, vec!["main", "music"]);
+                assert!(peers[0].psk_ok);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let ack = encode_server(&ServerMsg::RegisterAck {
+            ok: false,
+            reason: "registrations disabled".into(),
+        });
+        match decode_server(&mut &ack[..]).unwrap() {
+            ServerMsg::RegisterAck { ok, reason } => {
+                assert!(!ok);
+                assert_eq!(reason, "registrations disabled");
             }
             other => panic!("unexpected {other:?}"),
         }

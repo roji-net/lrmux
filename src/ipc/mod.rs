@@ -88,9 +88,34 @@ pub fn connect_tcp(addr: &str) -> io::Result<ConnStream> {
     connect_tcp_with(addr, &crate::config::global().network)
 }
 
+/// Connect via TCP with a bounded connect() — dead hosts fail fast
+/// instead of riding the kernel SYN timeout. Used by peer polling,
+/// where a stall would freeze the caller's event loop.
+pub fn connect_tcp_timeout(addr: &str, timeout: std::time::Duration) -> io::Result<ConnStream> {
+    connect_tcp_inner(addr, &crate::config::global().network, Some(timeout))
+}
+
 /// Connect via TCP using an explicit network config (TLS policy / overrides).
 pub fn connect_tcp_with(addr: &str, net: &NetworkConfig) -> io::Result<ConnStream> {
-    let stream = std::net::TcpStream::connect(addr)?;
+    connect_tcp_inner(addr, net, None)
+}
+
+fn connect_tcp_inner(
+    addr: &str,
+    net: &NetworkConfig,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<ConnStream> {
+    let stream = match timeout {
+        Some(t) => {
+            use std::net::ToSocketAddrs;
+            let sa = addr
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| io::Error::other(format!("no address for {addr}")))?;
+            std::net::TcpStream::connect_timeout(&sa, t)?
+        }
+        None => std::net::TcpStream::connect(addr)?,
+    };
     let peer = stream.peer_addr().unwrap_or_else(|_| {
         // Fallback if peer_addr fails — treat as remote (require TLS on auto).
         "8.8.8.8:1".parse().unwrap()
