@@ -272,8 +272,8 @@ relay                = false   # allow authenticated RelayOpen
   `connect()+getsockname()`.
 - **P1 — directory**: `server.id` ✅, Announce v2 + active announce ✅,
   peer cache + persistence ✅, `Register`/`accept_registrations`/`managers`
-  ✅, `ListPeers`/`PeerList` ✅. Pending: `lrmux manager`,
-  selector/`ls` shows remote sessions via manager.
+  ✅, `ListPeers`/`PeerList` ✅, `lrmux manager` ✅, `list-peers` +
+  inventory shows manager-cached peers ✅.
 - **P2 — relay**: `RelayOpen` byte pipe, client `attach --via <manager>`
   with end-to-end TLS.
 - **P3 — later**: live peer-change notifications to clients, leaf→manager
