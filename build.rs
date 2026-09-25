@@ -1,9 +1,10 @@
 use std::process::Command;
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    {
-        // Link to libproc for proc_pidinfo (child CWD lookup).
+    // Link to libproc for proc_pidinfo (child CWD lookup).
+    // cfg!(target_os) can't be used here: build scripts are compiled for the
+    // host, so it would also fire when cross-compiling to Linux.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=proc");
     }
 
