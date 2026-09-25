@@ -105,10 +105,15 @@ enum CliAction {
     },
     /// `discover`: UDP broadcast probe for LAN servers.
     Discover,
+    /// `manager -s <name> [--tcp addr]`: standalone peer directory —
+    /// no sessions, holds the peer cache, accepts registrations.
+    Manager { name: String, tcp: Option<String> },
     /// `psk show|set|generate`: manage the TCP pre-shared key.
     Psk(Vec<String>),
     /// `list-servers`: list all running servers.
     ListServers,
+    /// `list-peers [server]`: query a directory/manager's peer cache.
+    ListPeers(Option<String>),
     /// `list-sessions [server]`: list sessions (all servers, or one).
     ListSessions(Option<String>),
     /// `list-windows -t <target>`: list windows in a session.
@@ -187,10 +192,10 @@ fn first_subcommand(args: &[String]) -> Option<&str> {
 /// Parse CLI arguments into an action.
 fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().collect();
-    // `new-server` / `start-server` use `--tcp` as a listen address. Every
-    // other command uses it as the client connect target.
-    let owns_listen_tcp =
-        first_subcommand(&args).is_some_and(|c| cmd::canonical_name(c) == "new-server");
+    // `new-server` / `start-server` / `manager` use `--tcp` as a listen
+    // address. Every other command uses it as the client connect target.
+    let owns_listen_tcp = first_subcommand(&args)
+        .is_some_and(|c| matches!(cmd::canonical_name(c), "new-server" | "manager"));
     // Extract --tcp <addr> flag if present (global, for CLI commands).
     let mut tcp_addr: Option<String> = None;
     let mut filtered: Vec<String> = vec![args[0].clone()];
@@ -278,7 +283,29 @@ fn parse_args() -> CliAction {
         }
         Some("new-server") => parse_new_server(subcmd_args, false),
         Some("start-server") => parse_new_server(subcmd_args, true),
+        Some("manager") => {
+            let parsed = cmd::parse_flags(subcmd_args);
+            CliAction::Manager {
+                name: parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "manager".to_string()),
+                tcp: parsed.get("tcp").map(|s| s.to_string()),
+            }
+        }
         Some("list-servers") | Some("ls-servers") => CliAction::ListServers,
+        Some("list-peers") | Some("peers") => {
+            let parsed = cmd::parse_flags(subcmd_args);
+            CliAction::ListPeers(
+                parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .or_else(|| parsed.get("t"))
+                    .or_else(|| parsed.get("target"))
+                    .map(|s| s.to_string()),
+            )
+        }
         Some("discover") => CliAction::Discover,
         Some("psk") => CliAction::Psk(subcmd_args.to_vec()),
         Some("list-sessions") | Some("ls-sessions") | Some("ls") => {
@@ -861,6 +888,7 @@ fn run() -> io::Result<()> {
                     tcp.as_deref(),
                     ws.as_deref(),
                     headless,
+                    false,
                     ServerInit {
                         command: command.as_deref(),
                         session: session.as_deref(),
@@ -944,6 +972,7 @@ fn run() -> io::Result<()> {
                     None,
                     None,
                     detached,
+                    false,
                     ServerInit {
                         command: command.as_deref(),
                         session: name.as_deref(),
@@ -1153,10 +1182,12 @@ fn run() -> io::Result<()> {
             }
         }
         CliAction::Discover => cmd_discover(),
+        CliAction::Manager { name, tcp } => start_manager(&name, tcp.as_deref()),
         CliAction::Psk(args) => cmd_psk(&args),
         CliAction::Default => run_default(),
         CliAction::SessionSelector => run_session_selector(),
         CliAction::ListServers => list_servers(),
+        CliAction::ListPeers(server) => list_peers(server.as_deref()),
         CliAction::ListSessions(server) => list_sessions(server.as_deref()),
         CliAction::ListWindows(_target) => {
             // TODO: implement list-windows
@@ -1244,7 +1275,7 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
             eprintln!("lrmux: selector unavailable ({e}), starting default server...");
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                fork_server(&sock, None, None, false, ServerInit::default())?;
+                fork_server(&sock, None, None, false, false, ServerInit::default())?;
                 wait_for_server(&sock)?;
                 eprintln!("lrmux: server ready.");
             }
@@ -1290,6 +1321,7 @@ fn start_new_server(
         tcp_listen,
         ws_listen,
         false,
+        false,
         ServerInit {
             command: command.as_deref(),
             session,
@@ -1334,10 +1366,33 @@ fn start_headless_server(
         eprintln!("lrmux: WebSocket listener: {addr}");
         eprintln!("lrmux: open web/ via a static server, connect to ws://{addr}");
     }
-    fork_server(&sock, tcp_addr, ws_addr, true, init)?;
+    fork_server(&sock, tcp_addr, ws_addr, true, false, init)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: headless server '{name}' ready.");
     eprintln!("lrmux: connect with `lrmux` or use CLI commands (send-keys, capture-window, etc.)");
+    Ok(())
+}
+
+/// Start a standalone session manager (directory): no sessions, a TCP
+/// listener (config `network.tcp_listen`, `--tcp`, or `auto`), the peer
+/// cache, and open registrations. Used for always-on rendezvous nodes.
+fn start_manager(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
+    let sock = socket_path(name);
+    if ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("server '{name}' is already running"),
+        ));
+    }
+    let tcp = tcp_addr
+        .map(|s| s.to_string())
+        .or_else(|| config::global().network.tcp_listen_addr().map(String::from))
+        .unwrap_or_else(|| "auto".to_string());
+    eprintln!("lrmux: starting manager '{name}' on {}...", sock.display());
+    eprintln!("lrmux: TCP listener: {tcp}");
+    fork_server(&sock, Some(&tcp), None, false, true, ServerInit::default())?;
+    wait_for_server(&sock)?;
+    eprintln!("lrmux: manager '{name}' ready (stop with `lrmux kill-server -t {name}`)");
     Ok(())
 }
 
@@ -1352,7 +1407,7 @@ fn run_control_mode(target: Option<&str>) -> io::Result<()> {
     if !via_tcp && !ipc::server_exists(&sock) {
         if server == "default" {
             // Start a headless default server silently.
-            fork_server(&sock, None, None, true, ServerInit::default())?;
+            fork_server(&sock, None, None, true, false, ServerInit::default())?;
             wait_for_server(&sock)?;
         } else {
             return Err(io::Error::new(
@@ -1454,6 +1509,69 @@ fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Query a directory/manager's peer cache. With `--tcp` (or `-t <name>`)
+/// queries that endpoint; otherwise the default local server.
+fn list_peers(server: Option<&str>) -> io::Result<()> {
+    let mut stream = connect_to_server(server.unwrap_or("default"))?;
+    let ident = proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+        auth_token: crate::config::effective_psk(),
+    });
+    proto::send(&mut stream, &ident)?;
+    match ipc::stream::decode_with_deadline(&mut stream, std::time::Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    })? {
+        ServerMsg::IdentifyAck { .. } => {}
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+    }
+    proto::send(&mut stream, &proto::encode_client(&ClientMsg::ListPeers))?;
+    let peers = match ipc::stream::decode_with_deadline(
+        &mut stream,
+        std::time::Duration::from_secs(2),
+        |r| proto::decode_server(r),
+    )? {
+        ServerMsg::PeerList { peers } => peers,
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected PeerList",
+            ));
+        }
+    };
+    if peers.is_empty() {
+        eprintln!("(no peers — is this a manager or a [peers] directory server?)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<22} {:<10} {:<5} SESSIONS",
+        "NAME", "ADDR", "STATE", "TLS"
+    );
+    for p in &peers {
+        println!(
+            "{:<20} {:<22} {:<10} {:<5} {}",
+            p.name,
+            p.addr,
+            p.state,
+            if p.tls { "yes" } else { "no" },
+            p.sessions.join(", "),
+        );
+    }
+    Ok(())
 }
 
 /// List sessions. With a server argument, list that server's sessions as
@@ -1876,6 +1994,7 @@ fn fork_server(
     tcp_addr: Option<&str>,
     ws_addr: Option<&str>,
     headless: bool,
+    manager: bool,
     init: ServerInit<'_>,
 ) -> io::Result<()> {
     // CWD for the first session: explicit `-c`, else the client's current
@@ -1917,7 +2036,7 @@ fn fork_server(
         let sock = sock.to_path_buf();
         let tcp = tcp_addr.map(|s| s.to_string());
         let ws = ws_addr.map(|s| s.to_string());
-        match server::run(&sock, tcp.as_deref(), ws.as_deref(), headless) {
+        match server::run(&sock, tcp.as_deref(), ws.as_deref(), headless, manager) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("lrmux server: {e}");

@@ -90,11 +90,15 @@ pub fn tls_fingerprint() -> &'static str {
 /// - `LRMUX_INIT_CWD` — cwd for the first window (client's cwd, or `-c`)
 ///
 /// `TERM` / `COLORTERM` are inherited from the forking client as-is.
+/// `manager` runs the session-manager role: no sessions, a peer
+/// directory, open registrations, and the process stays alive with no
+/// sessions or clients attached.
 pub fn run(
     socket_path: &Path,
     tcp_addr: Option<&str>,
     ws_addr: Option<&str>,
     headless: bool,
+    manager: bool,
 ) -> io::Result<()> {
     let net = crate::config::global().network.clone();
     let _ = NETWORK.set(net.clone());
@@ -226,7 +230,7 @@ pub fn run(
     eprintln!("lrmux: server listening on {}", socket_path.display());
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_loop::run(listeners, socket_path, headless, discovery_sock)
+        event_loop::run(listeners, socket_path, headless, manager, discovery_sock)
     }));
 
     match result {

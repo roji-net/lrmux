@@ -266,14 +266,14 @@ relay                = false   # allow authenticated RelayOpen
 
 ## 9. Phases
 
-- **P0 — transport fixes** (works on every socket stack):
+- **P0 — transport fixes** (works on every socket stack): ✅ done.
   `discover()` uses `poll()` instead of `SO_RCVTIMEO`; non-fatal
   `set_broadcast`; unicast subnet scan + `scan` config; outbound-IP via
   `connect()+getsockname()`.
-- **P1 — directory**: `server.id`, Announce v2 + active announce, peer
-  cache + persistence, `Register`/`accept_registrations`/`managers`,
-  `ListPeers`/`PeerList`, `lrmux manager`, selector/`ls` shows remote
-  sessions via manager.
+- **P1 — directory**: `server.id` ✅, Announce v2 + active announce ✅,
+  peer cache + persistence ✅, `Register`/`accept_registrations`/`managers`
+  ✅, `ListPeers`/`PeerList` ✅. Pending: `lrmux manager`,
+  selector/`ls` shows remote sessions via manager.
 - **P2 — relay**: `RelayOpen` byte pipe, client `attach --via <manager>`
   with end-to-end TLS.
 - **P3 — later**: live peer-change notifications to clients, leaf→manager

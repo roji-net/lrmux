@@ -235,6 +235,27 @@ for every server, without passing --tcp.\n\
 Without --headless the server stays in the foreground client. Headless is opt-in.",
     },
     CommandSpec {
+        name: "manager",
+        aliases: &[],
+        summary: "Start a standalone session manager (peer directory)",
+        usage: "    lrmux manager [-s <name>] [--tcp <addr>]",
+        body: "\
+-s, --server <name>    Manager name (default: \"manager\").\n    \
+The name is its Unix socket: /tmp/lrmux-<UID>/<name>\n\
+--tcp <addr>           Listen address for registrations and peer queries.\n    \
+Default: network.tcp_listen from config, else \"auto\"\n    \
+(binds the first free port from 17280).\n\
+\n\
+A manager hosts no sessions. It holds the peer cache, answers\n    \
+ListPeers, accepts Register announcements from other nodes, and stays\n    \
+running until killed. Intended for always-on rendezvous nodes\n    \
+(e.g. a home server or add-on). See docs/MESH.md.\n\
+\n\
+Peer nodes register by listing the manager under [peers] managers\n    \
+in their config.toml. A normal server can also act as a directory\n    \
+with [peers] directory = true.",
+    },
+    CommandSpec {
         name: "new-window",
         aliases: &["neww"],
         summary: "Create a window",
@@ -330,6 +351,17 @@ lrmux capture-pane -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|mark
         summary: "List running servers",
         usage: "    lrmux list-servers",
         body: "Local Unix sockets plus LAN servers that answer UDP discovery.",
+    },
+    CommandSpec {
+        name: "list-peers",
+        aliases: &["peers"],
+        summary: "List known peers from a manager/directory",
+        usage: "    lrmux list-peers [-s <name>] [--tcp <host:port>]",
+        body: "\
+Queries a manager (or a server with [peers] directory = true) for its\n    \
+peer cache: known lrmux servers, their addresses, trust state, and\n    \
+session names. Defaults to the local 'default' server; use --tcp to\n    \
+query a remote manager.",
     },
     CommandSpec {
         name: "kill-server",
