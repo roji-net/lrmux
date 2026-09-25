@@ -151,7 +151,7 @@ server↔server protocol is needed for the first version.
 ## 5. Peer cache
 
 Owned by the directory role (manager or `directory = true` server).
-Persisted at `~/.config/lrmux/peers.json` with **absolute epoch
+Persisted at `~/.config/lrmux/peers.toml` with **absolute epoch
 timestamps** so TTL survives restarts.
 
 ```json

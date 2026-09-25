@@ -419,7 +419,7 @@ fn uuid_v4() -> String {
     uuid_from_bytes(&b)
 }
 
-fn fill_random(buf: &mut [u8]) -> io::Result<()> {
+pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     let mut f = fs::File::open("/dev/urandom")?;
     f.read_exact(buf)

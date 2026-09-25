@@ -13,6 +13,7 @@ mod ipc;
 mod keys;
 mod layout;
 mod log;
+mod peers;
 mod proto;
 mod pty;
 mod server;
