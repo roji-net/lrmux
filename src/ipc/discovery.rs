@@ -214,37 +214,218 @@ pub fn bind_server(port: u16) -> io::Result<UdpSocket> {
     Ok(sock)
 }
 
-/// Broadcast a Discover probe and collect Announce replies until timeout.
-pub fn discover(port: u16, timeout: Duration) -> io::Result<Vec<Announcement>> {
-    let sock = UdpSocket::bind(("0.0.0.0", 0))?;
-    sock.set_broadcast(true)?;
-    sock.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let probe = encode_discover();
-    sock.send_to(&probe, (Ipv4Addr::BROADCAST, port))?;
-    // Also try subnet-local common broadcast via 255.255.255.255 (already done)
-    // and limited broadcast to localhost for same-host servers.
-    let _ = sock.send_to(&probe, (Ipv4Addr::LOCALHOST, port));
+/// A scan target from config: a single host or a whole subnet to probe.
+#[derive(Debug, Clone, Copy)]
+enum ScanTarget {
+    Host(Ipv4Addr, u16),
+    /// IPv4 subnet as (network addr, netmask), host byte order.
+    Subnet {
+        network: u32,
+        mask: u32,
+    },
+}
 
-    let mut found: Vec<Announcement> = Vec::new();
+/// Parse a `network.scan` entry: "a.b.c.d", "a.b.c.d:port", or "a.b.c.d/n".
+fn parse_scan_target(s: &str, default_port: u16) -> Option<ScanTarget> {
+    let s = s.trim();
+    if let Some((addr, prefix)) = s.split_once('/') {
+        let ip: Ipv4Addr = addr.trim().parse().ok()?;
+        let bits: u8 = prefix.trim().parse().ok()?;
+        if bits > 32 {
+            return None;
+        }
+        let mask = if bits == 0 {
+            0
+        } else {
+            u32::MAX << (32 - bits)
+        };
+        return Some(ScanTarget::Subnet {
+            network: u32::from(ip) & mask,
+            mask,
+        });
+    }
+    if let Some((host, p)) = s.rsplit_once(':')
+        && let (Ok(ip), Ok(port)) = (host.parse::<Ipv4Addr>(), p.parse::<u16>())
+    {
+        return Some(ScanTarget::Host(ip, port));
+    }
+    s.parse::<Ipv4Addr>()
+        .ok()
+        .map(|ip| ScanTarget::Host(ip, default_port))
+}
+
+/// Outbound IPv4 address: the source IP a packet to the internet would use.
+/// UDP connect sends no packets — it just picks the route/interface.
+/// Works on platforms where getifaddrs/netlink is unavailable.
+fn outbound_ipv4() -> Option<u32> {
+    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) => Some(u32::from(ip)),
+        _ => None,
+    }
+}
+
+/// Local IPv4 subnets as (network, mask) host-order pairs.
+/// Prefers getifaddrs (real netmasks); falls back to the outbound IP with
+/// an assumed /24 — the common case on LANs and the only option where broadcast is absent.
+fn local_ipv4_subnets() -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) == 0 {
+            let mut ifa = ifap;
+            while !ifa.is_null() {
+                let ifa_ref = &*ifa;
+                ifa = ifa_ref.ifa_next;
+                if ifa_ref.ifa_addr.is_null() || ifa_ref.ifa_netmask.is_null() {
+                    continue;
+                }
+                if (*ifa_ref.ifa_addr).sa_family != libc::AF_INET as libc::sa_family_t {
+                    continue;
+                }
+                let a = &*(ifa_ref.ifa_addr as *const libc::sockaddr_in);
+                let m = &*(ifa_ref.ifa_netmask as *const libc::sockaddr_in);
+                let ip = u32::from_be(a.sin_addr.s_addr);
+                let mask = u32::from_be(m.sin_addr.s_addr);
+                // Skip loopback and link-local.
+                if ip >> 24 == 127 || (ip >> 16) == 0xA9FE {
+                    continue;
+                }
+                out.push((ip & mask, mask));
+            }
+            libc::freeifaddrs(ifap);
+        }
+    }
+    if out.is_empty()
+        && let Some(ip) = outbound_ipv4()
+        && ip >> 24 != 127
+    {
+        out.push((ip & 0xFFFF_FF00, 0xFFFF_FF00));
+    }
+    out
+}
+
+/// Cap on unicast probes per subnet, so a huge configured CIDR doesn't
+/// turn into a flood.
+const MAX_SCAN_HOSTS: u32 = 1024;
+
+/// Wait for the socket to be readable; returns false on timeout/interrupt.
+fn poll_readable(fd: std::os::fd::RawFd, timeout: Duration) -> io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if r < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(e);
+    }
+    Ok(r > 0 && pfd.revents & libc::POLLIN != 0)
+}
+
+/// Probe for LAN servers and collect Announce replies until timeout.
+///
+/// Targets, all best-effort (send errors are ignored — e.g. platforms with no
+/// broadcast at all):
+///   1. 255.255.255.255 limited broadcast + localhost
+///   2. Directed broadcast (net.255) per local subnet
+///   3. `scan` entries — explicit hosts and extra CIDRs from config
+///   4. If nothing answered early on: unicast probe to every host in each
+///      local/configured subnet (the only option where broadcast is absent, where broadcast
+///      send fails; also defeats AP client isolation)
+pub fn discover(port: u16, timeout: Duration, scan: &[String]) -> io::Result<Vec<Announcement>> {
+    use std::os::fd::AsRawFd;
+
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    // Both best-effort: missing on some platforms (SO_BROADCAST can't fail
+    // the whole probe; SO_RCVTIMEO is unusable on some platforms — we poll() instead).
+    let _ = sock.set_broadcast(true);
+    sock.set_nonblocking(true)?;
+
+    let probe = encode_discover();
+    let mut phase1: Vec<SocketAddr> = vec![
+        SocketAddr::new(Ipv4Addr::BROADCAST.into(), port),
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+    ];
+    let mut subnets = local_ipv4_subnets();
+    for t in scan.iter().filter_map(|s| parse_scan_target(s, port)) {
+        match t {
+            ScanTarget::Host(ip, p) => phase1.push(SocketAddr::new(ip.into(), p)),
+            ScanTarget::Subnet { network, mask } => subnets.push((network, mask)),
+        }
+    }
+    subnets.sort_unstable();
+    subnets.dedup();
+
+    // Directed broadcast per subnet (phase 1) + unicast host list (phase 2).
+    let mut phase2: Vec<SocketAddr> = Vec::new();
+    let mut own_ips: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    if let Some(ip) = outbound_ipv4() {
+        own_ips.insert(ip);
+    }
+    for &(net, mask) in &subnets {
+        let size = (!mask).wrapping_add(1);
+        if size < 4 {
+            continue; // /31, /32: no usable host range
+        }
+        phase1.push(SocketAddr::new(Ipv4Addr::from(net | !mask).into(), port));
+        for host in (net + 1)..(net + (size - 1).min(MAX_SCAN_HOSTS + 1)) {
+            if !own_ips.contains(&host) {
+                phase2.push(SocketAddr::new(Ipv4Addr::from(host).into(), port));
+            }
+        }
+    }
+    phase2.sort_unstable();
+    phase2.dedup();
+
+    for t in &phase1 {
+        let _ = sock.send_to(&probe, t);
+    }
+
+    // Phase 2 fires only if nothing answered — keeps quiet LANs quiet.
+    let scan_at = Instant::now() + timeout.min(Duration::from_millis(300)) / 3;
+    let mut scanned = phase2.is_empty();
     let deadline = Instant::now() + timeout;
+    let mut found: Vec<Announcement> = Vec::new();
     let mut buf = [0u8; 1500];
-    while Instant::now() < deadline {
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if let Some(ParsedPacket::Announce(a)) = parse_packet(&buf[..n], from)
-                    && !found
-                        .iter()
-                        .any(|x| x.name == a.name && x.tcp_addr() == a.tcp_addr())
-                {
-                    found.push(a);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if !scanned && now >= scan_at {
+            scanned = true;
+            if found.is_empty() {
+                for t in &phase2 {
+                    let _ = sock.send_to(&probe, t);
                 }
             }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(_) => break,
+        }
+        let wait = (deadline - now).min(Duration::from_millis(100));
+        match poll_readable(sock.as_raw_fd(), wait) {
+            Ok(true) => loop {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        if let Some(ParsedPacket::Announce(a)) = parse_packet(&buf[..n], from)
+                            && !found
+                                .iter()
+                                .any(|x| x.name == a.name && x.tcp_addr() == a.tcp_addr())
+                        {
+                            found.push(a);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            },
+            Ok(false) => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(found)
@@ -263,5 +444,65 @@ mod tests {
             second.is_ok(),
             "second discovery bind on {port} failed: {second:?}"
         );
+    }
+
+    #[test]
+    fn discover_collects_announce_reply() {
+        // Fake responder: a bound discovery socket that replies Announce
+        // to any packet it gets.
+        let responder = bind_server(0).expect("bind responder");
+        let port = responder.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            let reply = encode_announce("testsrv", 9999, false, "v0", "ff00");
+            let mut buf = [0u8; 256];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                // bind_server returns a nonblocking socket; poll then drain.
+                match poll_readable(responder.as_raw_fd(), Duration::from_millis(100)) {
+                    Ok(true) => {
+                        while let Ok((n, from)) = responder.recv_from(&mut buf) {
+                            if matches!(parse_packet(&buf[..n], from), Some(ParsedPacket::Discover))
+                            {
+                                let _ = responder.send_to(&reply, from);
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        });
+        let found = discover(port, Duration::from_secs(2), &[]).expect("discover");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|a| a.name == "testsrv" && a.tcp_port == 9999),
+            "expected announce from testsrv, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn parse_scan_target_variants() {
+        assert!(matches!(
+            parse_scan_target("10.0.0.5", 100).unwrap(),
+            ScanTarget::Host(ip, 100) if ip == Ipv4Addr::new(10,0,0,5)
+        ));
+        assert!(matches!(
+            parse_scan_target("10.0.0.5:999", 100).unwrap(),
+            ScanTarget::Host(ip, 999) if ip == Ipv4Addr::new(10,0,0,5)
+        ));
+        match parse_scan_target("192.168.1.7/24", 100).unwrap() {
+            ScanTarget::Subnet { network, mask } => {
+                assert_eq!(network, u32::from(Ipv4Addr::new(192, 168, 1, 0)));
+                assert_eq!(mask, 0xFFFF_FF00);
+            }
+            _ => panic!("expected subnet"),
+        }
+        assert!(parse_scan_target("nope", 100).is_none());
+        assert!(parse_scan_target("10.0.0.1/33", 100).is_none());
     }
 }

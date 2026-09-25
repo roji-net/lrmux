@@ -694,7 +694,7 @@ fn encode_attr(buf: &mut Vec<u8>, attrs: Attr) {
 // ── Decode ──────────────────────────────────────────────────────────
 
 /// Read one framed message from a stream. Returns the type tag + payload.
-fn read_frame<R: Read>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
+fn read_frame<R: Read + ?Sized>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -711,7 +711,7 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
 }
 
 /// Read and decode a client message from a stream.
-pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
+pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> {
     let (tag, data) = read_frame(reader)?;
     let mut r = &data[..];
     match tag {
@@ -984,7 +984,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
 }
 
 /// Read and decode a server message from a stream.
-pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
+pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> {
     let (tag, data) = read_frame(reader)?;
     let mut r = &data[..];
     match tag {
@@ -1311,7 +1311,7 @@ fn read_u64(r: &mut &[u8]) -> io::Result<u64> {
 }
 
 /// Write a framed message to a stream.
-pub fn send<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+pub fn send<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.write_all(bytes)?;
     writer.flush()?;
     Ok(())

@@ -131,6 +131,11 @@ pub struct NetworkConfig {
     /// UDP discovery port (clients broadcast here; servers listen).
     #[serde(default = "default_discovery_port")]
     pub discovery_port: u16,
+    /// Extra discovery targets: "a.b.c.d" or "a.b.c.d:port" probe one host,
+    /// "a.b.c.d/n" unicast-probes every host in the subnet. Needed where
+    /// broadcast is unavailable (constrained platforms, AP client isolation) or off-subnet.
+    #[serde(default)]
+    pub scan: Vec<String>,
     /// TLS policy for TCP connections.
     #[serde(default)]
     pub tls: TlsMode,
@@ -170,6 +175,7 @@ impl Default for NetworkConfig {
             tcp_listen: String::new(),
             discovery: false,
             discovery_port: default_discovery_port(),
+            scan: Vec::new(),
             tls: TlsMode::Auto,
             psk: String::new(),
             auth_token: String::new(),

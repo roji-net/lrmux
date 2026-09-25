@@ -206,8 +206,8 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
     }
 
     // LAN discovery.
-    let port = crate::config::global().network.discovery_port;
-    match ipc::discovery::discover(port, discover_timeout) {
+    let net = &crate::config::global().network;
+    match ipc::discovery::discover(net.discovery_port, discover_timeout, &net.scan) {
         Ok(anns) => {
             for ann in anns {
                 let tcp = ann.tcp_addr();
@@ -272,10 +272,12 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
 
 fn query_sessions_unix(sock: &std::path::Path) -> io::Result<(String, Vec<SessionInfo>)> {
     let mut stream = ipc::connect(sock).map(ipc::ConnStream::Unix)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
+    let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    });
+    match res {
         Ok(ServerMsg::SessionList { sessions, address }) => Ok((address, sessions)),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -290,10 +292,12 @@ fn query_sessions_unix(sock: &std::path::Path) -> io::Result<(String, Vec<Sessio
 
 fn query_sessions_tcp(addr: &str) -> io::Result<(String, Vec<SessionInfo>)> {
     let mut stream = ipc::connect_tcp(addr)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
+    let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    });
+    match res {
         Ok(ServerMsg::SessionList { sessions, address }) => Ok((address, sessions)),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -1433,10 +1433,13 @@ fn cmd_discover() -> io::Result<()> {
 /// Times out after 2s — a wedged server accepts but never responds.
 fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
     let mut stream = connect_to_server(server)?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
+    let res =
+        ipc::stream::decode_with_deadline(&mut stream, std::time::Duration::from_secs(2), |r| {
+            proto::decode_server(r)
+        });
+    match res {
         Ok(ServerMsg::SessionList { sessions, address }) => {
             let names = sessions.into_iter().map(|s| s.name).collect();
             Ok((address, names))
@@ -1638,7 +1641,6 @@ fn print_versions() {
 /// Query a running server for its version string and address.
 fn query_server_version(server: &str) -> io::Result<(String, String)> {
     let mut stream = connect_to_server(server)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let identify = proto::encode_client(&ClientMsg::Identify {
         rows: 0,
         cols: 0,
@@ -1646,7 +1648,10 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
         auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &identify)?;
-    match proto::decode_server(&mut stream) {
+    let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    });
+    match res {
         Ok(ServerMsg::IdentifyAck {
             version, address, ..
         }) => Ok((version, address)),

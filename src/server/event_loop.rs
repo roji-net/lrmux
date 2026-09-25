@@ -2065,11 +2065,15 @@ fn handshake_first_client(
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = wrap_accepted_stream(stream)?;
     // Bound the handshake read: a client that connects and stays silent
-    // must not stall server startup forever.
-    let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    // must not stall server startup forever. decode_with_deadline polls
+    // the fd, which works where SO_RCVTIMEO is unavailable.
     let is_tcp = client.is_tcp();
-
-    let (client_rows, client_cols, auth_token) = match proto::decode_client(&mut client) {
+    let first = crate::ipc::stream::decode_with_deadline(
+        &mut client,
+        std::time::Duration::from_secs(5),
+        |r| proto::decode_client(r),
+    );
+    let (client_rows, client_cols, auth_token) = match first {
         Ok(ClientMsg::Identify {
             rows,
             cols,
@@ -2214,13 +2218,17 @@ fn accept_new_client(
                     return Ok(());
                 }
             };
-            stream.set_nonblocking(false)?;
             // Bound the handshake read: a client that connects and stays
             // silent must not freeze the whole event loop.
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            // decode_with_deadline polls the fd (SO_RCVTIMEO is
+            // unimplemented on some platforms).
             let is_tcp = stream.is_tcp();
-
-            let (attach, is_control, auth_token) = match proto::decode_client(&mut stream) {
+            let first = crate::ipc::stream::decode_with_deadline(
+                &mut stream,
+                std::time::Duration::from_secs(2),
+                |r| proto::decode_client(r),
+            );
+            let (attach, is_control, auth_token) = match first {
                 Ok(ClientMsg::Identify {
                     attach: a,
                     auth_token,
