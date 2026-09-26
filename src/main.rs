@@ -1648,13 +1648,8 @@ fn cmd_psk(args: &[String]) -> io::Result<()> {
             if p.is_empty() {
                 println!("(no PSK configured)");
             } else {
-                let preview = if p.len() > 8 {
-                    format!("{}... ({} chars)", &p[..4], p.len())
-                } else {
-                    "********".to_string()
-                };
-                println!("psk: {preview}");
-                println!("tip: use `lrmux psk generate` to create a new one");
+                // Print in full so it can be copied to other servers.
+                println!("{p}");
             }
             Ok(())
         }
