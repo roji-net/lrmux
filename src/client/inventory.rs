@@ -206,8 +206,8 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
     }
 
     // LAN discovery.
-    let port = crate::config::global().network.discovery_port;
-    match ipc::discovery::discover(port, discover_timeout) {
+    let net = &crate::config::global().network;
+    match ipc::discovery::discover(net.discovery_port, discover_timeout, &net.scan) {
         Ok(anns) => {
             for ann in anns {
                 let tcp = ann.tcp_addr();
@@ -267,15 +267,101 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
         }
     }
 
+    // Configured managers report their cached peers. This is the path
+    // that works without any UDP/broadcast at all: a constrained client
+    // only needs TCP to the manager to see the whole fleet.
+    for m in &crate::config::global().peers.managers {
+        match query_peers_tcp(m) {
+            Ok(peers) => {
+                for p in peers {
+                    if p.addr.is_empty() || p.state == "stale" {
+                        continue;
+                    }
+                    let dup = entries
+                        .iter()
+                        .any(|e| e.name == p.name || e.tcp_addr() == Some(p.addr.as_str()));
+                    if dup {
+                        continue;
+                    }
+                    entries.push(ServerEntry {
+                        name: p.name,
+                        source: ServerSource::Lan {
+                            tcp_addr: p.addr.clone(),
+                            tls: p.tls,
+                            version: String::new(),
+                            fingerprint: p.fingerprint,
+                        },
+                        sessions: p
+                            .sessions
+                            .iter()
+                            .map(|s| SessionInfo {
+                                name: s.clone(),
+                                attached: 0,
+                                created: 0,
+                                last_activity: 0,
+                                has_activity: false,
+                            })
+                            .collect(),
+                        address: p.addr,
+                        probe_error: None,
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("lrmux: warning: peer query to manager {m} failed ({e})");
+            }
+        }
+    }
+
     Ok(entries)
+}
+
+/// Ask a directory/manager for its peer cache: Identify (auth) then
+/// ListPeers. Bounded by deadlines; a dead manager just gets skipped.
+fn query_peers_tcp(addr: &str) -> io::Result<Vec<proto::PeerInfo>> {
+    let mut stream = ipc::connect_tcp_timeout(addr, Duration::from_secs(2))?;
+    let ident = proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+        auth_token: crate::config::effective_psk(),
+    });
+    proto::send(&mut stream, &ident)?;
+    match ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    })? {
+        ServerMsg::IdentifyAck { .. } => {}
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+    }
+    proto::send(&mut stream, &proto::encode_client(&ClientMsg::ListPeers))?;
+    match ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    })? {
+        ServerMsg::PeerList { peers } => Ok(peers),
+        ServerMsg::Error { msg } => Err(io::Error::new(io::ErrorKind::InvalidData, msg)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected PeerList",
+        )),
+    }
 }
 
 fn query_sessions_unix(sock: &std::path::Path) -> io::Result<(String, Vec<SessionInfo>)> {
     let mut stream = ipc::connect(sock).map(ipc::ConnStream::Unix)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
+    let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    });
+    match res {
         Ok(ServerMsg::SessionList { sessions, address }) => Ok((address, sessions)),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -290,10 +376,12 @@ fn query_sessions_unix(sock: &std::path::Path) -> io::Result<(String, Vec<Sessio
 
 fn query_sessions_tcp(addr: &str) -> io::Result<(String, Vec<SessionInfo>)> {
     let mut stream = ipc::connect_tcp(addr)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
+    let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    });
+    match res {
         Ok(ServerMsg::SessionList { sessions, address }) => Ok((address, sessions)),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,

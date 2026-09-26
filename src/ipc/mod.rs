@@ -27,6 +27,21 @@ pub fn tcp_addr() -> Option<String> {
     TCP_OVERRIDE.lock().unwrap().clone()
 }
 
+/// Optional relay (`--via host:port`): every TCP connect is tunnelled
+/// through that manager's RelayOpen byte pipe instead of dialing the
+/// target directly.
+static VIA_ADDR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set/clear the global `--via` relay address.
+pub fn set_via_addr(addr: Option<String>) {
+    *VIA_ADDR.lock().unwrap() = addr;
+}
+
+/// Current `--via` relay address, if any.
+pub fn via_addr() -> Option<String> {
+    VIA_ADDR.lock().unwrap().clone()
+}
+
 /// Connect using `--tcp` when set, otherwise the Unix socket at `path`.
 pub fn connect_any(path: &Path) -> io::Result<ConnStream> {
     if let Some(addr) = tcp_addr() {
@@ -88,13 +103,80 @@ pub fn connect_tcp(addr: &str) -> io::Result<ConnStream> {
     connect_tcp_with(addr, &crate::config::global().network)
 }
 
+/// Connect via TCP with a bounded connect() — dead hosts fail fast
+/// instead of riding the kernel SYN timeout. Used by peer polling,
+/// where a stall would freeze the caller's event loop.
+pub fn connect_tcp_timeout(addr: &str, timeout: std::time::Duration) -> io::Result<ConnStream> {
+    connect_tcp_inner(addr, &crate::config::global().network, Some(timeout))
+}
+
 /// Connect via TCP using an explicit network config (TLS policy / overrides).
 pub fn connect_tcp_with(addr: &str, net: &NetworkConfig) -> io::Result<ConnStream> {
-    let stream = std::net::TcpStream::connect(addr)?;
-    let peer = stream.peer_addr().unwrap_or_else(|_| {
-        // Fallback if peer_addr fails — treat as remote (require TLS on auto).
-        "8.8.8.8:1".parse().unwrap()
-    });
+    connect_tcp_inner(addr, net, None)
+}
+
+fn connect_tcp_inner(
+    addr: &str,
+    net: &NetworkConfig,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<ConnStream> {
+    // Relayed connect: TCP to the manager, Identify+RelayOpen, and the
+    // socket becomes a raw pipe to `addr` from then on.
+    let stream = if let Some(via) = via_addr() {
+        relay_open(
+            &via,
+            addr,
+            timeout.unwrap_or(std::time::Duration::from_secs(5)),
+        )?
+    } else {
+        match timeout {
+            Some(t) => {
+                use std::net::ToSocketAddrs;
+                let sa = addr
+                    .to_socket_addrs()?
+                    .next()
+                    .ok_or_else(|| io::Error::other(format!("no address for {addr}")))?;
+                std::net::TcpStream::connect_timeout(&sa, t)?
+            }
+            None => match std::net::TcpStream::connect(addr) {
+                Ok(s) => s,
+                // Auto-fallback: a direct connect that fails retries through
+                // each configured manager — the manager may reach networks
+                // the client cannot.
+                Err(e) => {
+                    let mut last = e;
+                    let mut ok = None;
+                    for m in &crate::config::global().peers.managers {
+                        match relay_open(m, addr, std::time::Duration::from_secs(5)) {
+                            Ok(s) => {
+                                ok = Some(s);
+                                break;
+                            }
+                            Err(re) => last = re,
+                        }
+                    }
+                    match ok {
+                        Some(s) => s,
+                        None => return Err(last),
+                    }
+                }
+            },
+        }
+    };
+    let peer = if via_addr().is_some() {
+        // Relayed: peer_addr() is the manager. The TLS policy applies to
+        // the *target* — resolve its address for the decision instead.
+        use std::net::ToSocketAddrs;
+        addr.to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+            .unwrap_or_else(|| "8.8.8.8:1".parse().unwrap())
+    } else {
+        stream.peer_addr().unwrap_or_else(|_| {
+            // Fallback if peer_addr fails — treat as remote (require TLS on auto).
+            "8.8.8.8:1".parse().unwrap()
+        })
+    };
     let want_tls = tls::tls_required(net, peer) || matches!(net.tls, TlsMode::On);
     if want_tls {
         if matches!(net.tls, TlsMode::Off) {
@@ -108,6 +190,76 @@ pub fn connect_tcp_with(addr: &str, net: &NetworkConfig) -> io::Result<ConnStrea
     } else {
         Ok(ConnStream::Tcp(stream))
     }
+}
+
+/// Open a raw byte pipe to `target` through a manager at `via`:
+/// connect TCP to the manager, authenticate with Identify, send
+/// RelayOpen, and wait for RelayAck{ok}. The returned stream then
+/// carries opaque bytes to the target — the caller may run its own
+/// TLS handshake over it for end-to-end encryption.
+///
+/// The manager connection itself is plaintext TCP; authentication is
+/// the configured PSK. (Nested TLS to the manager is not supported —
+/// TLS terminates at the target.)
+fn relay_open(
+    via: &str,
+    target: &str,
+    timeout: std::time::Duration,
+) -> io::Result<std::net::TcpStream> {
+    use crate::proto::{ClientMsg, ServerMsg};
+
+    use std::net::ToSocketAddrs;
+    let sa = via
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::other(format!("no address for {via}")))?;
+    let mut stream = ConnStream::Tcp(std::net::TcpStream::connect_timeout(&sa, timeout)?);
+
+    // Identify (auth) so the relay request rides an authenticated conn.
+    let ident = crate::proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+        auth_token: crate::config::effective_psk(),
+    });
+    crate::proto::send(&mut stream, &ident)?;
+    match stream::decode_with_deadline(&mut stream, timeout, |r| crate::proto::decode_server(r))? {
+        ServerMsg::IdentifyAck { .. } => {}
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+    }
+
+    let open = crate::proto::encode_client(&ClientMsg::RelayOpen {
+        addr: target.to_string(),
+    });
+    crate::proto::send(&mut stream, &open)?;
+    match stream::decode_with_deadline(&mut stream, timeout, |r| crate::proto::decode_server(r))? {
+        ServerMsg::RelayAck { ok: true, .. } => {}
+        ServerMsg::RelayAck { reason, .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("relay {via}: {reason}"),
+            ));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected RelayAck",
+            ));
+        }
+    }
+
+    let ConnStream::Tcp(tcp) = stream else {
+        return Err(io::Error::other("relay stream is not plain TCP"));
+    };
+    Ok(tcp)
 }
 
 /// Bind a TCP listener.

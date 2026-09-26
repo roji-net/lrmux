@@ -23,6 +23,8 @@ pub struct Config {
     pub behavior: BehaviorConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub peers: PeersConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -131,6 +133,16 @@ pub struct NetworkConfig {
     /// UDP discovery port (clients broadcast here; servers listen).
     #[serde(default = "default_discovery_port")]
     pub discovery_port: u16,
+    /// Extra discovery targets: "a.b.c.d" or "a.b.c.d:port" probe one host,
+    /// "a.b.c.d/n" unicast-probes every host in the subnet. Needed where
+    /// broadcast is unavailable (constrained platforms, AP client isolation) or off-subnet.
+    #[serde(default)]
+    pub scan: Vec<String>,
+    /// Actively announce this server on startup, periodically, and on
+    /// shutdown (broadcast best-effort + unicast to `scan` hosts).
+    /// Only does anything when a TCP listener is configured.
+    #[serde(default = "default_true")]
+    pub announce: bool,
     /// TLS policy for TCP connections.
     #[serde(default)]
     pub tls: TlsMode,
@@ -164,12 +176,56 @@ fn default_discovery_port() -> u16 {
     17280
 }
 
+fn default_peer_ttl() -> u64 {
+    600
+}
+
+/// Peer directory / SessionManager knobs.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PeersConfig {
+    /// Hold a peer cache and answer ListPeers (directory role).
+    /// `lrmux manager` implies this.
+    #[serde(default)]
+    pub directory: bool,
+    /// Verify/refresh announced and registered peers over TCP.
+    #[serde(default = "default_true")]
+    pub poll: bool,
+    /// Peer entry TTL in seconds. Entries not refreshed within the TTL
+    /// are evicted; refresh polls are jittered inside [0.5, 0.9] * ttl.
+    #[serde(default = "default_peer_ttl")]
+    pub ttl_secs: u64,
+    /// Managers to Register with on startup, "host:port" entries.
+    #[serde(default)]
+    pub managers: Vec<String>,
+    /// Accept Register messages from other nodes on this server.
+    #[serde(default)]
+    pub accept_registrations: bool,
+    /// Allow authenticated RelayOpen byte pipes through this node.
+    #[serde(default)]
+    pub relay: bool,
+}
+
+impl Default for PeersConfig {
+    fn default() -> Self {
+        Self {
+            directory: false,
+            poll: true,
+            ttl_secs: default_peer_ttl(),
+            managers: Vec::new(),
+            accept_registrations: false,
+            relay: false,
+        }
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             tcp_listen: String::new(),
             discovery: false,
             discovery_port: default_discovery_port(),
+            scan: Vec::new(),
+            announce: true,
             tls: TlsMode::Auto,
             psk: String::new(),
             auth_token: String::new(),
@@ -330,7 +386,84 @@ pub fn generate_psk() -> io::Result<String> {
     Ok(base64url(&buf))
 }
 
-fn fill_random(buf: &mut [u8]) -> io::Result<()> {
+/// Stable server identity (UUID v4), generated once and persisted at
+/// `~/.config/lrmux/server.id`. Peers dedup on this id — TCP ports are
+/// auto-assigned and change across restarts.
+pub fn server_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(load_or_create_server_id)
+}
+
+fn load_or_create_server_id() -> String {
+    let path = config_dir().join("server.id");
+    if let Ok(s) = fs::read_to_string(&path) {
+        let s = s.trim();
+        if is_uuid(s) {
+            return s.to_string();
+        }
+    }
+    let id = uuid_v4();
+    let _ = fs::create_dir_all(config_dir());
+    if let Err(e) = fs::write(&path, format!("{id}\n")) {
+        eprintln!("lrmux: warning: cannot persist {}: {e}", path.display());
+    }
+    id
+}
+
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// UUID string ("8b2f0a1e-…") to its 16 raw bytes.
+pub fn uuid_to_bytes(s: &str) -> Option<[u8; 16]> {
+    if !is_uuid(s) {
+        return None;
+    }
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Raw 16 bytes to hyphenated UUID string.
+pub fn uuid_from_bytes(b: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    if fill_random(&mut b).is_err() {
+        // Last-resort entropy: mixer of time and pid. Still unique in
+        // practice; only reachable when /dev/urandom is unavailable.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut h = sha2::Sha256::new();
+        use sha2::Digest;
+        h.update(nanos.to_le_bytes());
+        h.update(std::process::id().to_le_bytes());
+        b.copy_from_slice(&h.finalize()[..16]);
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+    uuid_from_bytes(&b)
+}
+
+pub(crate) fn fill_random(buf: &mut [u8]) -> io::Result<()> {
     use std::io::Read;
     let mut f = fs::File::open("/dev/urandom")?;
     f.read_exact(buf)
@@ -360,4 +493,24 @@ fn base64url(data: &[u8]) -> String {
         out.push(T[((n >> 6) & 63) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_v4_is_valid_and_versioned() {
+        let id = uuid_v4();
+        assert!(is_uuid(&id), "bad uuid: {id}");
+        assert_eq!(id.as_bytes()[14], b'4');
+        assert!(matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    #[test]
+    fn is_uuid_rejects_malformed() {
+        assert!(!is_uuid(""));
+        assert!(!is_uuid("not-a-uuid"));
+        assert!(!is_uuid("8b2f0a1e4c3d4e5f9a0b1c2d3e4f5a6b")); // no dashes
+    }
 }
