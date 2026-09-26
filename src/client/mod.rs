@@ -2,6 +2,7 @@
 
 pub mod control;
 pub mod copy_mode;
+mod input_filter;
 pub mod inventory;
 pub mod render;
 pub mod selector;
@@ -139,10 +140,17 @@ pub fn run(
         }
     };
 
+    // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
+    // responses to our probes are client-side traffic, not pane input.
+    let mut input_filter = input_filter::InputFilter::new();
+
     // Probe outer TTY defaults (OSC 10/11) so the server can paint HTML
     // captures without waiting for vim to ask. Raw mode is already on —
-    // replies won't echo onto the screen.
-    report_outer_term_palette(&mut stream)?;
+    // replies won't echo onto the screen. Keystrokes read alongside a
+    // reply come back in probe_leftover and re-enter via the filter.
+    let mut probe_leftover = Vec::new();
+    report_outer_term_palette(&mut stream, &mut probe_leftover)?;
+    input_filter.inject(&probe_leftover);
 
     // Create the local grid + renderer.
     let mut grid = Grid::new(grid_rows, grid_cols, 10_000);
@@ -281,8 +289,10 @@ pub fn run(
             },
         ];
 
-        // Use a 500ms poll timeout so we can expire flash messages.
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
+        // Poll timeout: 500ms for flash expiry, tightened while the
+        // input filter holds a possible partial terminal reply.
+        let timeout_ms = input_filter.hold_remaining_ms().unwrap_or(500).min(500);
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -290,6 +300,10 @@ pub fn run(
             }
             return Err(err);
         }
+
+        // A held partial sequence that never completed was user input —
+        // release it; the staged bytes are picked up below.
+        input_filter.flush_expired();
 
         // Check if flash message expired.
         if let Some(deadline) = flash_deadline
@@ -308,12 +322,24 @@ pub fn run(
             render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
         }
 
-        // stdin → prefix detection → server (as PaneInput or commands)
-        if fds[0].revents & libc::POLLIN != 0 {
-            let mut buf = [0u8; 8192];
-            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n > 0 {
-                let input = &buf[..n as usize];
+        // stdin → prefix detection → server (as PaneInput or commands).
+        // Also runs when the filter staged bytes without stdin activity —
+        // probe leftovers or an expired hold.
+        let mut stdin_eof = false;
+        if fds[0].revents & libc::POLLIN != 0 || input_filter.has_staged() {
+            let mut raw = Vec::new();
+            if fds[0].revents & libc::POLLIN != 0 {
+                let mut buf = [0u8; 8192];
+                let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n > 0 {
+                    raw.extend_from_slice(&buf[..n as usize]);
+                } else if n == 0 {
+                    stdin_eof = true;
+                }
+            }
+            let filtered = input_filter.feed(&raw);
+            if !filtered.is_empty() {
+                let input = &filtered[..];
 
                 if copy_mode.is_some() {
                     // In copy mode: all input goes to copy mode key handling.
@@ -609,9 +635,10 @@ pub fn run(
                         }
                     }
                 }
-            } else if n == 0 {
-                break;
             }
+        }
+        if stdin_eof {
+            break;
         }
 
         // Server → grid → renderer → stdout
@@ -841,13 +868,17 @@ pub fn run(
                             // Flush any pending render bytes first so the OSC
                             // query isn't stuck behind a partial stdout write.
                             let _ = io::stdout().flush();
-                            if let Some(reply) = query_outer_osc_color(code, bell_terminated) {
+                            let mut probe_leftover = Vec::new();
+                            if let Some(reply) =
+                                query_outer_osc_color(code, bell_terminated, &mut probe_leftover)
+                            {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
                                     data: reply,
                                 });
                                 proto::send(&mut stream, &msg)?;
                             }
+                            input_filter.inject(&probe_leftover);
                         }
                         ServerMsg::PskUpdated => {
                             flash_msg = Some("PSK updated on server".to_string());
@@ -1863,11 +1894,17 @@ fn show_help_overlay(server_version: &str) {
 }
 
 /// Query OSC 10/11 on the outer TTY and send `TermPalette` to the server.
-pub(crate) fn report_outer_term_palette(stream: &mut impl Write) -> io::Result<()> {
-    let fg = query_outer_osc_color(10, true)
+/// Non-reply bytes picked up while probing (user keystrokes read
+/// alongside the reply) go into `extra_input` for the caller to re-feed
+/// as input instead of dropping them.
+pub(crate) fn report_outer_term_palette(
+    stream: &mut impl Write,
+    extra_input: &mut Vec<u8>,
+) -> io::Result<()> {
+    let fg = query_outer_osc_color(10, true, extra_input)
         .and_then(|d| crate::term::parse_osc_color_reply(&d))
         .map(|(_, rgb)| rgb);
-    let bg = query_outer_osc_color(11, true)
+    let bg = query_outer_osc_color(11, true, extra_input)
         .and_then(|d| crate::term::parse_osc_color_reply(&d))
         .map(|(_, rgb)| rgb);
     if fg.is_none() && bg.is_none() {
@@ -1882,7 +1919,11 @@ pub(crate) fn report_outer_term_palette(stream: &mut impl Write) -> io::Result<(
 /// Tries stdout/stdin first (the fds the interactive client already has on
 /// the user's terminal), then `/dev/tty` as a fallback. A failed query
 /// surfaces as vim E1568 and wrong `background` / colorscheme colors.
-pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
+pub(crate) fn query_outer_osc_color(
+    code: u8,
+    bell_terminated: bool,
+    extra_input: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
     }
@@ -1899,10 +1940,12 @@ pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<V
 
     // Prefer the fds we already own; fall back to /dev/tty (needed for -CC
     // where stdout is the control-mode channel, not a raw terminal).
-    if let Some(reply) = query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query) {
+    if let Some(reply) =
+        query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query, extra_input)
+    {
         return Some(reply);
     }
-    query_osc_via_dev_tty(&query)
+    query_osc_via_dev_tty(&query, extra_input)
 }
 
 /// Control-mode variant: never write OSC to stdout (that's the tmux control
@@ -1910,6 +1953,7 @@ pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<V
 pub(crate) fn query_outer_osc_color_for_control(
     code: u8,
     bell_terminated: bool,
+    extra_input: &mut Vec<u8>,
 ) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
@@ -1923,10 +1967,10 @@ pub(crate) fn query_outer_osc_color_for_control(
     } else {
         query.extend_from_slice(b"\x1b\\");
     }
-    query_osc_via_dev_tty(&query)
+    query_osc_via_dev_tty(&query, extra_input)
 }
 
-fn query_osc_via_dev_tty(query: &[u8]) -> Option<Vec<u8>> {
+fn query_osc_via_dev_tty(query: &[u8], extra_input: &mut Vec<u8>) -> Option<Vec<u8>> {
     let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
     if fd < 0 {
         return None;
@@ -1940,10 +1984,20 @@ fn query_osc_via_dev_tty(query: &[u8]) -> Option<Vec<u8>> {
         }
     }
     let tty = TtyFd(fd);
-    query_osc_on_fds(tty.0, tty.0, query)
+    query_osc_on_fds(tty.0, tty.0, query, extra_input)
 }
 
-fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>> {
+/// Returns the OSC reply, or None on timeout. Bytes read that are not
+/// part of the reply — pending input drained up front, user keystrokes
+/// arriving mid-wait, trailing bytes after the reply — are appended to
+/// `extra_input` so the caller can re-feed them instead of swallowing
+/// what the user typed while we were blocked probing.
+fn query_osc_on_fds(
+    read_fd: i32,
+    write_fd: i32,
+    query: &[u8],
+    extra_input: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     // Disable ECHO while waiting for the reply. Interactive clients are
     // already raw, but control-mode / edge paths can still be cooked — and
     // an echoed OSC reply paints garbage on the user's screen.
@@ -1980,7 +2034,8 @@ fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>
     }
     let _echo_guard = RestoreEcho(saved_termios.map(|t| (read_fd, t)));
 
-    // Drain pending input so leftover key bytes aren't mistaken for the reply.
+    // Drain pending input so leftover key bytes aren't mistaken for the
+    // reply — but keep them: they are real user input, not garbage.
     let fl = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
     if fl >= 0 {
         unsafe {
@@ -1992,6 +2047,7 @@ fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>
         loop {
             let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
             if n > 0 {
+                extra_input.extend_from_slice(&tmp[..n as usize]);
                 continue;
             }
             break;
@@ -2040,15 +2096,21 @@ fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>
         }
         buf.extend_from_slice(&tmp[..n as usize]);
         if let Some(end) = osc_reply_end(&buf) {
-            if let Some(start) = buf.windows(2).position(|w| w == b"\x1b]") {
-                break Some(buf[start..end].to_vec());
-            }
-            break Some(buf[..end].to_vec());
+            // Anything before/after the reply bytes is user input that
+            // raced the probe — hand it back, don't eat it.
+            let start = buf.windows(2).position(|w| w == b"\x1b]").unwrap_or(0);
+            extra_input.extend_from_slice(&buf[..start]);
+            extra_input.extend_from_slice(&buf[end..]);
+            break Some(buf[start..end].to_vec());
         }
         if buf.len() > 4096 {
             break None;
         }
     };
+    if result.is_none() {
+        // Timed out mid-reply (or got only input): return what we read.
+        extra_input.extend_from_slice(&buf);
+    }
     if fl >= 0 {
         unsafe {
             libc::fcntl(read_fd, libc::F_SETFL, fl);

@@ -91,10 +91,11 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
 
     // Probe outer TTY defaults via /dev/tty (stdout is the control channel).
     {
-        let fg = crate::client::query_outer_osc_color_for_control(10, true)
+        let mut probe_leftover = Vec::new();
+        let fg = crate::client::query_outer_osc_color_for_control(10, true, &mut probe_leftover)
             .and_then(|d| crate::term::parse_osc_color_reply(&d))
             .map(|(_, rgb)| rgb);
-        let bg = crate::client::query_outer_osc_color_for_control(11, true)
+        let bg = crate::client::query_outer_osc_color_for_control(11, true, &mut probe_leftover)
             .and_then(|d| crate::term::parse_osc_color_reply(&d))
             .map(|(_, rgb)| rgb);
         if fg.is_some() || bg.is_some() {
@@ -295,9 +296,11 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                         } => {
                             // iTerm2 -CC: stdout is the control channel, so
                             // query via /dev/tty (handled inside query helper).
+                            let mut probe_leftover = Vec::new();
                             if let Some(reply) = crate::client::query_outer_osc_color_for_control(
                                 code,
                                 bell_terminated,
+                                &mut probe_leftover,
                             ) {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
