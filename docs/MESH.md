@@ -139,7 +139,7 @@ Server→Client:
 
 - `RegisterAck { ok, reason }`
 - `PeerList { peers: [PeerEntry] }` — see §5 for fields.
-- `RelayReady` / `RelayError { reason }` — after `RelayReady`, the stream
+- `RelayAck { ok, reason }` — after `RelayAck{ok:true}`, the stream
   carries raw relayed bytes in both directions.
 
 Polling a peer is an ordinary authenticated client session:
@@ -232,11 +232,22 @@ client --[TCP+TLS]--> manager/relay --[TCP]--> target server
 ```
 
 - `RelayOpen { addr }` on an authenticated connection; relay replies
-  `RelayReady` and pipes bytes to/from a fresh TCP connect to `addr`.
+  `RelayAck{ok}` and pipes bytes to/from a fresh TCP connect to `addr`.
 - The client then runs the normal Identify/TLS handshake through the pipe;
   the relay sees ciphertext only.
-- `[peers] relay = true` enables the role. Relayed connections count in
-  the state file for crash forensics.
+- `[peers] relay = true` enables the role on a normal server; managers
+  always relay. Targets resolving to the relay's own listen address are
+  refused (self-relay cannot make progress through the synchronous
+  accept handshake).
+- Client side: `--via <manager>` forces the relay path; with no `--via`
+  a failed direct `connect()` retries through each `[peers] managers`
+  entry automatically.
+- The leg to the relay is plaintext TCP authenticated by PSK (TLS, when
+  enabled, terminates at the target — end-to-end). A relay with
+  `network.tls = "on"` is not yet supported by the client.
+- Half-close: when the target closes, the relay drains its buffered
+  response to the client before disconnecting — so request/response
+  exchanges like `ListSessions` survive the pipe.
 
 Use case: off-LAN access (client reaches only the exposed manager), or
 reaching a peer behind NAT that registered to the manager.
@@ -274,8 +285,9 @@ relay                = false   # allow authenticated RelayOpen
   peer cache + persistence ✅, `Register`/`accept_registrations`/`managers`
   ✅, `ListPeers`/`PeerList` ✅, `lrmux manager` ✅, `list-peers` +
   inventory shows manager-cached peers ✅.
-- **P2 — relay**: `RelayOpen` byte pipe, client `attach --via <manager>`
-  with end-to-end TLS.
+- **P2 — relay**: `RelayOpen`/`RelayAck` byte pipe ✅, `[peers] relay` /
+  manager gating + auth ✅, client `--via` + direct-connect fallback ✅,
+  end-to-end TLS through the pipe ✅.
 - **P3 — later**: live peer-change notifications to clients, leaf→manager
   persistent channel (reverse tunnel), fingerprint TOFU UI prompts.
 

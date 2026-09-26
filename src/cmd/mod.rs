@@ -478,6 +478,7 @@ lrmux -- <cmd> [args]    Create a new window running <cmd> and attach\n\
 \n\
 GLOBAL OPTIONS:\n    \
     --tcp <host:port>    Connect over TCP (client commands: attach, ls, kill-server, …)\n    \
+--via <host:port>      Route TCP connects through that manager's relay\n    \
 --psk <secret>       Pre-shared key for this process\n    \
 -v, --version        Print this binary's version\n    \
 -h, --help           This help, or `lrmux <command> --help` for one command\n\

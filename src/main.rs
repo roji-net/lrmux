@@ -207,6 +207,9 @@ fn parse_args() -> CliAction {
         } else if args[i] == "--psk" && i + 1 < args.len() {
             crate::config::set_psk_override(Some(args[i + 1].clone()));
             i += 2;
+        } else if args[i] == "--via" && i + 1 < args.len() {
+            crate::ipc::set_via_addr(Some(args[i + 1].clone()));
+            i += 2;
         } else {
             filtered.push(args[i].clone());
             i += 1;
