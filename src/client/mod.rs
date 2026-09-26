@@ -856,7 +856,9 @@ pub fn run(
                         }
                         // Directory messages are answered by CLI paths, not
                         // inside an attached session.
-                        ServerMsg::PeerList { .. } | ServerMsg::RegisterAck { .. } => {}
+                        ServerMsg::PeerList { .. }
+                        | ServerMsg::RegisterAck { .. }
+                        | ServerMsg::RelayAck { .. } => {}
                     }
                 }
                 // Render once per socket batch instead of once per frame —

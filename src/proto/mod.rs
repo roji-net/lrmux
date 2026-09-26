@@ -158,6 +158,12 @@ pub enum ClientMsg {
         tls: bool,
         fingerprint: String,
     },
+    /// Ask this node to open a raw byte pipe to `addr` (a peer's
+    /// host:port). After RelayAck{ok} the connection carries opaque
+    /// bytes — the client typically runs a fresh TLS + Identify to the
+    /// target through it. Requires an authenticated connection and
+    /// relay enabled on the node.
+    RelayOpen { addr: String },
 }
 
 /// Server → Client messages.
@@ -237,6 +243,9 @@ pub enum ServerMsg {
     PeerList { peers: Vec<PeerInfo> },
     /// Acknowledge Register (response to Register).
     RegisterAck { ok: bool, reason: String },
+    /// Acknowledge RelayOpen. On `ok` the connection becomes a raw byte
+    /// pipe to the requested address — no more framed messages.
+    RelayAck { ok: bool, reason: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -270,6 +279,7 @@ const C_TERM_PALETTE: u8 = 0x1a;
 const C_SET_PSK: u8 = 0x1b;
 const C_LIST_PEERS: u8 = 0x1c;
 const C_REGISTER: u8 = 0x1d;
+const C_RELAY_OPEN: u8 = 0x1e;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -286,6 +296,7 @@ const S_TERM_OSC_QUERY: u8 = 0x1b;
 const S_PSK_UPDATED: u8 = 0x1c;
 const S_PEER_LIST: u8 = 0x1d;
 const S_REGISTER_ACK: u8 = 0x1e;
+const S_RELAY_ACK: u8 = 0x1f;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -546,6 +557,11 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.extend_from_slice(&(fingerprint.len() as u32).to_le_bytes());
             payload.extend_from_slice(fingerprint.as_bytes());
         }
+        ClientMsg::RelayOpen { addr } => {
+            payload.push(C_RELAY_OPEN);
+            payload.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+            payload.extend_from_slice(addr.as_bytes());
+        }
     }
     frame(payload)
 }
@@ -722,6 +738,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
         }
         ServerMsg::RegisterAck { ok, reason } => {
             payload.push(S_REGISTER_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
+        }
+        ServerMsg::RelayAck { ok, reason } => {
+            payload.push(S_RELAY_ACK);
             payload.push(if *ok { 1 } else { 0 });
             payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             payload.extend_from_slice(reason.as_bytes());
@@ -1079,6 +1101,10 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
                 fingerprint,
             })
         }
+        C_RELAY_OPEN => {
+            let addr = read_len_string(&mut r)?;
+            Ok(ClientMsg::RelayOpen { addr })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -1331,6 +1357,11 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let ok = read_u8(&mut r)? != 0;
             let reason = read_len_string(&mut r)?;
             Ok(ServerMsg::RegisterAck { ok, reason })
+        }
+        S_RELAY_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::RelayAck { ok, reason })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1588,6 +1619,31 @@ mod tests {
                 assert_eq!(reason, "registrations disabled");
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_messages_roundtrip() {
+        let open = encode_client(&ClientMsg::RelayOpen {
+            addr: "10.0.0.7:17280".into(),
+        });
+        match decode_client(&mut &open[..]).unwrap() {
+            ClientMsg::RelayOpen { addr } => assert_eq!(addr, "10.0.0.7:17280"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        for (ok, reason) in [(true, ""), (false, "relay disabled")] {
+            let ack = encode_server(&ServerMsg::RelayAck {
+                ok,
+                reason: reason.into(),
+            });
+            match decode_server(&mut &ack[..]).unwrap() {
+                ServerMsg::RelayAck { ok: got, reason: r } => {
+                    assert_eq!(got, ok);
+                    assert_eq!(r, reason);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 }
