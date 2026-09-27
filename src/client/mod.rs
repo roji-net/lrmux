@@ -71,6 +71,15 @@ enum ConfirmState {
     NetworkSetupSetPsk { input: String },
 }
 
+/// How an interactive client run ended.
+pub enum ClientExit {
+    /// Normal exit: detach, session ended, server gone, error path.
+    Done,
+    /// The user asked to leave this server and return to the session
+    /// selector (`Ctrl-A /`).
+    Selector,
+}
+
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
 /// If `select_session` is provided, a SelectSession command is sent to switch to that session.
@@ -80,7 +89,7 @@ pub fn run(
     select_session: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
-) -> io::Result<()> {
+) -> io::Result<ClientExit> {
     // Connect to the server (Unix socket, or TCP when --tcp is set).
     let mut stream = ipc::connect_any(socket_path)?;
     let stream_fd = stream.as_raw_fd();
@@ -246,6 +255,7 @@ pub fn run(
     let mut paste_buffer = String::new();
     // Reason for exiting the relay loop, printed after terminal restoration.
     let mut exit_reason: Option<String> = None;
+    let mut want_selector = false;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -680,6 +690,7 @@ pub fn run(
                     let (
                         passthrough,
                         detach,
+                        to_selector,
                         confirm,
                         remaining,
                         enter_copy_mode,
@@ -729,7 +740,11 @@ pub fn run(
                     if detach {
                         let msg = proto::encode_client(&ClientMsg::Detach);
                         proto::send(&mut stream, &msg)?;
-                        exit_reason = Some("detached".to_string());
+                        if to_selector {
+                            want_selector = true;
+                        } else {
+                            exit_reason = Some("detached".to_string());
+                        }
                         break;
                     }
                     if enter_copy_mode {
@@ -1156,7 +1171,11 @@ pub fn run(
     if let Some(reason) = exit_reason {
         eprintln!("lrmux: {reason}");
     }
-    Ok(())
+    Ok(if want_selector {
+        ClientExit::Selector
+    } else {
+        ClientExit::Done
+    })
 }
 
 /// Log file for a server socket at `/tmp/lrmux-<UID>/<name>` lives at
@@ -1177,7 +1196,8 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
 }
 
 /// Process input bytes through the prefix-key state machine.
-/// Returns (passthrough, detach, confirm, remaining, enter_copy_mode, paste).
+/// Returns (passthrough, detach, to_selector, confirm, remaining,
+/// enter_copy_mode, paste, flash, show_help, request_session_chooser).
 /// When a confirm dialog is triggered, remaining bytes after the trigger are returned
 /// so the caller can process them with process_confirm.
 #[allow(clippy::type_complexity)]
@@ -1191,6 +1211,7 @@ fn process_prefix(
 ) -> io::Result<(
     Vec<u8>,
     bool,
+    bool,
     Option<ConfirmState>,
     Vec<u8>,
     bool,
@@ -1201,6 +1222,7 @@ fn process_prefix(
 )> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
+    let mut to_selector = false;
     let mut confirm: Option<ConfirmState> = None;
     let mut enter_copy_mode = false;
     let mut paste = false;
@@ -1214,6 +1236,7 @@ fn process_prefix(
             return Ok((
                 passthrough,
                 detach,
+                to_selector,
                 confirm,
                 input[i..].to_vec(),
                 enter_copy_mode,
@@ -1269,6 +1292,11 @@ fn process_prefix(
                     // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
                     b'd' | 0x04 => {
                         detach = true;
+                    }
+                    // '/' → detach and return to the session/server selector.
+                    b'/' => {
+                        detach = true;
+                        to_selector = true;
                     }
                     // 'x' → kill pane (no confirmation, immediate).
                     b'x' => {
@@ -1369,6 +1397,7 @@ fn process_prefix(
     Ok((
         passthrough,
         detach,
+        to_selector,
         confirm,
         Vec::new(),
         enter_copy_mode,
@@ -2090,6 +2119,7 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A r", "Refresh screen"),
         ("Ctrl-A ,", "Network / PSK setup"),
         ("Ctrl-A d / Ctrl-D", "Detach"),
+        ("Ctrl-A /", "Detach to session selector"),
         ("Ctrl-A \\", "Show server log"),
         ("Ctrl-A ?", "Show this help"),
     ];

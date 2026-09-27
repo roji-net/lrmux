@@ -1015,21 +1015,19 @@ fn run() -> io::Result<()> {
             } else if started_fresh {
                 // First Identify creates the bootstrapped session — just attach.
                 match client::run(&sock, None, None, None, None) {
-                    Ok(()) => Ok(()),
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         "server socket is stale; try again",
                     )),
-                    Err(e) => Err(e),
+                    r => then_selector(r),
                 }
             } else {
                 match client::run(&sock, Some(name), None, command, cwd) {
-                    Ok(()) => Ok(()),
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         "server socket is stale; try again",
                     )),
-                    Err(e) => Err(e),
+                    r => then_selector(r),
                 }
             }
         }
@@ -1082,7 +1080,7 @@ fn run() -> io::Result<()> {
             } else {
                 None
             };
-            client::run(&sock, new_session, session, None, None)
+            then_selector(client::run(&sock, new_session, session, None, None))
         }
         CliAction::SelectSession(name) => {
             // Non-interactive: send SelectSession to the default server.
@@ -1122,10 +1120,17 @@ fn run() -> io::Result<()> {
             // Outside lrmux: start a new server if needed, create a window with the command, attach.
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                return start_new_server("default", Some(None), None, None, None, None);
+                return then_selector(start_new_server(
+                    "default",
+                    Some(None),
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
             }
             // Server exists: create a new window with the command and attach.
-            client::run(&sock, None, None, Some(cmd), None)
+            then_selector(client::run(&sock, None, None, Some(cmd), None))
         }
         CliAction::NewServer {
             name,
@@ -1174,14 +1179,14 @@ fn run() -> io::Result<()> {
                     },
                 )
             } else {
-                start_new_server(
+                then_selector(start_new_server(
                     &name,
                     None,
                     command,
                     tcp.as_deref(),
                     ws.as_deref(),
                     session.as_deref(),
-                )
+                ))
             }
         }
         CliAction::Discover => cmd_discover(),
@@ -1242,47 +1247,90 @@ fn run_session_selector() -> io::Result<()> {
     dispatch_selector(client::selector::run_selector_forced())
 }
 
+/// After an interactive client exits, check for `ClientExit::Selector`
+/// (`Ctrl-A /`) and re-enter the session/server selector; pass through
+/// normal exits and errors.
+fn then_selector(r: io::Result<client::ClientExit>) -> io::Result<()> {
+    match r {
+        Ok(client::ClientExit::Selector) => {
+            dispatch_selector(client::selector::run_selector_forced())
+        }
+        Ok(client::ClientExit::Done) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
-    match result {
-        Ok(SelectorResult::Attach {
-            server,
-            session,
-            tcp,
-        }) => {
-            if let Some(addr) = tcp {
-                crate::ipc::set_tcp_addr(Some(addr));
-            }
-            let sock = socket_path(&server);
-            client::run(&sock, None, Some(session), None, None)
-        }
-        Ok(SelectorResult::NewSession { server, name, tcp }) => {
-            if let Some(addr) = tcp {
-                // Remote server: create the session over TCP. Never fork a
-                // local server just because the Unix socket is absent here.
-                crate::ipc::set_tcp_addr(Some(addr));
+    let mut result = result;
+    loop {
+        match result {
+            Ok(SelectorResult::Attach {
+                server,
+                session,
+                tcp,
+            }) => {
+                if let Some(addr) = tcp {
+                    crate::ipc::set_tcp_addr(Some(addr));
+                }
                 let sock = socket_path(&server);
-                return client::run(&sock, Some(name), None, None, None);
+                match client::run(&sock, None, Some(session), None, None) {
+                    // Attached, then detached back to the selector — reopen it.
+                    Ok(client::ClientExit::Selector) => {
+                        result = client::selector::run_selector_forced();
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
-            let sock = socket_path(&server);
-            if !ipc::server_exists(&sock) {
-                start_new_server(&server, None, None, None, None, None)?;
+            Ok(SelectorResult::NewSession { server, name, tcp }) => {
+                if let Some(addr) = tcp {
+                    // Remote server: create the session over TCP. Never fork a
+                    // local server just because the Unix socket is absent here.
+                    crate::ipc::set_tcp_addr(Some(addr));
+                    let sock = socket_path(&server);
+                    match client::run(&sock, Some(name), None, None, None) {
+                        Ok(client::ClientExit::Selector) => {
+                            result = client::selector::run_selector_forced();
+                        }
+                        Ok(_) => return Ok(()),
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                let sock = socket_path(&server);
+                if !ipc::server_exists(&sock) {
+                    match start_new_server(&server, None, None, None, None, None) {
+                        Ok(client::ClientExit::Selector) => {
+                            result = client::selector::run_selector_forced();
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                match client::run(&sock, Some(name), None, None, None) {
+                    Ok(client::ClientExit::Selector) => {
+                        result = client::selector::run_selector_forced();
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
-            client::run(&sock, Some(name), None, None, None)
-        }
-        Ok(SelectorResult::NewServer { name }) => {
-            start_new_server(&name, None, None, None, None, Some(&name))
-        }
-        Ok(SelectorResult::Quit) => Ok(()),
-        Err(e) => {
-            // Selector failed (e.g. no raw mode) — fall back to default server.
-            eprintln!("lrmux: selector unavailable ({e}), starting default server...");
-            let sock = socket_path("default");
-            if !ipc::server_exists(&sock) {
-                fork_server(&sock, None, None, false, false, ServerInit::default())?;
-                wait_for_server(&sock)?;
-                eprintln!("lrmux: server ready.");
+            Ok(SelectorResult::NewServer { name }) => {
+                return then_selector(start_new_server(&name, None, None, None, None, Some(&name)));
             }
-            client::run(&sock, None, None, None, None)
+            Ok(SelectorResult::Quit) => return Ok(()),
+            Err(e) => {
+                // Selector failed (e.g. no raw mode) — fall back to default server.
+                eprintln!("lrmux: selector unavailable ({e}), starting default server...");
+                let sock = socket_path("default");
+                if !ipc::server_exists(&sock) {
+                    fork_server(&sock, None, None, false, false, ServerInit::default())?;
+                    wait_for_server(&sock)?;
+                    eprintln!("lrmux: server ready.");
+                }
+                return then_selector(client::run(&sock, None, None, None, None));
+            }
         }
     }
 }
@@ -1296,7 +1344,7 @@ fn start_new_server(
     tcp_listen: Option<&str>,
     ws_listen: Option<&str>,
     session: Option<&str>,
-) -> io::Result<()> {
+) -> io::Result<client::ClientExit> {
     let sock = socket_path(name);
 
     // Check if a server with this name already exists.
