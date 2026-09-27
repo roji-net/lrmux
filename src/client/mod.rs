@@ -4,6 +4,7 @@ pub mod control;
 pub mod copy_mode;
 mod input_filter;
 pub mod inventory;
+mod mouse;
 pub mod render;
 pub mod selector;
 pub mod terminal;
@@ -143,6 +144,13 @@ pub fn run(
     // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
     // responses to our probes are client-side traffic, not pane input.
     let mut input_filter = input_filter::InputFilter::new();
+    // Mouse report decoder — active only while the outer terminal is in
+    // a reporting mode we enabled (the child asked for mouse tracking,
+    // or alternate scroll).
+    let mut mouse_decoder = mouse::Decoder::new();
+    // Mouse modes currently applied to the outer terminal:
+    // (tracking mask, altscroll-driven reporting).
+    let mut applied_mouse: (u8, bool) = (0, false);
 
     // Probe outer TTY defaults (OSC 10/11) so the server can paint HTML
     // captures without waiting for vim to ask. Raw mode is already on —
@@ -291,7 +299,11 @@ pub fn run(
 
         // Poll timeout: 500ms for flash expiry, tightened while the
         // input filter holds a possible partial terminal reply.
-        let timeout_ms = input_filter.hold_remaining_ms().unwrap_or(500).min(500);
+        let timeout_ms = input_filter
+            .hold_remaining_ms()
+            .unwrap_or(500)
+            .min(mouse_decoder.hold_remaining_ms().unwrap_or(500))
+            .min(500);
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -304,6 +316,7 @@ pub fn run(
         // A held partial sequence that never completed was user input —
         // release it; the staged bytes are picked up below.
         input_filter.flush_expired();
+        mouse_decoder.flush_expired();
 
         // Check if flash message expired.
         if let Some(deadline) = flash_deadline
@@ -326,7 +339,10 @@ pub fn run(
         // Also runs when the filter staged bytes without stdin activity —
         // probe leftovers or an expired hold.
         let mut stdin_eof = false;
-        if fds[0].revents & libc::POLLIN != 0 || input_filter.has_staged() {
+        if fds[0].revents & libc::POLLIN != 0
+            || input_filter.has_staged()
+            || mouse_decoder.has_staged()
+        {
             let mut raw = Vec::new();
             if fds[0].revents & libc::POLLIN != 0 {
                 let mut buf = [0u8; 8192];
@@ -338,8 +354,59 @@ pub fn run(
                 }
             }
             let filtered = input_filter.feed(&raw);
-            if !filtered.is_empty() {
+            // Split mouse reports out of the input stream: they are
+            // re-encoded for the pane (or handled locally) rather than
+            // reaching the child as stray escape bytes.
+            let (filtered, mouse_events) = mouse_decoder.feed(&filtered);
+            if !filtered.is_empty() || !mouse_events.is_empty() {
                 let input = &filtered[..];
+
+                // Route decoded mouse events.
+                if grid.wants_mouse() {
+                    for ev in &mouse_events {
+                        // Drop clicks landing outside the pane viewport
+                        // (status bar, filler region).
+                        let view_rows = term_rows.saturating_sub(1);
+                        if ev.x == 0
+                            || ev.x as usize > grid.cols()
+                            || ev.y == 0
+                            || ev.y as usize > grid.rows().min(view_rows)
+                        {
+                            continue;
+                        }
+                        let data = mouse::encode_report(grid.mouse_fmt, ev);
+                        let msg = proto::encode_client(&ClientMsg::PaneInput { data });
+                        proto::send(&mut stream, &msg)?;
+                    }
+                } else if grid.mouse_altscroll {
+                    // DECSET 1007 without tracking: wheel becomes arrows.
+                    let up = if grid.app_cursor_keys {
+                        b"\x1bOA".as_slice()
+                    } else {
+                        b"\x1b[A".as_slice()
+                    };
+                    let down = if grid.app_cursor_keys {
+                        b"\x1bOB".as_slice()
+                    } else {
+                        b"\x1b[B".as_slice()
+                    };
+                    for ev in &mouse_events {
+                        if !ev.is_wheel() {
+                            continue;
+                        }
+                        let arrow = if ev.is_wheel_up() { up } else { down };
+                        // xterm emits three arrow presses per wheel tick.
+                        let mut data = Vec::with_capacity(arrow.len() * 3);
+                        for _ in 0..3 {
+                            data.extend_from_slice(arrow);
+                        }
+                        let msg = proto::encode_client(&ClientMsg::PaneInput { data });
+                        proto::send(&mut stream, &msg)?;
+                    }
+                }
+                // When the child wants no mouse and no altscroll, events
+                // are dropped — local copy-mode selection (drag) hooks in
+                // here later.
 
                 if copy_mode.is_some() {
                     // In copy mode: all input goes to copy mode key handling.
@@ -701,6 +768,7 @@ pub fn run(
                             cursor_row,
                             cursor_col,
                             cursor_visible,
+                            mouse_flags,
                         } => {
                             for (row, cells) in &dirty {
                                 apply_row(&mut grid, *row as usize, cells);
@@ -708,6 +776,7 @@ pub fn run(
                             grid.cursor_row = cursor_row as usize;
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
+                            grid.set_mouse_flags(mouse_flags);
                             needs_render = true;
                         }
                         ServerMsg::GridSnapshot {
@@ -717,6 +786,7 @@ pub fn run(
                             cursor_row,
                             cursor_col,
                             cursor_visible,
+                            mouse_flags,
                         } => {
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
@@ -743,6 +813,7 @@ pub fn run(
                             grid.cursor_row = cursor_row as usize;
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
+                            grid.set_mouse_flags(mouse_flags);
                             let mut stdout = io::stdout();
                             // Reset scroll region to full screen, clear, then
                             // re-establish the scroll region. This ensures the
@@ -892,6 +963,9 @@ pub fn run(
                         | ServerMsg::RelayAck { .. } => {}
                     }
                 }
+                // GridUpdate/Snapshot carry the child's mouse flags — keep
+                // the outer terminal's reporting modes in sync.
+                sync_mouse_modes(&mut applied_mouse, &grid, &mut mouse_decoder);
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
                 if needs_render && exit_reason.is_none() {
@@ -1726,9 +1800,30 @@ fn apply_row(grid: &mut Grid, row: usize, cells: &[Cell]) {
 /// Restore the terminal (exit alternate screen, show cursor).
 fn restore_terminal() {
     let mut stdout = io::stdout();
-    // Reset scroll region to full screen, show cursor, clear screen.
+    // Disable mouse reporting we may have enabled, reset scroll region
+    // to full screen, show cursor, clear screen.
+    let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
     let _ = stdout.write_all(b"\x1b[r\x1b[?25h\x1b[2J\x1b[H");
     let _ = stdout.flush();
+}
+
+/// Enable/disable mouse reporting on the outer terminal to match the
+/// child's requested state (`applied` tracks the last emitted modes so
+/// unchanged updates emit nothing).
+fn sync_mouse_modes(applied: &mut (u8, bool), grid: &Grid, decoder: &mut mouse::Decoder) {
+    let desired = (
+        grid.mouse_tracking,
+        grid.mouse_altscroll && grid.mouse_tracking == 0,
+    );
+    if *applied == desired {
+        return;
+    }
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
+    let _ = stdout.write_all(mouse::terminal_setup(desired.0, desired.1).as_bytes());
+    let _ = stdout.flush();
+    *applied = desired;
+    decoder.set_active(desired.0 != 0 || desired.1);
 }
 
 /// Try to parse a complete server frame from the buffer.

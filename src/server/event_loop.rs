@@ -2422,6 +2422,7 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: pane.grid.mouse_flags(),
     });
     if !client_send(client, &snapshot) {
         return Err(io::Error::new(
@@ -2617,6 +2618,7 @@ fn handshake_first_client(
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: window.pane.grid.mouse_flags(),
     });
     proto::send(&mut client, &snapshot)?;
     let _ = window.pane.take_dirty_rows(); // snapshot already has full state
@@ -2765,6 +2767,7 @@ fn accept_new_client(
                         cursor_row,
                         cursor_col,
                         cursor_visible,
+                        mouse_flags: pane.grid.mouse_flags(),
                     });
                     if proto::send(&mut stream, &snapshot).is_err() {
                         return Ok(());
@@ -2972,6 +2975,7 @@ fn send_grid_update_to_window_viewers(
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: pane.grid.mouse_flags(),
     });
     let mut i = 0;
     while i < clients.len() {
@@ -3021,6 +3025,7 @@ fn send_grid_update<W: Write>(
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: pane.grid.mouse_flags(),
     });
     proto::send(writer, &msg)
 }
