@@ -715,6 +715,11 @@ pub fn run(
                         let mut stdout = io::stdout();
                         write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                         renderer.render(&mut stdout, &mut grid)?;
+                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                        // Ask the server for a fresh snapshot too — a plain
+                        // re-render can leave stale rows after the overlay
+                        // cleared the screen.
+                        send_cmd(&mut stream, &ClientMsg::Refresh)?;
                     }
                     if request_session_chooser {
                         pending_session_chooser = true;
