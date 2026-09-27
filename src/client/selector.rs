@@ -41,6 +41,10 @@ struct Entry {
     session: String,
     /// When set, connect via this TCP address instead of a local Unix socket.
     tcp: Option<String>,
+    /// TCP listen address for display (host:port) — `None` for servers
+    /// without TCP. Distinct from `tcp`: a local Unix server can still
+    /// advertise a TCP listener without routing the attach through it.
+    addr: Option<String>,
     /// ListSessions failed. Enter reports this and stays in the selector.
     unreachable: Option<String>,
     attached: u16,
@@ -62,7 +66,7 @@ impl Entry {
             self.server,
             self.session,
             self.group_label,
-            self.tcp.as_deref().unwrap_or("")
+            self.addr.as_deref().unwrap_or("")
         )
     }
 
@@ -100,15 +104,24 @@ const REMOTE_COLORS: &[&str] = &[
 /// Run the interactive selector. Returns the user's choice.
 /// Auto-joins if exactly one server/session exists.
 pub fn run_selector() -> io::Result<SelectorResult> {
-    run_selector_impl(false)
+    run_selector_impl(false, None)
 }
 
 /// Run the interactive selector, forcing the TUI even if only one session exists.
 pub fn run_selector_forced() -> io::Result<SelectorResult> {
-    run_selector_impl(true)
+    run_selector_impl(true, None)
 }
 
-fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
+/// Like `run_selector_forced`, but pre-selects the row matching `hint`
+/// (the session the user just detached from via `Ctrl-A /`).
+pub fn run_selector_forced_hint(hint: crate::client::SelectHint) -> io::Result<SelectorResult> {
+    run_selector_impl(true, Some(hint))
+}
+
+fn run_selector_impl(
+    force: bool,
+    hint: Option<crate::client::SelectHint>,
+) -> io::Result<SelectorResult> {
     let servers = inventory::collect(std::time::Duration::from_millis(500))?;
     let mut entries: Vec<Entry> = Vec::new();
     push_all_entries(&mut entries, &servers);
@@ -139,7 +152,19 @@ fn run_selector_impl(force: bool) -> io::Result<SelectorResult> {
         });
     }
 
-    interactive_selector(entries)
+    interactive_selector(entries, hint)
+}
+
+/// Does this entry match the session the user just left?
+fn matches_hint(e: &Entry, hint: &crate::client::SelectHint) -> bool {
+    if hint.session.as_deref() != Some(e.session.as_str()) {
+        return false;
+    }
+    match (&hint.tcp, &e.tcp) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => hint.server.as_deref() == Some(e.server.as_str()),
+        _ => false,
+    }
 }
 
 fn push_all_entries(entries: &mut Vec<Entry>, servers: &[ServerEntry]) {
@@ -197,6 +222,25 @@ fn port_of_addr(addr: &str) -> Option<String> {
     inventory::port_of_addr(addr)
 }
 
+/// The TCP listen address to display: the LAN address for remote entries,
+/// or the server-reported address when it looks like `host:port` (a local
+/// server's `address` is its socket path when TCP is off).
+fn display_addr(s: &ServerEntry) -> Option<String> {
+    if let Some(t) = s.tcp_addr() {
+        return Some(t.to_string());
+    }
+    if s.address.starts_with('/') {
+        return None; // Unix socket path — no TCP listener.
+    }
+    let host = inventory::host_of_addr(&s.address);
+    let ok_port = inventory::port_of_addr(&s.address).is_some_and(|p| p.parse::<u16>().is_ok());
+    if !host.is_empty() && ok_port {
+        Some(s.address.clone())
+    } else {
+        None
+    }
+}
+
 fn push_server_entries(
     entries: &mut Vec<Entry>,
     s: &ServerEntry,
@@ -205,11 +249,13 @@ fn push_server_entries(
     group_color: String,
 ) {
     let tcp = s.tcp_addr().map(|a| a.to_string());
+    let addr = display_addr(s);
     if let Some(err) = &s.probe_error {
         entries.push(Entry {
             server: s.name.clone(),
             session: "(unreachable)".to_string(),
             tcp,
+            addr,
             unreachable: Some(err.clone()),
             attached: 0,
             created: 0,
@@ -226,6 +272,7 @@ fn push_server_entries(
             server: s.name.clone(),
             session: "(no sessions)".to_string(),
             tcp,
+            addr,
             unreachable: None,
             attached: 0,
             created: 0,
@@ -242,6 +289,7 @@ fn push_server_entries(
             s,
             info,
             tcp.clone(),
+            addr.clone(),
             group_key.clone(),
             group_label.clone(),
             group_color.clone(),
@@ -253,6 +301,7 @@ fn entry_from_info(
     s: &ServerEntry,
     info: &SessionInfo,
     tcp: Option<String>,
+    addr: Option<String>,
     group_key: String,
     group_label: String,
     group_color: String,
@@ -261,6 +310,7 @@ fn entry_from_info(
         server: s.name.clone(),
         session: info.name.clone(),
         tcp,
+        addr,
         unreachable: None,
         attached: info.attached,
         created: info.created,
@@ -391,11 +441,18 @@ fn pad_visible(s: &str, width: usize) -> String {
 }
 
 /// The interactive selector TUI — ASCII table grouped by server.
-fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
+fn interactive_selector(
+    entries: Vec<Entry>,
+    hint: Option<crate::client::SelectHint>,
+) -> io::Result<SelectorResult> {
     let _raw_guard = terminal::enter_raw_mode()?;
     let mut stdout = io::stdout();
 
-    let mut selected: usize = 0;
+    // Pre-select the session the user just detached from (Ctrl-A /).
+    let mut selected: usize = hint
+        .as_ref()
+        .and_then(|h| entries.iter().position(|e| matches_hint(e, h)))
+        .unwrap_or(0);
     let mut query: String = String::new();
     let mut flash: Option<String> = None;
 
@@ -415,30 +472,55 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
         write!(stdout, "\x1b[2J\x1b[H")?;
         write!(stdout, "\x1b[1mlrmux\x1b[0m — select a session\r\n")?;
 
-        // Column widths.
+        // Column widths. The Address column only appears when at least one
+        // server has TCP enabled; all-local setups keep the compact table.
         const W_NUM: usize = 3;
         const W_ACT: usize = 2;
         const W_SESS: usize = 34;
         const W_STAT: usize = 11;
         const W_CREATED: usize = 12;
         const W_LAST: usize = 12;
+        let w_addr = if entries.iter().any(|e| e.addr.is_some()) {
+            entries
+                .iter()
+                .filter_map(|e| e.addr.as_deref().map(str::chars).map(Iterator::count))
+                .max()
+                .unwrap_or(0)
+                .max(7)
+                .min(24)
+        } else {
+            0
+        };
+        let sep_w = W_NUM
+            + 1
+            + W_ACT
+            + 1
+            + W_SESS
+            + 1
+            + W_STAT
+            + 1
+            + W_CREATED
+            + 1
+            + W_LAST
+            + if w_addr > 0 { w_addr + 1 } else { 0 };
 
         // Header.
         write!(
             stdout,
-            "\x1b[90m{} {} {} {} {} {}\x1b[0m\r\n",
+            "\x1b[90m{} {} {}{}{} {} {}\x1b[0m\r\n",
             pad_visible("#", W_NUM),
             pad_visible("●", W_ACT),
             pad_visible("Server/Session", W_SESS),
+            if w_addr > 0 {
+                format!(" {}", pad_visible("Address", w_addr))
+            } else {
+                String::new()
+            },
             pad_visible("Status", W_STAT),
             pad_visible("Created", W_CREATED),
             pad_visible("Activity", W_LAST),
         )?;
-        write!(
-            stdout,
-            "\x1b[90m{}\x1b[0m\r\n",
-            "─".repeat(W_NUM + 1 + W_ACT + 1 + W_SESS + 1 + W_STAT + 1 + W_CREATED + 1 + W_LAST)
-        )?;
+        write!(stdout, "\x1b[90m{}\x1b[0m\r\n", "─".repeat(sep_w))?;
 
         if filt.is_empty() {
             write!(stdout, "\x1b[90m  (no matches)\x1b[0m\r\n")?;
@@ -482,11 +564,17 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
                     pad_visible(bullet, W_ACT)
                 };
 
+                let addr_cell = if w_addr > 0 {
+                    format!(" {}", pad_visible(e.addr.as_deref().unwrap_or("—"), w_addr))
+                } else {
+                    String::new()
+                };
                 let line = format!(
-                    "{} {} {} {} {} {}",
+                    "{} {} {}{} {} {} {}",
                     pad_visible(&num, W_NUM),
                     bullet_cell,
                     pad_visible(&sess, W_SESS),
+                    addr_cell,
                     status_cell,
                     pad_visible(&created, W_CREATED),
                     pad_visible(&activity, W_LAST),
@@ -500,11 +588,7 @@ fn interactive_selector(entries: Vec<Entry>) -> io::Result<SelectorResult> {
             }
         }
 
-        write!(
-            stdout,
-            "\x1b[90m{}\x1b[0m\r\n",
-            "─".repeat(W_NUM + 1 + W_ACT + 1 + W_SESS + 1 + W_STAT + 1 + W_CREATED + 1 + W_LAST)
-        )?;
+        write!(stdout, "\x1b[90m{}\x1b[0m\r\n", "─".repeat(sep_w))?;
         if let Some(msg) = &flash {
             write!(stdout, "\x1b[31m{msg}\x1b[0m\r\n")?;
         }
