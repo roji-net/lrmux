@@ -1921,6 +1921,7 @@ pub fn run(
                     grid_rows,
                     grid_cols,
                     &mut clients,
+                    peer_cache.as_ref(),
                 ) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
@@ -2655,6 +2656,192 @@ fn tcp_auth_ok(is_tcp: bool, token: &str) -> bool {
     token == required
 }
 
+/// Read the first bytes of a connection to classify the protocol: binary
+/// client frames start with a u32-LE length under 16 MiB (byte 3 == 0),
+/// while the ASCII line protocol (telnet/nc) starts with printable text.
+/// Waits for up to 4 bytes, returning early on a newline (a complete ASCII
+/// line cannot be a binary frame). Bounded by `timeout`.
+fn sniff_prefix(
+    stream: &mut crate::ipc::ConnStream,
+    timeout: std::time::Duration,
+) -> io::Result<Vec<u8>> {
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::with_capacity(4);
+    let res = (|| {
+        while buf.len() < 4 && !buf.contains(&b'\n') {
+            let mut b = [0u8; 64];
+            match stream.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline || !stream.wait_readable(deadline - now)? {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+    let _ = stream.set_nonblocking(false);
+    res.map(|_| buf)
+}
+
+/// Decode the first client frame when `prefix` bytes were already consumed
+/// by sniffing. Equivalent to `decode_with_deadline` with the prefix
+/// replayed ahead of the stream.
+fn decode_client_prefixed(
+    stream: &mut crate::ipc::ConnStream,
+    prefix: Vec<u8>,
+    timeout: std::time::Duration,
+) -> io::Result<ClientMsg> {
+    stream.set_nonblocking(true)?;
+    let res = {
+        let rd = crate::ipc::stream::DeadlineReader::new(stream, timeout);
+        let mut chain = io::Cursor::new(prefix).chain(rd);
+        proto::decode_client(&mut chain)
+    };
+    let _ = stream.set_nonblocking(false);
+    res
+}
+
+/// ASCII line protocol: a minimal command interface reachable via
+/// `nc`/`telnet`. Sniffed when a connection's first bytes are not a binary
+/// frame. Same rules as the binary protocol: on TCP with a configured PSK
+/// the session requires `auth <psk>` first; read-only commands only.
+fn ascii_session(
+    stream: &mut crate::ipc::ConnStream,
+    buffered: Vec<u8>,
+    sessions: &[Session],
+    clients: &[ClientConn],
+    peer_cache: Option<&crate::peers::PeerCache>,
+) -> io::Result<()> {
+    let is_tcp = stream.is_tcp();
+    let psk = crate::server::runtime_psk();
+    let mut authed = !is_tcp || psk.is_empty();
+    let mut buf = buffered;
+
+    let banner = format!(
+        "lrmux {} — 'help' for commands\r\n> ",
+        crate::version::VERSION
+    );
+    if stream.write_all(banner.as_bytes()).is_err() || stream.flush().is_err() {
+        return Ok(());
+    }
+    stream.set_nonblocking(true)?;
+
+    // Per-command idle bound: the accept handshake is synchronous, so an
+    // idle ASCII client must not stall the event loop indefinitely.
+    let line_timeout = std::time::Duration::from_secs(15);
+    loop {
+        let deadline = std::time::Instant::now() + line_timeout;
+        let line = loop {
+            if let Some(p) = buf.iter().position(|&b| b == b'\n') {
+                break buf.drain(..=p).collect::<Vec<u8>>();
+            }
+            if buf.len() > 4096 {
+                return Ok(()); // absurd line — drop the connection
+            }
+            let mut b = [0u8; 512];
+            match stream.read(&mut b) {
+                Ok(0) => return Ok(()),
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline || !stream.wait_readable(deadline - now).unwrap_or(false) {
+                        let _ = stream.write_all(b"idle timeout\r\n");
+                        let _ = stream.flush();
+                        return Ok(());
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+        };
+        let line = String::from_utf8_lossy(&line).trim().to_string();
+        let mut it = line.split_whitespace();
+        let resp = match it.next().unwrap_or("") {
+            "" => None,
+            "help" => Some(
+                "commands: help, version, ls, peers, auth <psk>, quit\r\n\
+                 ls = sessions, peers = known servers (manager cache)"
+                    .to_string(),
+            ),
+            "version" => Some(format!("lrmux {}", crate::version::VERSION)),
+            "quit" | "exit" => {
+                let _ = stream.write_all(b"bye\r\n");
+                let _ = stream.flush();
+                return Ok(());
+            }
+            "auth" => {
+                let tok = it.next().unwrap_or("");
+                if authed || (!is_tcp || psk.is_empty()) || (!psk.is_empty() && tok == psk) {
+                    authed = true;
+                    Some("ok".to_string())
+                } else {
+                    Some("auth failed".to_string())
+                }
+            }
+            "ls" | "list-sessions" => {
+                if !authed {
+                    Some("authentication required — send: auth <psk>".to_string())
+                } else {
+                    let list = build_session_list(sessions, clients);
+                    if list.is_empty() {
+                        Some("no sessions".to_string())
+                    } else {
+                        Some(
+                            list.iter()
+                                .map(|s| {
+                                    format!(
+                                        "{}\tattached={}\tactivity={}",
+                                        s.name, s.attached, s.has_activity
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\r\n"),
+                        )
+                    }
+                }
+            }
+            "peers" | "list-peers" => {
+                if !authed {
+                    Some("authentication required — send: auth <psk>".to_string())
+                } else {
+                    match peer_cache {
+                        Some(cache) if !cache.is_empty() => Some(
+                            cache
+                                .iter()
+                                .map(|p| {
+                                    format!(
+                                        "{}\t{:?}\t{}:{}\tsessions={}",
+                                        p.name,
+                                        p.state,
+                                        p.addrs.join(","),
+                                        p.tcp_port,
+                                        p.sessions.join(",")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\r\n"),
+                        ),
+                        _ => Some("no peers".to_string()),
+                    }
+                }
+            }
+            other => Some(format!("unknown command '{other}' — try 'help'")),
+        };
+        let out = match resp {
+            Some(r) => format!("{r}\r\n> "),
+            None => "> ".to_string(),
+        };
+        if stream.write_all(out.as_bytes()).is_err() || stream.flush().is_err() {
+            return Ok(());
+        }
+    }
+}
+
 /// Accept a new client, do the handshake, and add it to the clients list.
 /// New clients default to session 0, window 0.
 fn accept_new_client(
@@ -2663,6 +2850,7 @@ fn accept_new_client(
     grid_rows: u16,
     grid_cols: u16,
     clients: &mut Vec<ClientConn>,
+    peer_cache: Option<&crate::peers::PeerCache>,
 ) -> io::Result<()> {
     match listener.accept() {
         Ok(stream) => {
@@ -2675,16 +2863,22 @@ fn accept_new_client(
                     return Ok(());
                 }
             };
+            let is_tcp = stream.is_tcp();
+            // Sniff the first bytes: binary client frames start with a
+            // u32-LE length under 16 MiB (top byte always 0x00); anything
+            // else is the ASCII line protocol (telnet/nc). The sniffed
+            // bytes are replayed ahead of the stream on the binary path.
+            let sniffed = match sniff_prefix(&mut stream, std::time::Duration::from_secs(2)) {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            if sniffed.len() < 4 || sniffed[3] != 0 {
+                return ascii_session(&mut stream, sniffed, sessions, clients, peer_cache);
+            }
             // Bound the handshake read: a client that connects and stays
             // silent must not freeze the whole event loop.
-            // decode_with_deadline polls the fd (SO_RCVTIMEO is
-            // unimplemented on some platforms).
-            let is_tcp = stream.is_tcp();
-            let first = crate::ipc::stream::decode_with_deadline(
-                &mut stream,
-                std::time::Duration::from_secs(2),
-                |r| proto::decode_client(r),
-            );
+            let first =
+                decode_client_prefixed(&mut stream, sniffed, std::time::Duration::from_secs(2));
             let (attach, is_control, auth_token) = match first {
                 Ok(ClientMsg::Identify {
                     attach: a,
