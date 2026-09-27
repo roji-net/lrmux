@@ -76,8 +76,19 @@ pub enum ClientExit {
     /// Normal exit: detach, session ended, server gone, error path.
     Done,
     /// The user asked to leave this server and return to the session
-    /// selector (`Ctrl-A /`).
-    Selector,
+    /// selector (`Ctrl-A /`). Carries where they were attached so the
+    /// selector can pre-select that row.
+    Selector(SelectHint),
+}
+
+/// Where the client was attached when it exited to the selector.
+pub struct SelectHint {
+    /// Server name (Unix socket) — `None` when attached over TCP.
+    pub server: Option<String>,
+    /// TCP address the client was attached to — `None` for Unix sockets.
+    pub tcp: Option<String>,
+    /// Session the client was viewing, if known.
+    pub session: Option<String>,
 }
 
 /// Run the client: connect to server, relay stdin → server, render grid updates.
@@ -1177,7 +1188,22 @@ pub fn run(
         eprintln!("lrmux: {reason}");
     }
     Ok(if want_selector {
-        ClientExit::Selector
+        let tcp = crate::ipc::tcp_addr();
+        ClientExit::Selector(SelectHint {
+            server: if tcp.is_none() {
+                socket_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            } else {
+                None
+            },
+            tcp,
+            session: if current_session.is_empty() {
+                None
+            } else {
+                Some(current_session)
+            },
+        })
     } else {
         ClientExit::Done
     })

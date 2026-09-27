@@ -1252,8 +1252,8 @@ fn run_session_selector() -> io::Result<()> {
 /// normal exits and errors.
 fn then_selector(r: io::Result<client::ClientExit>) -> io::Result<()> {
     match r {
-        Ok(client::ClientExit::Selector) => {
-            dispatch_selector(client::selector::run_selector_forced())
+        Ok(client::ClientExit::Selector(hint)) => {
+            dispatch_selector(client::selector::run_selector_forced_hint(hint))
         }
         Ok(client::ClientExit::Done) => Ok(()),
         Err(e) => Err(e),
@@ -1275,8 +1275,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                 let sock = socket_path(&server);
                 match client::run(&sock, None, Some(session), None, None) {
                     // Attached, then detached back to the selector — reopen it.
-                    Ok(client::ClientExit::Selector) => {
-                        result = client::selector::run_selector_forced();
+                    Ok(client::ClientExit::Selector(hint)) => {
+                        result = client::selector::run_selector_forced_hint(hint);
                     }
                     Ok(_) => return Ok(()),
                     Err(e) => return Err(e),
@@ -1289,8 +1289,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                     crate::ipc::set_tcp_addr(Some(addr));
                     let sock = socket_path(&server);
                     match client::run(&sock, Some(name), None, None, None) {
-                        Ok(client::ClientExit::Selector) => {
-                            result = client::selector::run_selector_forced();
+                        Ok(client::ClientExit::Selector(hint)) => {
+                            result = client::selector::run_selector_forced_hint(hint);
                         }
                         Ok(_) => return Ok(()),
                         Err(e) => return Err(e),
@@ -1300,8 +1300,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                 let sock = socket_path(&server);
                 if !ipc::server_exists(&sock) {
                     match start_new_server(&server, None, None, None, None, None) {
-                        Ok(client::ClientExit::Selector) => {
-                            result = client::selector::run_selector_forced();
+                        Ok(client::ClientExit::Selector(hint)) => {
+                            result = client::selector::run_selector_forced_hint(hint);
                             continue;
                         }
                         Ok(_) => {}
@@ -1309,8 +1309,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                     }
                 }
                 match client::run(&sock, Some(name), None, None, None) {
-                    Ok(client::ClientExit::Selector) => {
-                        result = client::selector::run_selector_forced();
+                    Ok(client::ClientExit::Selector(hint)) => {
+                        result = client::selector::run_selector_forced_hint(hint);
                     }
                     Ok(_) => return Ok(()),
                     Err(e) => return Err(e),
