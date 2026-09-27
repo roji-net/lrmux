@@ -13,6 +13,7 @@ mod ipc;
 mod keys;
 mod layout;
 mod log;
+mod peers;
 mod proto;
 mod pty;
 mod server;
@@ -104,10 +105,15 @@ enum CliAction {
     },
     /// `discover`: UDP broadcast probe for LAN servers.
     Discover,
+    /// `manager -s <name> [--tcp addr]`: standalone peer directory —
+    /// no sessions, holds the peer cache, accepts registrations.
+    Manager { name: String, tcp: Option<String> },
     /// `psk show|set|generate`: manage the TCP pre-shared key.
     Psk(Vec<String>),
     /// `list-servers`: list all running servers.
     ListServers,
+    /// `list-peers [server]`: query a directory/manager's peer cache.
+    ListPeers(Option<String>),
     /// `list-sessions [server]`: list sessions (all servers, or one).
     ListSessions(Option<String>),
     /// `list-windows -t <target>`: list windows in a session.
@@ -186,10 +192,10 @@ fn first_subcommand(args: &[String]) -> Option<&str> {
 /// Parse CLI arguments into an action.
 fn parse_args() -> CliAction {
     let args: Vec<String> = std::env::args().collect();
-    // `new-server` / `start-server` use `--tcp` as a listen address. Every
-    // other command uses it as the client connect target.
-    let owns_listen_tcp =
-        first_subcommand(&args).is_some_and(|c| cmd::canonical_name(c) == "new-server");
+    // `new-server` / `start-server` / `manager` use `--tcp` as a listen
+    // address. Every other command uses it as the client connect target.
+    let owns_listen_tcp = first_subcommand(&args)
+        .is_some_and(|c| matches!(cmd::canonical_name(c), "new-server" | "manager"));
     // Extract --tcp <addr> flag if present (global, for CLI commands).
     let mut tcp_addr: Option<String> = None;
     let mut filtered: Vec<String> = vec![args[0].clone()];
@@ -200,6 +206,9 @@ fn parse_args() -> CliAction {
             i += 2;
         } else if args[i] == "--psk" && i + 1 < args.len() {
             crate::config::set_psk_override(Some(args[i + 1].clone()));
+            i += 2;
+        } else if args[i] == "--via" && i + 1 < args.len() {
+            crate::ipc::set_via_addr(Some(args[i + 1].clone()));
             i += 2;
         } else {
             filtered.push(args[i].clone());
@@ -277,7 +286,29 @@ fn parse_args() -> CliAction {
         }
         Some("new-server") => parse_new_server(subcmd_args, false),
         Some("start-server") => parse_new_server(subcmd_args, true),
+        Some("manager") => {
+            let parsed = cmd::parse_flags(subcmd_args);
+            CliAction::Manager {
+                name: parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "manager".to_string()),
+                tcp: parsed.get("tcp").map(|s| s.to_string()),
+            }
+        }
         Some("list-servers") | Some("ls-servers") => CliAction::ListServers,
+        Some("list-peers") | Some("peers") => {
+            let parsed = cmd::parse_flags(subcmd_args);
+            CliAction::ListPeers(
+                parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .or_else(|| parsed.get("t"))
+                    .or_else(|| parsed.get("target"))
+                    .map(|s| s.to_string()),
+            )
+        }
         Some("discover") => CliAction::Discover,
         Some("psk") => CliAction::Psk(subcmd_args.to_vec()),
         Some("list-sessions") | Some("ls-sessions") | Some("ls") => {
@@ -860,6 +891,7 @@ fn run() -> io::Result<()> {
                     tcp.as_deref(),
                     ws.as_deref(),
                     headless,
+                    false,
                     ServerInit {
                         command: command.as_deref(),
                         session: session.as_deref(),
@@ -943,6 +975,7 @@ fn run() -> io::Result<()> {
                     None,
                     None,
                     detached,
+                    false,
                     ServerInit {
                         command: command.as_deref(),
                         session: name.as_deref(),
@@ -982,21 +1015,19 @@ fn run() -> io::Result<()> {
             } else if started_fresh {
                 // First Identify creates the bootstrapped session — just attach.
                 match client::run(&sock, None, None, None, None) {
-                    Ok(()) => Ok(()),
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         "server socket is stale; try again",
                     )),
-                    Err(e) => Err(e),
+                    r => then_selector(r),
                 }
             } else {
                 match client::run(&sock, Some(name), None, command, cwd) {
-                    Ok(()) => Ok(()),
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         "server socket is stale; try again",
                     )),
-                    Err(e) => Err(e),
+                    r => then_selector(r),
                 }
             }
         }
@@ -1049,7 +1080,7 @@ fn run() -> io::Result<()> {
             } else {
                 None
             };
-            client::run(&sock, new_session, session, None, None)
+            then_selector(client::run(&sock, new_session, session, None, None))
         }
         CliAction::SelectSession(name) => {
             // Non-interactive: send SelectSession to the default server.
@@ -1089,10 +1120,17 @@ fn run() -> io::Result<()> {
             // Outside lrmux: start a new server if needed, create a window with the command, attach.
             let sock = socket_path("default");
             if !ipc::server_exists(&sock) {
-                return start_new_server("default", Some(None), None, None, None, None);
+                return then_selector(start_new_server(
+                    "default",
+                    Some(None),
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
             }
             // Server exists: create a new window with the command and attach.
-            client::run(&sock, None, None, Some(cmd), None)
+            then_selector(client::run(&sock, None, None, Some(cmd), None))
         }
         CliAction::NewServer {
             name,
@@ -1141,21 +1179,23 @@ fn run() -> io::Result<()> {
                     },
                 )
             } else {
-                start_new_server(
+                then_selector(start_new_server(
                     &name,
                     None,
                     command,
                     tcp.as_deref(),
                     ws.as_deref(),
                     session.as_deref(),
-                )
+                ))
             }
         }
         CliAction::Discover => cmd_discover(),
+        CliAction::Manager { name, tcp } => start_manager(&name, tcp.as_deref()),
         CliAction::Psk(args) => cmd_psk(&args),
         CliAction::Default => run_default(),
         CliAction::SessionSelector => run_session_selector(),
         CliAction::ListServers => list_servers(),
+        CliAction::ListPeers(server) => list_peers(server.as_deref()),
         CliAction::ListSessions(server) => list_sessions(server.as_deref()),
         CliAction::ListWindows(_target) => {
             // TODO: implement list-windows
@@ -1207,47 +1247,90 @@ fn run_session_selector() -> io::Result<()> {
     dispatch_selector(client::selector::run_selector_forced())
 }
 
+/// After an interactive client exits, check for `ClientExit::Selector`
+/// (`Ctrl-A /`) and re-enter the session/server selector; pass through
+/// normal exits and errors.
+fn then_selector(r: io::Result<client::ClientExit>) -> io::Result<()> {
+    match r {
+        Ok(client::ClientExit::Selector(hint)) => {
+            dispatch_selector(client::selector::run_selector_forced_hint(hint))
+        }
+        Ok(client::ClientExit::Done) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
-    match result {
-        Ok(SelectorResult::Attach {
-            server,
-            session,
-            tcp,
-        }) => {
-            if let Some(addr) = tcp {
-                crate::ipc::set_tcp_addr(Some(addr));
-            }
-            let sock = socket_path(&server);
-            client::run(&sock, None, Some(session), None, None)
-        }
-        Ok(SelectorResult::NewSession { server, name, tcp }) => {
-            if let Some(addr) = tcp {
-                // Remote server: create the session over TCP. Never fork a
-                // local server just because the Unix socket is absent here.
-                crate::ipc::set_tcp_addr(Some(addr));
+    let mut result = result;
+    loop {
+        match result {
+            Ok(SelectorResult::Attach {
+                server,
+                session,
+                tcp,
+            }) => {
+                if let Some(addr) = tcp {
+                    crate::ipc::set_tcp_addr(Some(addr));
+                }
                 let sock = socket_path(&server);
-                return client::run(&sock, Some(name), None, None, None);
+                match client::run(&sock, None, Some(session), None, None) {
+                    // Attached, then detached back to the selector — reopen it.
+                    Ok(client::ClientExit::Selector(hint)) => {
+                        result = client::selector::run_selector_forced_hint(hint);
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
-            let sock = socket_path(&server);
-            if !ipc::server_exists(&sock) {
-                start_new_server(&server, None, None, None, None, None)?;
+            Ok(SelectorResult::NewSession { server, name, tcp }) => {
+                if let Some(addr) = tcp {
+                    // Remote server: create the session over TCP. Never fork a
+                    // local server just because the Unix socket is absent here.
+                    crate::ipc::set_tcp_addr(Some(addr));
+                    let sock = socket_path(&server);
+                    match client::run(&sock, Some(name), None, None, None) {
+                        Ok(client::ClientExit::Selector(hint)) => {
+                            result = client::selector::run_selector_forced_hint(hint);
+                        }
+                        Ok(_) => return Ok(()),
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                let sock = socket_path(&server);
+                if !ipc::server_exists(&sock) {
+                    match start_new_server(&server, None, None, None, None, None) {
+                        Ok(client::ClientExit::Selector(hint)) => {
+                            result = client::selector::run_selector_forced_hint(hint);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                match client::run(&sock, Some(name), None, None, None) {
+                    Ok(client::ClientExit::Selector(hint)) => {
+                        result = client::selector::run_selector_forced_hint(hint);
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
-            client::run(&sock, Some(name), None, None, None)
-        }
-        Ok(SelectorResult::NewServer { name }) => {
-            start_new_server(&name, None, None, None, None, Some(&name))
-        }
-        Ok(SelectorResult::Quit) => Ok(()),
-        Err(e) => {
-            // Selector failed (e.g. no raw mode) — fall back to default server.
-            eprintln!("lrmux: selector unavailable ({e}), starting default server...");
-            let sock = socket_path("default");
-            if !ipc::server_exists(&sock) {
-                fork_server(&sock, None, None, false, ServerInit::default())?;
-                wait_for_server(&sock)?;
-                eprintln!("lrmux: server ready.");
+            Ok(SelectorResult::NewServer { name }) => {
+                return then_selector(start_new_server(&name, None, None, None, None, Some(&name)));
             }
-            client::run(&sock, None, None, None, None)
+            Ok(SelectorResult::Quit) => return Ok(()),
+            Err(e) => {
+                // Selector failed (e.g. no raw mode) — fall back to default server.
+                eprintln!("lrmux: selector unavailable ({e}), starting default server...");
+                let sock = socket_path("default");
+                if !ipc::server_exists(&sock) {
+                    fork_server(&sock, None, None, false, false, ServerInit::default())?;
+                    wait_for_server(&sock)?;
+                    eprintln!("lrmux: server ready.");
+                }
+                return then_selector(client::run(&sock, None, None, None, None));
+            }
         }
     }
 }
@@ -1261,7 +1344,7 @@ fn start_new_server(
     tcp_listen: Option<&str>,
     ws_listen: Option<&str>,
     session: Option<&str>,
-) -> io::Result<()> {
+) -> io::Result<client::ClientExit> {
     let sock = socket_path(name);
 
     // Check if a server with this name already exists.
@@ -1288,6 +1371,7 @@ fn start_new_server(
         &sock,
         tcp_listen,
         ws_listen,
+        false,
         false,
         ServerInit {
             command: command.as_deref(),
@@ -1333,10 +1417,33 @@ fn start_headless_server(
         eprintln!("lrmux: WebSocket listener: {addr}");
         eprintln!("lrmux: open web/ via a static server, connect to ws://{addr}");
     }
-    fork_server(&sock, tcp_addr, ws_addr, true, init)?;
+    fork_server(&sock, tcp_addr, ws_addr, true, false, init)?;
     wait_for_server(&sock)?;
     eprintln!("lrmux: headless server '{name}' ready.");
     eprintln!("lrmux: connect with `lrmux` or use CLI commands (send-keys, capture-window, etc.)");
+    Ok(())
+}
+
+/// Start a standalone session manager (directory): no sessions, a TCP
+/// listener (config `network.tcp_listen`, `--tcp`, or `auto`), the peer
+/// cache, and open registrations. Used for always-on rendezvous nodes.
+fn start_manager(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
+    let sock = socket_path(name);
+    if ipc::server_exists(&sock) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("server '{name}' is already running"),
+        ));
+    }
+    let tcp = tcp_addr
+        .map(|s| s.to_string())
+        .or_else(|| config::global().network.tcp_listen_addr().map(String::from))
+        .unwrap_or_else(|| "auto".to_string());
+    eprintln!("lrmux: starting manager '{name}' on {}...", sock.display());
+    eprintln!("lrmux: TCP listener: {tcp}");
+    fork_server(&sock, Some(&tcp), None, false, true, ServerInit::default())?;
+    wait_for_server(&sock)?;
+    eprintln!("lrmux: manager '{name}' ready (stop with `lrmux kill-server -t {name}`)");
     Ok(())
 }
 
@@ -1351,7 +1458,7 @@ fn run_control_mode(target: Option<&str>) -> io::Result<()> {
     if !via_tcp && !ipc::server_exists(&sock) {
         if server == "default" {
             // Start a headless default server silently.
-            fork_server(&sock, None, None, true, ServerInit::default())?;
+            fork_server(&sock, None, None, true, false, ServerInit::default())?;
             wait_for_server(&sock)?;
         } else {
             return Err(io::Error::new(
@@ -1433,10 +1540,13 @@ fn cmd_discover() -> io::Result<()> {
 /// Times out after 2s — a wedged server accepts but never responds.
 fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
     let mut stream = connect_to_server(server)?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
+    let res =
+        ipc::stream::decode_with_deadline(&mut stream, std::time::Duration::from_secs(2), |r| {
+            proto::decode_server(r)
+        });
+    match res {
         Ok(ServerMsg::SessionList { sessions, address }) => {
             let names = sessions.into_iter().map(|s| s.name).collect();
             Ok((address, names))
@@ -1450,6 +1560,69 @@ fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Query a directory/manager's peer cache. With `--tcp` (or `-t <name>`)
+/// queries that endpoint; otherwise the default local server.
+fn list_peers(server: Option<&str>) -> io::Result<()> {
+    let mut stream = connect_to_server(server.unwrap_or("default"))?;
+    let ident = proto::encode_client(&ClientMsg::Identify {
+        rows: 0,
+        cols: 0,
+        attach: false,
+        auth_token: crate::config::effective_psk(),
+    });
+    proto::send(&mut stream, &ident)?;
+    match ipc::stream::decode_with_deadline(&mut stream, std::time::Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    })? {
+        ServerMsg::IdentifyAck { .. } => {}
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+    }
+    proto::send(&mut stream, &proto::encode_client(&ClientMsg::ListPeers))?;
+    let peers = match ipc::stream::decode_with_deadline(
+        &mut stream,
+        std::time::Duration::from_secs(2),
+        |r| proto::decode_server(r),
+    )? {
+        ServerMsg::PeerList { peers } => peers,
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected PeerList",
+            ));
+        }
+    };
+    if peers.is_empty() {
+        eprintln!("(no peers — is this a manager or a [peers] directory server?)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<22} {:<10} {:<5} SESSIONS",
+        "NAME", "ADDR", "STATE", "TLS"
+    );
+    for p in &peers {
+        println!(
+            "{:<20} {:<22} {:<10} {:<5} {}",
+            p.name,
+            p.addr,
+            p.state,
+            if p.tls { "yes" } else { "no" },
+            p.sessions.join(", "),
+        );
+    }
+    Ok(())
 }
 
 /// List sessions. With a server argument, list that server's sessions as
@@ -1523,13 +1696,8 @@ fn cmd_psk(args: &[String]) -> io::Result<()> {
             if p.is_empty() {
                 println!("(no PSK configured)");
             } else {
-                let preview = if p.len() > 8 {
-                    format!("{}... ({} chars)", &p[..4], p.len())
-                } else {
-                    "********".to_string()
-                };
-                println!("psk: {preview}");
-                println!("tip: use `lrmux psk generate` to create a new one");
+                // Print in full so it can be copied to other servers.
+                println!("{p}");
             }
             Ok(())
         }
@@ -1638,7 +1806,6 @@ fn print_versions() {
 /// Query a running server for its version string and address.
 fn query_server_version(server: &str) -> io::Result<(String, String)> {
     let mut stream = connect_to_server(server)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let identify = proto::encode_client(&ClientMsg::Identify {
         rows: 0,
         cols: 0,
@@ -1646,7 +1813,10 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
         auth_token: crate::config::effective_psk(),
     });
     proto::send(&mut stream, &identify)?;
-    match proto::decode_server(&mut stream) {
+    let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
+        proto::decode_server(r)
+    });
+    match res {
         Ok(ServerMsg::IdentifyAck {
             version, address, ..
         }) => Ok((version, address)),
@@ -1870,6 +2040,7 @@ fn fork_server(
     tcp_addr: Option<&str>,
     ws_addr: Option<&str>,
     headless: bool,
+    manager: bool,
     init: ServerInit<'_>,
 ) -> io::Result<()> {
     // CWD for the first session: explicit `-c`, else the client's current
@@ -1911,7 +2082,7 @@ fn fork_server(
         let sock = sock.to_path_buf();
         let tcp = tcp_addr.map(|s| s.to_string());
         let ws = ws_addr.map(|s| s.to_string());
-        match server::run(&sock, tcp.as_deref(), ws.as_deref(), headless) {
+        match server::run(&sock, tcp.as_deref(), ws.as_deref(), headless, manager) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("lrmux server: {e}");

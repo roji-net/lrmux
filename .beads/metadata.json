@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "lrmux",
+  "project_id": "8b42383a-015d-497b-be55-a88596ec0521"
+}

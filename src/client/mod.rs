@@ -2,7 +2,9 @@
 
 pub mod control;
 pub mod copy_mode;
+mod input_filter;
 pub mod inventory;
+mod mouse;
 pub mod render;
 pub mod selector;
 pub mod terminal;
@@ -69,6 +71,26 @@ enum ConfirmState {
     NetworkSetupSetPsk { input: String },
 }
 
+/// How an interactive client run ended.
+pub enum ClientExit {
+    /// Normal exit: detach, session ended, server gone, error path.
+    Done,
+    /// The user asked to leave this server and return to the session
+    /// selector (`Ctrl-A /`). Carries where they were attached so the
+    /// selector can pre-select that row.
+    Selector(SelectHint),
+}
+
+/// Where the client was attached when it exited to the selector.
+pub struct SelectHint {
+    /// Server name (Unix socket) — `None` when attached over TCP.
+    pub server: Option<String>,
+    /// TCP address the client was attached to — `None` for Unix sockets.
+    pub tcp: Option<String>,
+    /// Session the client was viewing, if known.
+    pub session: Option<String>,
+}
+
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
 /// If `select_session` is provided, a SelectSession command is sent to switch to that session.
@@ -78,7 +100,7 @@ pub fn run(
     select_session: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
-) -> io::Result<()> {
+) -> io::Result<ClientExit> {
     // Connect to the server (Unix socket, or TCP when --tcp is set).
     let mut stream = ipc::connect_any(socket_path)?;
     let stream_fd = stream.as_raw_fd();
@@ -139,10 +161,30 @@ pub fn run(
         }
     };
 
+    // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
+    // responses to our probes are client-side traffic, not pane input.
+    let mut input_filter = input_filter::InputFilter::new();
+    // Mouse report decoder — the outer terminal is always in a reporting
+    // mode while attached: reports feed the child (when it tracks the
+    // mouse) or local copy-mode selection otherwise.
+    let mut mouse_decoder = mouse::Decoder::new();
+    mouse_decoder.set_active(true);
+    // Tracking mask currently applied to the outer terminal (None = not yet).
+    let mut applied_mouse: Option<u8> = None;
+    // Pending mouse-press position (x, y): arms a local selection — the
+    // drag that follows enters copy mode anchored here. A release without
+    // motion is a plain click and does nothing.
+    let mut mouse_anchor: Option<(u16, u16)> = None;
+    // True while copy mode was entered by a mouse drag (release copies).
+    let mut mouse_auto_copy = false;
+
     // Probe outer TTY defaults (OSC 10/11) so the server can paint HTML
     // captures without waiting for vim to ask. Raw mode is already on —
-    // replies won't echo onto the screen.
-    report_outer_term_palette(&mut stream)?;
+    // replies won't echo onto the screen. Keystrokes read alongside a
+    // reply come back in probe_leftover and re-enter via the filter.
+    let mut probe_leftover = Vec::new();
+    report_outer_term_palette(&mut stream, &mut probe_leftover)?;
+    input_filter.inject(&probe_leftover);
 
     // Create the local grid + renderer.
     let mut grid = Grid::new(grid_rows, grid_cols, 10_000);
@@ -224,6 +266,7 @@ pub fn run(
     let mut paste_buffer = String::new();
     // Reason for exiting the relay loop, printed after terminal restoration.
     let mut exit_reason: Option<String> = None;
+    let mut want_selector = false;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -281,8 +324,14 @@ pub fn run(
             },
         ];
 
-        // Use a 500ms poll timeout so we can expire flash messages.
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
+        // Poll timeout: 500ms for flash expiry, tightened while the
+        // input filter holds a possible partial terminal reply.
+        let timeout_ms = input_filter
+            .hold_remaining_ms()
+            .unwrap_or(500)
+            .min(mouse_decoder.hold_remaining_ms().unwrap_or(500))
+            .min(500);
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -290,6 +339,11 @@ pub fn run(
             }
             return Err(err);
         }
+
+        // A held partial sequence that never completed was user input —
+        // release it; the staged bytes are picked up below.
+        input_filter.flush_expired();
+        mouse_decoder.flush_expired();
 
         // Check if flash message expired.
         if let Some(deadline) = flash_deadline
@@ -308,12 +362,201 @@ pub fn run(
             render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
         }
 
-        // stdin → prefix detection → server (as PaneInput or commands)
-        if fds[0].revents & libc::POLLIN != 0 {
-            let mut buf = [0u8; 8192];
-            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n > 0 {
-                let input = &buf[..n as usize];
+        // stdin → prefix detection → server (as PaneInput or commands).
+        // Also runs when the filter staged bytes without stdin activity —
+        // probe leftovers or an expired hold.
+        let mut stdin_eof = false;
+        if fds[0].revents & libc::POLLIN != 0
+            || input_filter.has_staged()
+            || mouse_decoder.has_staged()
+        {
+            let mut raw = Vec::new();
+            if fds[0].revents & libc::POLLIN != 0 {
+                let mut buf = [0u8; 8192];
+                let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n > 0 {
+                    raw.extend_from_slice(&buf[..n as usize]);
+                } else if n == 0 {
+                    stdin_eof = true;
+                }
+            }
+            let filtered = input_filter.feed(&raw);
+            // Split mouse reports out of the input stream: they are
+            // re-encoded for the pane (or handled locally) rather than
+            // reaching the child as stray escape bytes.
+            let (filtered, mouse_events) = mouse_decoder.feed(&filtered);
+            if !filtered.is_empty() || !mouse_events.is_empty() {
+                let input = &filtered[..];
+
+                // Route decoded mouse events: to the pane when it tracks
+                // the mouse, or to local copy-mode selection otherwise
+                // (and always locally while copy mode is active).
+                let view_rows = term_rows.saturating_sub(1);
+                let mut mouse_copy_action: Option<copy_mode::CopyAction> = None;
+                for ev in &mouse_events {
+                    let local = copy_mode.is_some() || !grid.wants_mouse();
+                    if !local {
+                        // Forward to the pane in the child's encoding.
+                        // Motion events only when the child asked for drag
+                        // (1002) or any-motion (1003) reporting.
+                        if ev.is_motion() && grid.mouse_tracking & 0b110 == 0 {
+                            continue;
+                        }
+                        if ev.x == 0
+                            || ev.x as usize > grid.cols()
+                            || ev.y == 0
+                            || ev.y as usize > grid.rows().min(view_rows)
+                        {
+                            continue; // status bar / filler region
+                        }
+                        let data = mouse::encode_report(grid.mouse_fmt, ev);
+                        let msg = proto::encode_client(&ClientMsg::PaneInput { data });
+                        proto::send(&mut stream, &msg)?;
+                        continue;
+                    }
+                    // Local handling.
+                    if ev.is_wheel() {
+                        if grid.mouse_altscroll && !grid.wants_mouse() && copy_mode.is_none() {
+                            // DECSET 1007 without tracking: wheel → arrows.
+                            let arrow = match (ev.is_wheel_up(), grid.app_cursor_keys) {
+                                (true, true) => b"\x1bOA".as_slice(),
+                                (true, false) => b"\x1b[A".as_slice(),
+                                (false, true) => b"\x1bOB".as_slice(),
+                                (false, false) => b"\x1b[B".as_slice(),
+                            };
+                            // xterm emits three presses per wheel tick.
+                            let mut data = Vec::with_capacity(arrow.len() * 3);
+                            for _ in 0..3 {
+                                data.extend_from_slice(arrow);
+                            }
+                            let msg = proto::encode_client(&ClientMsg::PaneInput { data });
+                            proto::send(&mut stream, &msg)?;
+                            continue;
+                        }
+                        // Wheel scrolls the copy-mode view (entering it on
+                        // wheel-up — like tmux mouse mode).
+                        if copy_mode.is_none() {
+                            if !ev.is_wheel_up() {
+                                continue;
+                            }
+                            copy_mode = Some(copy_mode::CopyMode::new(
+                                grid.scrollback.len(),
+                                grid.cursor_row,
+                                grid.cursor_col,
+                            ));
+                        }
+                        let cm = copy_mode.as_mut().unwrap();
+                        let total = grid.scrollback.len() + grid.rows();
+                        if ev.is_wheel_up() {
+                            cm.vrow = cm.vrow.saturating_sub(3);
+                        } else {
+                            if cm.vrow >= total.saturating_sub(1) {
+                                // Already at the bottom — leave copy mode.
+                                mouse_copy_action = Some(copy_mode::CopyAction::Quit);
+                                break;
+                            }
+                            cm.vrow = (cm.vrow + 3).min(total - 1);
+                        }
+                        cm.ensure_cursor_visible(view_rows);
+                        let mut stdout = io::stdout();
+                        cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        continue;
+                    }
+                    if ev.is_motion() {
+                        // Drag: arm/extend the local selection.
+                        if let Some((ax, ay)) = mouse_anchor.take() {
+                            // First motion after a press — enter copy mode
+                            // anchored at the press position.
+                            if copy_mode.is_none() {
+                                copy_mode = Some(copy_mode::CopyMode::new(
+                                    grid.scrollback.len(),
+                                    grid.cursor_row,
+                                    grid.cursor_col,
+                                ));
+                            }
+                            mouse_auto_copy = true;
+                            let cm = copy_mode.as_mut().unwrap();
+                            cm.vrow = (grid.scrollback.len() + ay.saturating_sub(1) as usize)
+                                .min(grid.scrollback.len() + grid.rows() - 1);
+                            cm.vcol = (ax.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.selection_start = Some((cm.vrow, cm.vcol));
+                        }
+                        if let Some(cm) = copy_mode.as_mut()
+                            && cm.selection_start.is_some()
+                        {
+                            let total = grid.scrollback.len() + grid.rows();
+                            cm.vrow =
+                                (cm.viewport_top + ev.y.saturating_sub(1) as usize).min(total - 1);
+                            cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.ensure_cursor_visible(view_rows);
+                            let mut stdout = io::stdout();
+                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        }
+                        continue;
+                    }
+                    if ev.release {
+                        if mouse_auto_copy {
+                            // Drag ended — copy the selection and leave.
+                            mouse_auto_copy = false;
+                            if let Some(cm) = &copy_mode
+                                && let Some(text) = cm.copy_selection(&grid)
+                                && !text.is_empty()
+                            {
+                                mouse_copy_action = Some(copy_mode::CopyAction::Copy(text));
+                                break;
+                            }
+                            mouse_copy_action = Some(copy_mode::CopyAction::Quit);
+                            break;
+                        }
+                        // Release without a drag: plain click — cancel the
+                        // pending anchor (and any selection if in copy mode).
+                        if let Some(cm) = copy_mode.as_mut() {
+                            cm.selection_start = None;
+                            cm.vrow = (cm.viewport_top + ev.y.saturating_sub(1) as usize)
+                                .min(grid.scrollback.len() + grid.rows() - 1);
+                            cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.ensure_cursor_visible(view_rows);
+                            let mut stdout = io::stdout();
+                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        }
+                        mouse_anchor = None;
+                        continue;
+                    }
+                    // Button press: arm a selection anchor (drag enters
+                    // copy mode; release without drag = plain click).
+                    // Left button only.
+                    if ev.cb & 3 == 0 {
+                        mouse_anchor = Some((ev.x, ev.y));
+                    }
+                }
+                // Apply copy-mode exit/copy triggered by the mouse.
+                if let Some(action) = mouse_copy_action {
+                    match action {
+                        copy_mode::CopyAction::Quit => {
+                            copy_mode = None;
+                            restore_normal_view(
+                                &mut renderer,
+                                &mut grid,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                            )?;
+                        }
+                        copy_mode::CopyAction::Copy(text) => {
+                            paste_buffer = text.clone();
+                            let _ = copy_mode::copy_to_clipboard(&text);
+                            copy_mode = None;
+                            restore_normal_view(
+                                &mut renderer,
+                                &mut grid,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                            )?;
+                        }
+                        copy_mode::CopyAction::Continue => {}
+                    }
+                }
 
                 if copy_mode.is_some() {
                     // In copy mode: all input goes to copy mode key handling.
@@ -458,6 +701,7 @@ pub fn run(
                     let (
                         passthrough,
                         detach,
+                        to_selector,
                         confirm,
                         remaining,
                         enter_copy_mode,
@@ -482,6 +726,11 @@ pub fn run(
                         let mut stdout = io::stdout();
                         write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                         renderer.render(&mut stdout, &mut grid)?;
+                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                        // Ask the server for a fresh snapshot too — a plain
+                        // re-render can leave stale rows after the overlay
+                        // cleared the screen.
+                        send_cmd(&mut stream, &ClientMsg::Refresh)?;
                     }
                     if request_session_chooser {
                         pending_session_chooser = true;
@@ -507,7 +756,11 @@ pub fn run(
                     if detach {
                         let msg = proto::encode_client(&ClientMsg::Detach);
                         proto::send(&mut stream, &msg)?;
-                        exit_reason = Some("detached".to_string());
+                        if to_selector {
+                            want_selector = true;
+                        } else {
+                            exit_reason = Some("detached".to_string());
+                        }
                         break;
                     }
                     if enter_copy_mode {
@@ -609,9 +862,10 @@ pub fn run(
                         }
                     }
                 }
-            } else if n == 0 {
-                break;
             }
+        }
+        if stdin_eof {
+            break;
         }
 
         // Server → grid → renderer → stdout
@@ -674,6 +928,7 @@ pub fn run(
                             cursor_row,
                             cursor_col,
                             cursor_visible,
+                            mouse_flags,
                         } => {
                             for (row, cells) in &dirty {
                                 apply_row(&mut grid, *row as usize, cells);
@@ -681,6 +936,7 @@ pub fn run(
                             grid.cursor_row = cursor_row as usize;
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
+                            grid.set_mouse_flags(mouse_flags);
                             needs_render = true;
                         }
                         ServerMsg::GridSnapshot {
@@ -690,6 +946,7 @@ pub fn run(
                             cursor_row,
                             cursor_col,
                             cursor_visible,
+                            mouse_flags,
                         } => {
                             grid = Grid::new(rows as usize, cols as usize, 10_000);
                             grid.mark_all_dirty();
@@ -716,6 +973,7 @@ pub fn run(
                             grid.cursor_row = cursor_row as usize;
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
+                            grid.set_mouse_flags(mouse_flags);
                             let mut stdout = io::stdout();
                             // Reset scroll region to full screen, clear, then
                             // re-establish the scroll region. This ensures the
@@ -841,21 +1099,33 @@ pub fn run(
                             // Flush any pending render bytes first so the OSC
                             // query isn't stuck behind a partial stdout write.
                             let _ = io::stdout().flush();
-                            if let Some(reply) = query_outer_osc_color(code, bell_terminated) {
+                            let mut probe_leftover = Vec::new();
+                            if let Some(reply) =
+                                query_outer_osc_color(code, bell_terminated, &mut probe_leftover)
+                            {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
                                     data: reply,
                                 });
                                 proto::send(&mut stream, &msg)?;
                             }
+                            input_filter.inject(&probe_leftover);
                         }
                         ServerMsg::PskUpdated => {
                             flash_msg = Some("PSK updated on server".to_string());
                             flash_deadline =
                                 Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                         }
+                        // Directory messages are answered by CLI paths, not
+                        // inside an attached session.
+                        ServerMsg::PeerList { .. }
+                        | ServerMsg::RegisterAck { .. }
+                        | ServerMsg::RelayAck { .. } => {}
                     }
                 }
+                // GridUpdate/Snapshot carry the child's mouse flags — keep
+                // the outer terminal's reporting modes in sync.
+                sync_mouse_modes(&mut applied_mouse, &grid, &mut mouse_decoder);
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
                 if needs_render && exit_reason.is_none() {
@@ -917,7 +1187,26 @@ pub fn run(
     if let Some(reason) = exit_reason {
         eprintln!("lrmux: {reason}");
     }
-    Ok(())
+    Ok(if want_selector {
+        let tcp = crate::ipc::tcp_addr();
+        ClientExit::Selector(SelectHint {
+            server: if tcp.is_none() {
+                socket_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            } else {
+                None
+            },
+            tcp,
+            session: if current_session.is_empty() {
+                None
+            } else {
+                Some(current_session)
+            },
+        })
+    } else {
+        ClientExit::Done
+    })
 }
 
 /// Log file for a server socket at `/tmp/lrmux-<UID>/<name>` lives at
@@ -938,7 +1227,8 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
 }
 
 /// Process input bytes through the prefix-key state machine.
-/// Returns (passthrough, detach, confirm, remaining, enter_copy_mode, paste).
+/// Returns (passthrough, detach, to_selector, confirm, remaining,
+/// enter_copy_mode, paste, flash, show_help, request_session_chooser).
 /// When a confirm dialog is triggered, remaining bytes after the trigger are returned
 /// so the caller can process them with process_confirm.
 #[allow(clippy::type_complexity)]
@@ -952,6 +1242,7 @@ fn process_prefix(
 ) -> io::Result<(
     Vec<u8>,
     bool,
+    bool,
     Option<ConfirmState>,
     Vec<u8>,
     bool,
@@ -962,6 +1253,7 @@ fn process_prefix(
 )> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
+    let mut to_selector = false;
     let mut confirm: Option<ConfirmState> = None;
     let mut enter_copy_mode = false;
     let mut paste = false;
@@ -975,6 +1267,7 @@ fn process_prefix(
             return Ok((
                 passthrough,
                 detach,
+                to_selector,
                 confirm,
                 input[i..].to_vec(),
                 enter_copy_mode,
@@ -1030,6 +1323,11 @@ fn process_prefix(
                     // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
                     b'd' | 0x04 => {
                         detach = true;
+                    }
+                    // '/' → detach and return to the session/server selector.
+                    b'/' => {
+                        detach = true;
+                        to_selector = true;
                     }
                     // 'x' → kill pane (no confirmation, immediate).
                     b'x' => {
@@ -1130,6 +1428,7 @@ fn process_prefix(
     Ok((
         passthrough,
         detach,
+        to_selector,
         confirm,
         Vec::new(),
         enter_copy_mode,
@@ -1690,9 +1989,27 @@ fn apply_row(grid: &mut Grid, row: usize, cells: &[Cell]) {
 /// Restore the terminal (exit alternate screen, show cursor).
 fn restore_terminal() {
     let mut stdout = io::stdout();
-    // Reset scroll region to full screen, show cursor, clear screen.
+    // Disable mouse reporting we may have enabled, reset scroll region
+    // to full screen, show cursor, clear screen.
+    let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
     let _ = stdout.write_all(b"\x1b[r\x1b[?25h\x1b[2J\x1b[H");
     let _ = stdout.flush();
+}
+
+/// Keep the outer terminal's mouse reporting in sync with the child's
+/// requested tracking mask. Reporting is always on while attached (it
+/// backs local drag-to-select), only the tracking level changes.
+fn sync_mouse_modes(applied: &mut Option<u8>, grid: &Grid, decoder: &mut mouse::Decoder) {
+    let desired = grid.mouse_tracking;
+    if *applied == Some(desired) {
+        return;
+    }
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
+    let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
+    let _ = stdout.flush();
+    *applied = Some(desired);
+    decoder.set_active(true);
 }
 
 /// Try to parse a complete server frame from the buffer.
@@ -1833,6 +2150,7 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A r", "Refresh screen"),
         ("Ctrl-A ,", "Network / PSK setup"),
         ("Ctrl-A d / Ctrl-D", "Detach"),
+        ("Ctrl-A /", "Detach to session selector"),
         ("Ctrl-A \\", "Show server log"),
         ("Ctrl-A ?", "Show this help"),
     ];
@@ -1858,11 +2176,17 @@ fn show_help_overlay(server_version: &str) {
 }
 
 /// Query OSC 10/11 on the outer TTY and send `TermPalette` to the server.
-pub(crate) fn report_outer_term_palette(stream: &mut impl Write) -> io::Result<()> {
-    let fg = query_outer_osc_color(10, true)
+/// Non-reply bytes picked up while probing (user keystrokes read
+/// alongside the reply) go into `extra_input` for the caller to re-feed
+/// as input instead of dropping them.
+pub(crate) fn report_outer_term_palette(
+    stream: &mut impl Write,
+    extra_input: &mut Vec<u8>,
+) -> io::Result<()> {
+    let fg = query_outer_osc_color(10, true, extra_input)
         .and_then(|d| crate::term::parse_osc_color_reply(&d))
         .map(|(_, rgb)| rgb);
-    let bg = query_outer_osc_color(11, true)
+    let bg = query_outer_osc_color(11, true, extra_input)
         .and_then(|d| crate::term::parse_osc_color_reply(&d))
         .map(|(_, rgb)| rgb);
     if fg.is_none() && bg.is_none() {
@@ -1877,7 +2201,11 @@ pub(crate) fn report_outer_term_palette(stream: &mut impl Write) -> io::Result<(
 /// Tries stdout/stdin first (the fds the interactive client already has on
 /// the user's terminal), then `/dev/tty` as a fallback. A failed query
 /// surfaces as vim E1568 and wrong `background` / colorscheme colors.
-pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<Vec<u8>> {
+pub(crate) fn query_outer_osc_color(
+    code: u8,
+    bell_terminated: bool,
+    extra_input: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
     }
@@ -1894,10 +2222,12 @@ pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<V
 
     // Prefer the fds we already own; fall back to /dev/tty (needed for -CC
     // where stdout is the control-mode channel, not a raw terminal).
-    if let Some(reply) = query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query) {
+    if let Some(reply) =
+        query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query, extra_input)
+    {
         return Some(reply);
     }
-    query_osc_via_dev_tty(&query)
+    query_osc_via_dev_tty(&query, extra_input)
 }
 
 /// Control-mode variant: never write OSC to stdout (that's the tmux control
@@ -1905,6 +2235,7 @@ pub(crate) fn query_outer_osc_color(code: u8, bell_terminated: bool) -> Option<V
 pub(crate) fn query_outer_osc_color_for_control(
     code: u8,
     bell_terminated: bool,
+    extra_input: &mut Vec<u8>,
 ) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
@@ -1918,10 +2249,10 @@ pub(crate) fn query_outer_osc_color_for_control(
     } else {
         query.extend_from_slice(b"\x1b\\");
     }
-    query_osc_via_dev_tty(&query)
+    query_osc_via_dev_tty(&query, extra_input)
 }
 
-fn query_osc_via_dev_tty(query: &[u8]) -> Option<Vec<u8>> {
+fn query_osc_via_dev_tty(query: &[u8], extra_input: &mut Vec<u8>) -> Option<Vec<u8>> {
     let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
     if fd < 0 {
         return None;
@@ -1935,10 +2266,20 @@ fn query_osc_via_dev_tty(query: &[u8]) -> Option<Vec<u8>> {
         }
     }
     let tty = TtyFd(fd);
-    query_osc_on_fds(tty.0, tty.0, query)
+    query_osc_on_fds(tty.0, tty.0, query, extra_input)
 }
 
-fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>> {
+/// Returns the OSC reply, or None on timeout. Bytes read that are not
+/// part of the reply — pending input drained up front, user keystrokes
+/// arriving mid-wait, trailing bytes after the reply — are appended to
+/// `extra_input` so the caller can re-feed them instead of swallowing
+/// what the user typed while we were blocked probing.
+fn query_osc_on_fds(
+    read_fd: i32,
+    write_fd: i32,
+    query: &[u8],
+    extra_input: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     // Disable ECHO while waiting for the reply. Interactive clients are
     // already raw, but control-mode / edge paths can still be cooked — and
     // an echoed OSC reply paints garbage on the user's screen.
@@ -1975,7 +2316,8 @@ fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>
     }
     let _echo_guard = RestoreEcho(saved_termios.map(|t| (read_fd, t)));
 
-    // Drain pending input so leftover key bytes aren't mistaken for the reply.
+    // Drain pending input so leftover key bytes aren't mistaken for the
+    // reply — but keep them: they are real user input, not garbage.
     let fl = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
     if fl >= 0 {
         unsafe {
@@ -1987,6 +2329,7 @@ fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>
         loop {
             let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
             if n > 0 {
+                extra_input.extend_from_slice(&tmp[..n as usize]);
                 continue;
             }
             break;
@@ -2035,15 +2378,21 @@ fn query_osc_on_fds(read_fd: i32, write_fd: i32, query: &[u8]) -> Option<Vec<u8>
         }
         buf.extend_from_slice(&tmp[..n as usize]);
         if let Some(end) = osc_reply_end(&buf) {
-            if let Some(start) = buf.windows(2).position(|w| w == b"\x1b]") {
-                break Some(buf[start..end].to_vec());
-            }
-            break Some(buf[..end].to_vec());
+            // Anything before/after the reply bytes is user input that
+            // raced the probe — hand it back, don't eat it.
+            let start = buf.windows(2).position(|w| w == b"\x1b]").unwrap_or(0);
+            extra_input.extend_from_slice(&buf[..start]);
+            extra_input.extend_from_slice(&buf[end..]);
+            break Some(buf[start..end].to_vec());
         }
         if buf.len() > 4096 {
             break None;
         }
     };
+    if result.is_none() {
+        // Timed out mid-reply (or got only input): return what we read.
+        extra_input.extend_from_slice(&buf);
+    }
     if fl >= 0 {
         unsafe {
             libc::fcntl(read_fd, libc::F_SETFL, fl);

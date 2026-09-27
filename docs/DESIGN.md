@@ -136,9 +136,10 @@ All elements are configurable and the status bar can be disabled entirely.
 
 ### 2.10 Mouse support
 
-- **lrmux does not parse or handle mouse events.** All mouse input (scroll wheel, clicks, drags) is passed through to the child process untouched, exactly like every other non-prefix key.
-- This keeps the passthrough invariant pure: only the prefix key (and optionally F-keys) is ever intercepted; everything else — keyboard and mouse alike — flows to the child. AI CLIs, TUIs, and terminal apps that use the mouse get full, unmodified mouse control.
-- No mouse-related config option is needed in v1 (there's nothing to toggle). If mouse-aware features like click-to-select-pane or drag-to-resize are ever added, they would be a separate opt-in layer in a future phase.
+- **Mouse events are never consumed by lrmux.** When the child enables mouse tracking (DECSET 1000/1002/1003), the client enables reporting on the outer terminal and forwards each event to the pane, re-encoded in the format the child requested: legacy X10, UTF-8 extended (1005) or SGR (1006). The server-side VT parser tracks the requested modes and ships them to the client in `GridSnapshot`/`GridUpdate` (`mouse_flags` byte); the client decodes terminal reports (SGR is requested, X10 tolerated) and re-encodes — preserving the passthrough invariant.
+- Alternate scroll (DECSET 1007): when a child sets it without a tracking mode, wheel ticks are translated into three arrow-key presses (app-cursor-keys aware) — the standard xterm behavior.
+- **Local selection**: the client always keeps the outer terminal in button-event reporting (1002+1006) while attached. When the child requests no mouse handling, a left-drag selects text against the client-side grid — never including pane borders, filler, or the status bar — and releasing copies it (clipboard + internal paste buffer), exiting copy mode. A plain click without drag does nothing. The wheel scrolls copy-mode scrollback (enters on wheel-up, exits at the bottom). Local handling also takes over whenever copy mode is active, even if the child tracks the mouse.
+- Reporting is disabled again when the child turns tracking off, and always restored on client exit.
 
 ### 2.11 Window numbering
 
@@ -474,6 +475,7 @@ These are the keybindings for the first working version — enough to use lrmux 
 | `[` | Enter scrollback/copy mode |
 | `?` | Show keybindings (help) |
 | `d` | Detach from session |
+| `/` | Detach and return to the session/server selector |
 | `x` | Kill active pane (with confirmation) |
 | `M` | Open session manager (switch/create session or server without detaching) |
 | Double prefix | Send literal prefix key to child |
@@ -704,6 +706,7 @@ clipboard_cmd = ""          # empty = auto-detect (pbcopy/xclip/wl-copy)
 - **Config** `~/.config/lrmux/config.toml` `[network]`: `tcp_listen` (empty = off; `"auto"` or `host:port+` = first free port from that port / 17280; `host:port` = exact), `ws_listen`, `discovery`, `discovery_port` (default 17280), `tls` (`off`|`on`|`auto`), `psk` (alias `auth_token`), `safe_networks` (CIDR list, **default empty** ⇒ `tls=auto` requires TLS for every TCP peer), optional cert paths. All off / safe defaults.
 - **UDP discovery**: servers with TCP/WS (or `discovery = true`) answer Discover probes with unicast Announce. CLI `discover` / `ls` / `ls-servers` / selector share one inventory module and tag LAN entries.
 - **TCP session transport**: same binary framing as Unix; interactive client and `-CC` connect via `--tcp host:port` (optional `--psk`).
+- **ASCII command mode**: the TCP listener sniffs the first bytes of each connection — anything that is not a binary length-prefixed frame is treated as the line-based text protocol, so `nc`/`telnet` can drive it: `help`, `version`, `ls`, `peers`, `auth <psk>`, `quit`. Same auth rules as the binary protocol (PSK required on TCP when configured, via the `auth` command); plaintext is only reachable where the network policy already allows it. Per-command reads are deadline-bounded so an idle ASCII connection cannot stall the accept path.
 - **WebSocket + browser client**: `ws_listen` / `start-server --ws addr`; `ConnStream::Ws` bridges tungstenite binary frames to the same length-prefixed proto. MVP client in `web/` (Identify + PSK, grid render, keyboard input). WSS via reverse proxy; Rust/WASM client deferred.
 - **PSK auth**: non-empty `psk` required on TCP/WS Identify; Unix sockets skip PSK. CLI `lrmux psk show|set|generate`; in-session `Ctrl-A ,` scaffolding; `SetPsk` hot-applies + persists.
 - **TLS (rustls)**: TCP only; `auto` uses `safe_networks`; self-signed cert bootstrap under `~/.config/lrmux/certs/`.

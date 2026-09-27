@@ -21,6 +21,25 @@ pub struct SessionInfo {
     pub has_activity: bool,
 }
 
+/// One peer in a `PeerList` response — a flattened view of the
+/// directory's cache entry.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    /// Stable UUID (empty for v1-only peers that never sent one).
+    pub server_id: String,
+    pub name: String,
+    /// "host:port" connect string for the peer's TCP listener.
+    pub addr: String,
+    pub tls: bool,
+    pub fingerprint: String,
+    /// "announced" | "verified" | "stale"
+    pub state: String,
+    /// The directory could authenticate to this peer with our PSK.
+    pub psk_ok: bool,
+    /// Session names from the last verified poll.
+    pub sessions: Vec<String>,
+}
+
 // ── Message types ───────────────────────────────────────────────────
 
 /// Client → Server messages.
@@ -127,6 +146,24 @@ pub enum ClientMsg {
     /// Set / replace the server PSK (hot-apply + persist). Scaffolding for
     /// in-session network setup; fullscreen config editor comes later.
     SetPsk { psk: String },
+    /// Request the peer table from a directory node (SessionManager).
+    /// Requires an authenticated connection.
+    ListPeers,
+    /// Register this server with a directory node. Peers announce over
+    /// UDP too, but registration works where broadcast can't reach.
+    Register {
+        server_id: String,
+        name: String,
+        tcp_port: u16,
+        tls: bool,
+        fingerprint: String,
+    },
+    /// Ask this node to open a raw byte pipe to `addr` (a peer's
+    /// host:port). After RelayAck{ok} the connection carries opaque
+    /// bytes — the client typically runs a fresh TLS + Identify to the
+    /// target through it. Requires an authenticated connection and
+    /// relay enabled on the node.
+    RelayOpen { addr: String },
 }
 
 /// Server → Client messages.
@@ -147,6 +184,9 @@ pub enum ServerMsg {
         cursor_row: u16,
         cursor_col: u16,
         cursor_visible: bool,
+        /// Packed mouse state (`Grid::mouse_flags`). Missing on messages
+        /// from an older server (pre-mouse): decode as 0.
+        mouse_flags: u8,
     },
     /// Dirty rows update (sent after PTY output is parsed into the grid).
     GridUpdate {
@@ -154,6 +194,9 @@ pub enum ServerMsg {
         cursor_row: u16,
         cursor_col: u16,
         cursor_visible: bool,
+        /// Packed mouse state (`Grid::mouse_flags`). Missing on messages
+        /// from an older server: decode as 0.
+        mouse_flags: u8,
     },
     /// Scrollback rows that scrolled off the top since the last update.
     /// Sent before GridUpdate so the client can push them to scrollback.
@@ -202,6 +245,13 @@ pub enum ServerMsg {
     },
     /// Acknowledge SetPsk (PSK was applied on the server).
     PskUpdated,
+    /// Peer table (response to ListPeers).
+    PeerList { peers: Vec<PeerInfo> },
+    /// Acknowledge Register (response to Register).
+    RegisterAck { ok: bool, reason: String },
+    /// Acknowledge RelayOpen. On `ok` the connection becomes a raw byte
+    /// pipe to the requested address — no more framed messages.
+    RelayAck { ok: bool, reason: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -233,6 +283,9 @@ const C_REFRESH: u8 = 0x18;
 const C_TERM_OSC_REPLY: u8 = 0x19;
 const C_TERM_PALETTE: u8 = 0x1a;
 const C_SET_PSK: u8 = 0x1b;
+const C_LIST_PEERS: u8 = 0x1c;
+const C_REGISTER: u8 = 0x1d;
+const C_RELAY_OPEN: u8 = 0x1e;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -247,6 +300,9 @@ const S_LOG_CONTENT: u8 = 0x19;
 const S_CONTROL_NOTIFY: u8 = 0x1a;
 const S_TERM_OSC_QUERY: u8 = 0x1b;
 const S_PSK_UPDATED: u8 = 0x1c;
+const S_PEER_LIST: u8 = 0x1d;
+const S_REGISTER_ACK: u8 = 0x1e;
+const S_RELAY_ACK: u8 = 0x1f;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -487,6 +543,31 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.extend_from_slice(&(psk.len() as u32).to_le_bytes());
             payload.extend_from_slice(psk.as_bytes());
         }
+        ClientMsg::ListPeers => {
+            payload.push(C_LIST_PEERS);
+        }
+        ClientMsg::Register {
+            server_id,
+            name,
+            tcp_port,
+            tls,
+            fingerprint,
+        } => {
+            payload.push(C_REGISTER);
+            payload.extend_from_slice(&(server_id.len() as u32).to_le_bytes());
+            payload.extend_from_slice(server_id.as_bytes());
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&tcp_port.to_le_bytes());
+            payload.push(if *tls { 1 } else { 0 });
+            payload.extend_from_slice(&(fingerprint.len() as u32).to_le_bytes());
+            payload.extend_from_slice(fingerprint.as_bytes());
+        }
+        ClientMsg::RelayOpen { addr } => {
+            payload.push(C_RELAY_OPEN);
+            payload.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+            payload.extend_from_slice(addr.as_bytes());
+        }
     }
     frame(payload)
 }
@@ -516,6 +597,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             cursor_row,
             cursor_col,
             cursor_visible,
+            mouse_flags,
         } => {
             payload.push(S_GRID_SNAPSHOT);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -527,12 +609,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_row.to_le_bytes());
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
+            payload.push(*mouse_flags);
         }
         ServerMsg::GridUpdate {
             dirty,
             cursor_row,
             cursor_col,
             cursor_visible,
+            mouse_flags,
         } => {
             payload.push(S_GRID_UPDATE);
             payload.extend_from_slice(&(dirty.len() as u32).to_le_bytes());
@@ -546,6 +630,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_row.to_le_bytes());
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
+            payload.push(*mouse_flags);
         }
         ServerMsg::ScrollbackUpdate { rows, replay } => {
             payload.push(S_SCROLLBACK_UPDATE);
@@ -638,6 +723,41 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
         ServerMsg::PskUpdated => {
             payload.push(S_PSK_UPDATED);
         }
+        ServerMsg::PeerList { peers } => {
+            payload.push(S_PEER_LIST);
+            payload.extend_from_slice(&(peers.len() as u32).to_le_bytes());
+            for p in peers {
+                payload.extend_from_slice(&(p.server_id.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.server_id.as_bytes());
+                payload.extend_from_slice(&(p.name.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.name.as_bytes());
+                payload.extend_from_slice(&(p.addr.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.addr.as_bytes());
+                payload.push(if p.tls { 1 } else { 0 });
+                payload.extend_from_slice(&(p.fingerprint.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.fingerprint.as_bytes());
+                payload.extend_from_slice(&(p.state.len() as u32).to_le_bytes());
+                payload.extend_from_slice(p.state.as_bytes());
+                payload.push(if p.psk_ok { 1 } else { 0 });
+                payload.extend_from_slice(&(p.sessions.len() as u32).to_le_bytes());
+                for s in &p.sessions {
+                    payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        ServerMsg::RegisterAck { ok, reason } => {
+            payload.push(S_REGISTER_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
+        }
+        ServerMsg::RelayAck { ok, reason } => {
+            payload.push(S_RELAY_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
+        }
     }
     frame(payload)
 }
@@ -694,7 +814,7 @@ fn encode_attr(buf: &mut Vec<u8>, attrs: Attr) {
 // ── Decode ──────────────────────────────────────────────────────────
 
 /// Read one framed message from a stream. Returns the type tag + payload.
-fn read_frame<R: Read>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
+fn read_frame<R: Read + ?Sized>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -711,7 +831,7 @@ fn read_frame<R: Read>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
 }
 
 /// Read and decode a client message from a stream.
-pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
+pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> {
     let (tag, data) = read_frame(reader)?;
     let mut r = &data[..];
     match tag {
@@ -976,6 +1096,25 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
             let psk = String::from_utf8_lossy(&r[..len]).into_owned();
             Ok(ClientMsg::SetPsk { psk })
         }
+        C_LIST_PEERS => Ok(ClientMsg::ListPeers),
+        C_REGISTER => {
+            let server_id = read_len_string(&mut r)?;
+            let name = read_len_string(&mut r)?;
+            let tcp_port = read_u16(&mut r)?;
+            let tls = read_u8(&mut r)? != 0;
+            let fingerprint = read_len_string(&mut r)?;
+            Ok(ClientMsg::Register {
+                server_id,
+                name,
+                tcp_port,
+                tls,
+                fingerprint,
+            })
+        }
+        C_RELAY_OPEN => {
+            let addr = read_len_string(&mut r)?;
+            Ok(ClientMsg::RelayOpen { addr })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -984,7 +1123,7 @@ pub fn decode_client<R: Read>(reader: &mut R) -> io::Result<ClientMsg> {
 }
 
 /// Read and decode a server message from a stream.
-pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
+pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> {
     let (tag, data) = read_frame(reader)?;
     let mut r = &data[..];
     match tag {
@@ -1023,6 +1162,8 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let cursor_row = read_u16(&mut r)?;
             let cursor_col = read_u16(&mut r)?;
             let cursor_visible = read_u8(&mut r)? != 0;
+            // Trailing field — absent on pre-mouse servers.
+            let mouse_flags = if r.is_empty() { 0 } else { read_u8(&mut r)? };
             Ok(ServerMsg::GridSnapshot {
                 rows,
                 cols,
@@ -1030,6 +1171,7 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
                 cursor_row,
                 cursor_col,
                 cursor_visible,
+                mouse_flags,
             })
         }
         S_GRID_UPDATE => {
@@ -1047,11 +1189,14 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             let cursor_row = read_u16(&mut r)?;
             let cursor_col = read_u16(&mut r)?;
             let cursor_visible = read_u8(&mut r)? != 0;
+            // Trailing field — absent on pre-mouse servers.
+            let mouse_flags = if r.is_empty() { 0 } else { read_u8(&mut r)? };
             Ok(ServerMsg::GridUpdate {
                 dirty,
                 cursor_row,
                 cursor_col,
                 cursor_visible,
+                mouse_flags,
             })
         }
         S_SCROLLBACK_UPDATE => {
@@ -1195,6 +1340,45 @@ pub fn decode_server<R: Read>(reader: &mut R) -> io::Result<ServerMsg> {
             })
         }
         S_PSK_UPDATED => Ok(ServerMsg::PskUpdated),
+        S_PEER_LIST => {
+            let count = read_u32(&mut r)? as usize;
+            let mut peers = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let server_id = read_len_string(&mut r)?;
+                let name = read_len_string(&mut r)?;
+                let addr = read_len_string(&mut r)?;
+                let tls = read_u8(&mut r)? != 0;
+                let fingerprint = read_len_string(&mut r)?;
+                let state = read_len_string(&mut r)?;
+                let psk_ok = read_u8(&mut r)? != 0;
+                let n = read_u32(&mut r)? as usize;
+                let mut sessions = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    sessions.push(read_len_string(&mut r)?);
+                }
+                peers.push(PeerInfo {
+                    server_id,
+                    name,
+                    addr,
+                    tls,
+                    fingerprint,
+                    state,
+                    psk_ok,
+                    sessions,
+                });
+            }
+            Ok(ServerMsg::PeerList { peers })
+        }
+        S_REGISTER_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::RegisterAck { ok, reason })
+        }
+        S_RELAY_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::RelayAck { ok, reason })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -1240,6 +1424,20 @@ fn decode_attr(r: &mut &[u8]) -> io::Result<Attr> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Mandatory u32-length-prefixed string (fails on truncation).
+fn read_len_string(r: &mut &[u8]) -> io::Result<String> {
+    let len = read_u32(r)? as usize;
+    if r.len() < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated string",
+        ));
+    }
+    let s = String::from_utf8_lossy(&r[..len]).into_owned();
+    *r = &r[len..];
+    Ok(s)
+}
 
 /// Read a length-prefixed UTF-8 string if enough bytes remain; else empty.
 /// Used for optional trailing auth_token on Identify (backward compatible).
@@ -1311,7 +1509,7 @@ fn read_u64(r: &mut &[u8]) -> io::Result<u64> {
 }
 
 /// Write a framed message to a stream.
-pub fn send<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
+pub fn send<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.write_all(bytes)?;
     writer.flush()?;
     Ok(())
@@ -1369,6 +1567,149 @@ mod tests {
                 assert_eq!(sessions[0].attached, 2);
                 assert!(sessions[0].has_activity);
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_messages_roundtrip() {
+        let reg = encode_client(&ClientMsg::Register {
+            server_id: "8b2f0a1e-4c3d-4e5f-9a0b-1c2d3e4f5a6b".into(),
+            name: "work".into(),
+            tcp_port: 17280,
+            tls: true,
+            fingerprint: "ab00".into(),
+        });
+        match decode_client(&mut &reg[..]).unwrap() {
+            ClientMsg::Register {
+                server_id,
+                name,
+                tcp_port,
+                tls,
+                fingerprint,
+            } => {
+                assert_eq!(server_id, "8b2f0a1e-4c3d-4e5f-9a0b-1c2d3e4f5a6b");
+                assert_eq!(name, "work");
+                assert_eq!(tcp_port, 17280);
+                assert!(tls);
+                assert_eq!(fingerprint, "ab00");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let bytes = encode_client(&ClientMsg::ListPeers);
+        assert!(matches!(
+            decode_client(&mut &bytes[..]).unwrap(),
+            ClientMsg::ListPeers
+        ));
+
+        let list = encode_server(&ServerMsg::PeerList {
+            peers: vec![PeerInfo {
+                server_id: "id".into(),
+                name: "work".into(),
+                addr: "10.0.0.7:17280".into(),
+                tls: true,
+                fingerprint: "ff".into(),
+                state: "verified".into(),
+                psk_ok: true,
+                sessions: vec!["main".into(), "music".into()],
+            }],
+        });
+        match decode_server(&mut &list[..]).unwrap() {
+            ServerMsg::PeerList { peers } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].addr, "10.0.0.7:17280");
+                assert_eq!(peers[0].sessions, vec!["main", "music"]);
+                assert!(peers[0].psk_ok);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let ack = encode_server(&ServerMsg::RegisterAck {
+            ok: false,
+            reason: "registrations disabled".into(),
+        });
+        match decode_server(&mut &ack[..]).unwrap() {
+            ServerMsg::RegisterAck { ok, reason } => {
+                assert!(!ok);
+                assert_eq!(reason, "registrations disabled");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_messages_roundtrip() {
+        let open = encode_client(&ClientMsg::RelayOpen {
+            addr: "10.0.0.7:17280".into(),
+        });
+        match decode_client(&mut &open[..]).unwrap() {
+            ClientMsg::RelayOpen { addr } => assert_eq!(addr, "10.0.0.7:17280"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        for (ok, reason) in [(true, ""), (false, "relay disabled")] {
+            let ack = encode_server(&ServerMsg::RelayAck {
+                ok,
+                reason: reason.into(),
+            });
+            match decode_server(&mut &ack[..]).unwrap() {
+                ServerMsg::RelayAck { ok: got, reason: r } => {
+                    assert_eq!(got, ok);
+                    assert_eq!(r, reason);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn grid_messages_carry_mouse_flags() {
+        let snap = encode_server(&ServerMsg::GridSnapshot {
+            rows: 24,
+            cols: 80,
+            cells: vec![],
+            cursor_row: 1,
+            cursor_col: 2,
+            cursor_visible: true,
+            mouse_flags: 0x4e, // tracking 1002|1003, SGR fmt, altscroll, app cur
+        });
+        match decode_server(&mut &snap[..]).unwrap() {
+            ServerMsg::GridSnapshot { mouse_flags, .. } => assert_eq!(mouse_flags, 0x4e),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let upd = encode_server(&ServerMsg::GridUpdate {
+            dirty: vec![],
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            mouse_flags: 0x12,
+        });
+        match decode_server(&mut &upd[..]).unwrap() {
+            ServerMsg::GridUpdate { mouse_flags, .. } => assert_eq!(mouse_flags, 0x12),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grid_messages_without_flags_decode_zero() {
+        // A pre-mouse server sends no trailing byte — decode as 0.
+        let mut snap = encode_server(&ServerMsg::GridSnapshot {
+            rows: 24,
+            cols: 80,
+            cells: vec![],
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mouse_flags: 0x55,
+        });
+        snap.pop(); // strip the trailing mouse_flags byte
+        // Fix the length prefix so the frame stays well-formed.
+        let len = u32::from_le_bytes([snap[0], snap[1], snap[2], snap[3]]) - 1;
+        snap[..4].copy_from_slice(&len.to_le_bytes());
+        match decode_server(&mut &snap[..]).unwrap() {
+            ServerMsg::GridSnapshot { mouse_flags, .. } => assert_eq!(mouse_flags, 0),
             other => panic!("unexpected {other:?}"),
         }
     }

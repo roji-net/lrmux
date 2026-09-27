@@ -56,6 +56,11 @@ struct ClientConn {
     /// True when connected over TCP (plain or TLS). Unix clients skip
     /// auth_token checks (filesystem permissions are the gate).
     is_tcp: bool,
+    /// Relay mode: after a RelayAck{ok} this connection is a raw byte
+    /// pipe to `relay_peer` — framed messages stop being parsed.
+    relay_peer: Option<std::net::TcpStream>,
+    /// Client→peer bytes pending a peer POLLOUT.
+    relay_in: Vec<u8>,
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
@@ -85,6 +90,71 @@ impl ClientConn {
             suppressed: false,
             palette: super::capture::TerminalPalette::default(),
             is_tcp,
+            relay_peer: None,
+            relay_in: Vec::new(),
+        }
+    }
+}
+
+/// Cap on client→peer relay bytes buffered for a slow upstream.
+const RELAY_IN_CAP: usize = 1024 * 1024;
+
+/// The relay peer is gone (EOF or error). Half-close the pipe: drop the
+/// peer, discard undelivered client→peer bytes, and let outbuf drain to
+/// the client before disconnecting it. The peer may have finished a
+/// request/response exchange — e.g. ListSessions — and closed cleanly,
+/// so the buffered response must still reach the client.
+fn relay_teardown(client: &mut ClientConn) {
+    client.relay_peer = None;
+    client.relay_in.clear();
+    client.close_when_idle = true;
+}
+
+/// Copy as much pending client→peer relay data as the peer accepts.
+/// Returns false when the peer socket broke (drop the client).
+fn flush_relay_in(client: &mut ClientConn) -> bool {
+    let Some(peer) = client.relay_peer.as_mut() else {
+        return true;
+    };
+    while !client.relay_in.is_empty() {
+        match peer.write(&client.relay_in) {
+            Ok(0) => return false,
+            Ok(n) => {
+                client.relay_in.drain(..n);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Read peer bytes into the client's outbound buffer (relayed back).
+/// Returns false when the client is too far behind (outbuf cap).
+fn pump_relay_peer(client: &mut ClientConn) -> bool {
+    let Some(peer) = client.relay_peer.as_mut() else {
+        return true;
+    };
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match peer.read(&mut buf) {
+            Ok(0) => {
+                relay_teardown(client);
+                return true;
+            }
+            Ok(n) => {
+                if client.outbuf.len().saturating_add(n) > CLIENT_OUTBUF_CAP {
+                    return false;
+                }
+                client.outbuf.extend_from_slice(&buf[..n]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(_) => {
+                relay_teardown(client);
+                return true;
+            }
         }
     }
 }
@@ -215,13 +285,19 @@ pub fn run(
     listeners: Vec<crate::ipc::ConnListener>,
     socket_path: &std::path::Path,
     headless: bool,
+    manager: bool,
     discovery_sock: Option<std::net::UdpSocket>,
 ) -> io::Result<()> {
     // Capture once at startup. Probes (ListSessions) and failed first
     // handshakes must not consume / lose `new-server -- cmd` options.
     let boot = take_bootstrap();
 
-    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if headless {
+    let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if manager {
+        // Manager role: pure directory/broker, no sessions, no waiting
+        // for a first client. Stays up until killed.
+        crate::log::info("server started in manager mode (no sessions)");
+        (24u16, 80u16, Vec::new(), Vec::new())
+    } else if headless {
         // Headless mode: create a default session (24x80) without waiting
         // for the first client. Used by `lrmux new-server --headless`
         // (`start-server` is the same) for testing and remote management.
@@ -264,6 +340,31 @@ pub fn run(
     }
     let listener_fds: Vec<i32> = listeners.iter().map(|l| l.as_raw_fd()).collect();
 
+    // Our own TCP listen addresses — RelayOpen targets pointing back at
+    // us are refused: the synchronous accept handshake cannot make
+    // progress on a connection the event loop itself must forward.
+    // Wildcard listeners additionally match loopback targets on the
+    // same port (127.0.0.1:P is us when we listen on 0.0.0.0:P).
+    let mut self_tcp_addrs = std::collections::HashSet::new();
+    let mut self_tcp_ports_wildcard = std::collections::HashSet::new();
+    for l in &listeners {
+        let t = match l {
+            crate::ipc::stream::ConnListener::Tcp(t) | crate::ipc::stream::ConnListener::Ws(t) => t,
+            crate::ipc::stream::ConnListener::Unix(_) => continue,
+        };
+        if let Ok(sa) = t.local_addr() {
+            if sa.ip().is_unspecified() {
+                self_tcp_ports_wildcard.insert(sa.port());
+            } else {
+                self_tcp_addrs.insert(sa);
+            }
+        }
+    }
+    let self_relay_target = |sa: &std::net::SocketAddr| {
+        self_tcp_addrs.contains(sa)
+            || (sa.ip().is_loopback() && self_tcp_ports_wildcard.contains(&sa.port()))
+    };
+
     // Client sockets are non-blocking in the main loop: a slow or hung
     // client must never stall the event loop. Outbound data goes through
     // each client's outbuf and is flushed on POLLOUT.
@@ -288,6 +389,51 @@ pub fn run(
         .unwrap_or(0);
     let announce_tls = crate::server::tls_server_config().is_some()
         && !matches!(crate::server::network().tls, crate::config::TlsMode::Off);
+
+    // Active announces (startup + heartbeat + leaving) when the config
+    // knob is on and a TCP port exists to point peers at. The deadline
+    // bounds poll() so heartbeats fire even on an idle server.
+    let announce_on = crate::server::network().announce && announce_tcp_port != 0;
+    let mut next_announce = announce_on.then(std::time::Instant::now);
+
+    // Peer directory: held when this node is a manager, a directory, or
+    // accepts registrations. Fed by UDP announces and Register messages,
+    // and verified over TCP when [peers] poll = true.
+    let peers_cfg = &crate::config::global().peers;
+    let mut peer_cache = (manager || peers_cfg.directory || peers_cfg.accept_registrations)
+        .then(|| crate::peers::PeerCache::load(peers_cfg.ttl_secs));
+
+    // Register ourselves with configured managers (bounded, best-effort).
+    // Skip entries that resolve to our own listener — registering with
+    // ourselves would just wait out the timeout.
+    let own_tcp_addr = listeners.iter().find_map(|l| match l {
+        crate::ipc::ConnListener::Tcp(t) => t.local_addr().ok(),
+        _ => None,
+    });
+    if announce_tcp_port != 0 {
+        for m in &peers_cfg.managers {
+            if std::net::ToSocketAddrs::to_socket_addrs(m.as_str())
+                .ok()
+                .is_some_and(|mut it| {
+                    it.any(|a| {
+                        Some(a) == own_tcp_addr
+                            || (a.port() == announce_tcp_port
+                                && (a.ip().is_loopback()
+                                    || own_tcp_addr
+                                        .map(|o| o.ip().is_unspecified() || o.ip() == a.ip())
+                                        .unwrap_or(false)))
+                    })
+                })
+            {
+                crate::log::info(&format!("skipping self manager entry {m}"));
+                continue;
+            }
+            match crate::peers::register(m, announce_tcp_port, announce_tls) {
+                Ok(()) => crate::log::info(&format!("registered with manager {m}")),
+                Err(e) => crate::log::warn(&format!("register with manager {m} failed: {e}")),
+            }
+        }
+    }
 
     loop {
         // Build pollfd array: listeners + discovery + all window PTY fds + all client fds.
@@ -341,8 +487,34 @@ pub fn run(
                 revents: 0,
             });
         }
+        // Relay peers: one extra fd per relayed client. POLLOUT only
+        // while client→peer bytes are queued in relay_in.
+        let relay_base = fds.len();
+        let mut relay_map: Vec<usize> = Vec::new();
+        for (ci, c) in clients.iter().enumerate() {
+            if let Some(ref peer) = c.relay_peer {
+                relay_map.push(ci);
+                fds.push(libc::pollfd {
+                    fd: peer.as_raw_fd(),
+                    events: libc::POLLIN
+                        | if c.relay_in.is_empty() {
+                            0
+                        } else {
+                            libc::POLLOUT
+                        },
+                    revents: 0,
+                });
+            }
+        }
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        let timeout_ms = match next_announce {
+            Some(t) => t
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .clamp(0, i32::MAX as u128) as i32,
+            None => -1,
+        };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -351,55 +523,75 @@ pub fn run(
             return Err(err);
         }
 
+        // Announce heartbeat: broadcast (best-effort) + unicast to
+        // configured scan hosts. Errors inside announce() are ignored.
+        if let Some(t) = next_announce
+            && std::time::Instant::now() >= t
+        {
+            send_announce(
+                discovery_sock.as_ref(),
+                announce_tcp_port,
+                announce_tls,
+                false,
+            );
+            next_announce = Some(std::time::Instant::now() + ANNOUNCE_INTERVAL);
+        }
+
         let polled_clients = clients.len();
 
-        // Listeners readable → accept new client from any listener.
-        for (li, _lfd) in listener_fds.iter().enumerate() {
-            if fds[li].revents & libc::POLLIN != 0 {
-                match accept_new_client(
-                    &listeners[li],
-                    &mut sessions,
-                    grid_rows,
-                    grid_cols,
-                    &mut clients,
-                ) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                        // KillServer received — shut down gracefully.
-                        crate::log::info("KillServer received, shutting down");
-                        kill_all_children(&sessions);
-                        state::save_state(socket_path, &sessions);
-                        broadcast_to_all(
-                            &mut clients,
-                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+        // Discovery UDP: respond to Discover probes with Announce, and
+        // feed incoming Announces into the peer cache (skip our own).
+        if let (Some(di), Some(ds)) = (discovery_idx, discovery_sock.as_ref())
+            && fds[di].revents & libc::POLLIN != 0
+        {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = ds.recv_from(&mut buf) {
+                match crate::ipc::discovery::parse_packet(&buf[..n], from) {
+                    Some(crate::ipc::discovery::ParsedPacket::Discover)
+                        if announce_tcp_port != 0 =>
+                    {
+                        let pkt = crate::ipc::discovery::encode_announce(
+                            crate::server::server_name(),
+                            announce_tcp_port,
+                            announce_tls,
+                            crate::version::VERSION,
+                            crate::server::tls_fingerprint(),
+                            crate::config::server_id(),
+                            false,
                         );
-                        shutdown_flush(&mut clients);
-                        ipc::cleanup(socket_path);
-                        return Ok(());
+                        let _ = ds.send_to(&pkt, from);
                     }
-                    Err(_) => {}
+                    Some(crate::ipc::discovery::ParsedPacket::Announce(ann)) => {
+                        if ann.server_id.as_deref() != Some(crate::config::server_id())
+                            && let Some(cache) = peer_cache.as_mut()
+                        {
+                            cache.upsert_announce(&ann, crate::peers::PeerSource::Broadcast);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Discovery UDP: respond to Discover probes with Announce.
-        if let (Some(di), Some(ds)) = (discovery_idx, discovery_sock.as_ref())
-            && fds[di].revents & libc::POLLIN != 0
-            && announce_tcp_port != 0
+        // Peer polling: verify/refresh due entries over TCP. Synchronous
+        // but bounded (connect_timeout + read deadlines per stage).
+        if crate::config::global().peers.poll
+            && let Some(cache) = peer_cache.as_mut()
         {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, from)) = ds.recv_from(&mut buf) {
-                if let Some(crate::ipc::discovery::ParsedPacket::Discover) =
-                    crate::ipc::discovery::parse_packet(&buf[..n], from)
-                {
-                    let pkt = crate::ipc::discovery::encode_announce(
-                        crate::server::server_name(),
-                        announce_tcp_port,
-                        announce_tls,
-                        crate::version::VERSION,
-                        crate::server::tls_fingerprint(),
-                    );
-                    let _ = ds.send_to(&pkt, from);
+            for key in cache.due_for_poll() {
+                let addr = cache
+                    .get(&key)
+                    .and_then(|e| e.addrs.first().map(|a| format!("{a}:{}", e.tcp_port)));
+                let Some(addr) = addr else { continue };
+                match crate::peers::poll_peer(&addr) {
+                    Ok((sessions, psk_ok)) => {
+                        cache.mark_verified(&key, sessions, "", psk_ok);
+                        crate::log::info(&format!("peer {addr} verified"));
+                    }
+                    Err(e) => {
+                        cache.mark_stale(&key);
+                        crate::log::info(&format!("peer {addr} poll failed: {e}"));
+                    }
                 }
             }
         }
@@ -593,6 +785,19 @@ pub fn run(
                 match read_into_client_buf(&mut clients[client_idx]) {
                     Ok(true) => {
                         crate::log::debug(&format!("read from client {client_idx}"));
+                        if clients[client_idx].relay_peer.is_some() {
+                            // Relay mode: raw bytes, no framing. Queue for
+                            // the peer and drop the client on overflow.
+                            let c = &mut clients[client_idx];
+                            c.relay_in.extend_from_slice(&c.buf);
+                            c.buf.clear();
+                            if c.relay_in.len() > RELAY_IN_CAP {
+                                to_remove.push(client_idx);
+                            } else if !flush_relay_in(c) {
+                                relay_teardown(c);
+                            }
+                            continue;
+                        }
                         loop {
                             match try_parse_frame(&mut clients[client_idx].buf) {
                                 Ok(Some(msg)) => {
@@ -1085,8 +1290,121 @@ pub fn run(
                                                 });
                                             let _ = client_send(&mut clients[client_idx], &msg);
                                         }
+                                        ClientMsg::ListPeers => {
+                                            let peers = peer_cache
+                                                .as_ref()
+                                                .map(|c| c.iter().map(peer_to_info).collect())
+                                                .unwrap_or_default();
+                                            let msg = proto::encode_server(&ServerMsg::PeerList {
+                                                peers,
+                                            });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
+                                        ClientMsg::RelayOpen { addr } => {
+                                            // Raw TCP pipe — the client runs
+                                            // its own TLS/Identify through it
+                                            // (end-to-end to the target).
+                                            let result = if !(manager
+                                                || crate::config::global().peers.relay)
+                                            {
+                                                Err(io::Error::new(
+                                                    io::ErrorKind::PermissionDenied,
+                                                    "relay disabled",
+                                                ))
+                                            } else {
+                                                use std::net::ToSocketAddrs;
+                                                addr.to_socket_addrs()
+                                                    .ok()
+                                                    .and_then(|mut it| it.next())
+                                                    .ok_or_else(|| {
+                                                        io::Error::other(format!(
+                                                            "no address for {addr}"
+                                                        ))
+                                                    })
+                                                    .and_then(|sa| {
+                                                        if self_relay_target(&sa) {
+                                                            Err(io::Error::new(
+                                                                io::ErrorKind::InvalidInput,
+                                                                "refusing to relay to own listener",
+                                                            ))
+                                                        } else {
+                                                            std::net::TcpStream::connect_timeout(
+                                                                &sa,
+                                                                std::time::Duration::from_secs(3),
+                                                            )
+                                                        }
+                                                    })
+                                            };
+                                            match result {
+                                                Ok(peer) => {
+                                                    let _ = peer.set_nonblocking(true);
+                                                    let msg = proto::encode_server(
+                                                        &ServerMsg::RelayAck {
+                                                            ok: true,
+                                                            reason: String::new(),
+                                                        },
+                                                    );
+                                                    let _ =
+                                                        client_send(&mut clients[client_idx], &msg);
+                                                    clients[client_idx].relay_peer = Some(peer);
+                                                }
+                                                Err(e) => {
+                                                    let msg = proto::encode_server(
+                                                        &ServerMsg::RelayAck {
+                                                            ok: false,
+                                                            reason: e.to_string(),
+                                                        },
+                                                    );
+                                                    let _ =
+                                                        client_send(&mut clients[client_idx], &msg);
+                                                }
+                                            }
+                                        }
+                                        ClientMsg::Register {
+                                            server_id,
+                                            name,
+                                            tcp_port,
+                                            tls,
+                                            fingerprint,
+                                        } => {
+                                            let from = clients[client_idx].stream.peer_addr();
+                                            let (ok, reason) = handle_register(
+                                                manager,
+                                                peer_cache.as_mut(),
+                                                from,
+                                                crate::ipc::discovery::Announcement {
+                                                    name,
+                                                    addr: std::net::SocketAddr::new(
+                                                        from.map(|a| a.ip()).unwrap_or(
+                                                            std::net::IpAddr::V4(
+                                                                std::net::Ipv4Addr::UNSPECIFIED,
+                                                            ),
+                                                        ),
+                                                        tcp_port,
+                                                    ),
+                                                    tcp_port,
+                                                    tls,
+                                                    version: String::new(),
+                                                    fingerprint,
+                                                    server_id: Some(server_id),
+                                                    leaving: false,
+                                                },
+                                            );
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::RegisterAck {
+                                                    ok,
+                                                    reason,
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
                                         ClientMsg::KillServer => {
                                             eprintln!("lrmux: KillServer received, shutting down.");
+                                            send_announce(
+                                                discovery_sock.as_ref(),
+                                                announce_tcp_port,
+                                                announce_tls,
+                                                true,
+                                            );
                                             broadcast_to_all(
                                                 &mut clients,
                                                 &proto::encode_server(&ServerMsg::PaneExit {
@@ -1572,6 +1890,64 @@ pub fn run(
             }
         }
 
+        // Relay peer fds: peer→client reads fill outbuf (flushed on the
+        // client's POLLOUT); client→peer queued bytes drain on POLLOUT.
+        for (ri, rpf) in fds[relay_base..].iter().enumerate() {
+            let client_idx = relay_map[ri];
+            if client_idx >= clients.len() || to_remove.contains(&client_idx) {
+                continue;
+            }
+            if rpf.revents & libc::POLLOUT != 0 && !flush_relay_in(&mut clients[client_idx]) {
+                relay_teardown(&mut clients[client_idx]);
+                continue;
+            }
+            if rpf.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                && !pump_relay_peer(&mut clients[client_idx])
+            {
+                to_remove.push(client_idx);
+            }
+        }
+
+        // Listeners readable → accept new client from any listener.
+        // Runs after client/relay I/O: accept_new_client's synchronous
+        // handshake would otherwise stall the loop ahead of work that
+        // ready clients are waiting on — including relay forwarding that
+        // the new connection itself may depend on (self-relay).
+        for (li, _lfd) in listener_fds.iter().enumerate() {
+            if fds[li].revents & libc::POLLIN != 0 {
+                match accept_new_client(
+                    &listeners[li],
+                    &mut sessions,
+                    grid_rows,
+                    grid_cols,
+                    &mut clients,
+                    peer_cache.as_ref(),
+                ) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                        // KillServer received — shut down gracefully.
+                        crate::log::info("KillServer received, shutting down");
+                        send_announce(
+                            discovery_sock.as_ref(),
+                            announce_tcp_port,
+                            announce_tls,
+                            true,
+                        );
+                        kill_all_children(&sessions);
+                        state::save_state(socket_path, &sessions);
+                        broadcast_to_all(
+                            &mut clients,
+                            &proto::encode_server(&ServerMsg::PaneExit { code: 0 }),
+                        );
+                        shutdown_flush(&mut clients);
+                        ipc::cleanup(socket_path);
+                        return Ok(());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
         // Send snapshots + status bar to clients that need them.
         // Handle send failures gracefully — remove the client instead of killing the server.
         let mut snapshot_failures: Vec<usize> = Vec::new();
@@ -1616,7 +1992,9 @@ pub fn run(
         }
 
         // If no sessions and no clients, or kill-server was requested, exit.
-        if shutdown || (sessions.is_empty() && clients.is_empty()) {
+        // A manager stays up with no sessions and no clients — it is the
+        // rendezvous point other nodes register with and clients query.
+        if shutdown || (sessions.is_empty() && clients.is_empty() && !manager) {
             break;
         }
 
@@ -1625,14 +2003,92 @@ pub fn run(
         if iter_count.is_multiple_of(1000) && !sessions.is_empty() {
             state::save_state(socket_path, &sessions);
         }
+        if let Some(cache) = peer_cache.as_mut() {
+            cache.evict_expired();
+            cache.save_if_dirty();
+        }
     }
 
     crate::log::info("no sessions and no clients remaining, server exiting");
+    send_announce(
+        discovery_sock.as_ref(),
+        announce_tcp_port,
+        announce_tls,
+        true,
+    );
     // Send SIGHUP to all remaining child processes before cleanup.
     kill_all_children(&sessions);
     state::save_state(socket_path, &sessions);
     ipc::cleanup(socket_path);
     Ok(())
+}
+
+/// Announce heartbeat cadence.
+const ANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Send an Announce (v2) to every well-known destination. No-op when
+/// `[network] announce` is off or there is no TCP port to advertise.
+/// `leaving` marks the graceful-shutdown flag.
+fn send_announce(sock: Option<&std::net::UdpSocket>, tcp_port: u16, tls: bool, leaving: bool) {
+    let net = &crate::config::global().network;
+    if !net.announce || tcp_port == 0 {
+        return;
+    }
+    let pkt = crate::ipc::discovery::encode_announce(
+        crate::server::server_name(),
+        tcp_port,
+        tls,
+        crate::version::VERSION,
+        crate::server::tls_fingerprint(),
+        crate::config::server_id(),
+        leaving,
+    );
+    crate::ipc::discovery::announce(sock, net.discovery_port, &net.scan, &pkt);
+}
+
+/// Flatten a cache entry for the wire (`PeerList`).
+fn peer_to_info(e: &crate::peers::PeerEntry) -> proto::PeerInfo {
+    let state = match e.state {
+        crate::peers::PeerState::Announced => "announced",
+        crate::peers::PeerState::Verified => "verified",
+        crate::peers::PeerState::Stale => "stale",
+    };
+    proto::PeerInfo {
+        server_id: e.server_id.clone(),
+        name: e.name.clone(),
+        addr: e
+            .addrs
+            .first()
+            .map(|a| format!("{a}:{}", e.tcp_port))
+            .unwrap_or_default(),
+        tls: e.tls,
+        fingerprint: e.fingerprint.clone(),
+        state: state.to_string(),
+        psk_ok: e.psk_ok,
+        sessions: e.sessions.clone(),
+    }
+}
+
+/// Handle a Register message: record the peer when registrations are
+/// accepted. The peer is verified asynchronously by the poll scheduler
+/// (new entries start with poll_at = now).
+fn handle_register(
+    manager: bool,
+    cache: Option<&mut crate::peers::PeerCache>,
+    peer_addr: Option<std::net::SocketAddr>,
+    ann: crate::ipc::discovery::Announcement,
+) -> (bool, String) {
+    if !manager && !crate::config::global().peers.accept_registrations {
+        return (false, "registrations disabled".to_string());
+    }
+    if peer_addr.is_none() {
+        return (false, "no remote address (unix client)".to_string());
+    }
+    let Some(cache) = cache else {
+        return (false, "directory not enabled".to_string());
+    };
+    cache.upsert_announce(&ann, crate::peers::PeerSource::Register);
+    (true, String::new())
 }
 
 /// Send SIGHUP to all living child processes across all sessions.
@@ -1967,6 +2423,7 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: pane.grid.mouse_flags(),
     });
     if !client_send(client, &snapshot) {
         return Err(io::Error::new(
@@ -2065,11 +2522,15 @@ fn handshake_first_client(
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
     let mut client = wrap_accepted_stream(stream)?;
     // Bound the handshake read: a client that connects and stays silent
-    // must not stall server startup forever.
-    let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    // must not stall server startup forever. decode_with_deadline polls
+    // the fd, which works where SO_RCVTIMEO is unavailable.
     let is_tcp = client.is_tcp();
-
-    let (client_rows, client_cols, auth_token) = match proto::decode_client(&mut client) {
+    let first = crate::ipc::stream::decode_with_deadline(
+        &mut client,
+        std::time::Duration::from_secs(5),
+        |r| proto::decode_client(r),
+    );
+    let (client_rows, client_cols, auth_token) = match first {
         Ok(ClientMsg::Identify {
             rows,
             cols,
@@ -2158,6 +2619,7 @@ fn handshake_first_client(
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: window.pane.grid.mouse_flags(),
     });
     proto::send(&mut client, &snapshot)?;
     let _ = window.pane.take_dirty_rows(); // snapshot already has full state
@@ -2194,6 +2656,192 @@ fn tcp_auth_ok(is_tcp: bool, token: &str) -> bool {
     token == required
 }
 
+/// Read the first bytes of a connection to classify the protocol: binary
+/// client frames start with a u32-LE length under 16 MiB (byte 3 == 0),
+/// while the ASCII line protocol (telnet/nc) starts with printable text.
+/// Waits for up to 4 bytes, returning early on a newline (a complete ASCII
+/// line cannot be a binary frame). Bounded by `timeout`.
+fn sniff_prefix(
+    stream: &mut crate::ipc::ConnStream,
+    timeout: std::time::Duration,
+) -> io::Result<Vec<u8>> {
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::with_capacity(4);
+    let res = (|| {
+        while buf.len() < 4 && !buf.contains(&b'\n') {
+            let mut b = [0u8; 64];
+            match stream.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline || !stream.wait_readable(deadline - now)? {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+    let _ = stream.set_nonblocking(false);
+    res.map(|_| buf)
+}
+
+/// Decode the first client frame when `prefix` bytes were already consumed
+/// by sniffing. Equivalent to `decode_with_deadline` with the prefix
+/// replayed ahead of the stream.
+fn decode_client_prefixed(
+    stream: &mut crate::ipc::ConnStream,
+    prefix: Vec<u8>,
+    timeout: std::time::Duration,
+) -> io::Result<ClientMsg> {
+    stream.set_nonblocking(true)?;
+    let res = {
+        let rd = crate::ipc::stream::DeadlineReader::new(stream, timeout);
+        let mut chain = io::Cursor::new(prefix).chain(rd);
+        proto::decode_client(&mut chain)
+    };
+    let _ = stream.set_nonblocking(false);
+    res
+}
+
+/// ASCII line protocol: a minimal command interface reachable via
+/// `nc`/`telnet`. Sniffed when a connection's first bytes are not a binary
+/// frame. Same rules as the binary protocol: on TCP with a configured PSK
+/// the session requires `auth <psk>` first; read-only commands only.
+fn ascii_session(
+    stream: &mut crate::ipc::ConnStream,
+    buffered: Vec<u8>,
+    sessions: &[Session],
+    clients: &[ClientConn],
+    peer_cache: Option<&crate::peers::PeerCache>,
+) -> io::Result<()> {
+    let is_tcp = stream.is_tcp();
+    let psk = crate::server::runtime_psk();
+    let mut authed = !is_tcp || psk.is_empty();
+    let mut buf = buffered;
+
+    let banner = format!(
+        "lrmux {} — 'help' for commands\r\n> ",
+        crate::version::VERSION
+    );
+    if stream.write_all(banner.as_bytes()).is_err() || stream.flush().is_err() {
+        return Ok(());
+    }
+    stream.set_nonblocking(true)?;
+
+    // Per-command idle bound: the accept handshake is synchronous, so an
+    // idle ASCII client must not stall the event loop indefinitely.
+    let line_timeout = std::time::Duration::from_secs(15);
+    loop {
+        let deadline = std::time::Instant::now() + line_timeout;
+        let line = loop {
+            if let Some(p) = buf.iter().position(|&b| b == b'\n') {
+                break buf.drain(..=p).collect::<Vec<u8>>();
+            }
+            if buf.len() > 4096 {
+                return Ok(()); // absurd line — drop the connection
+            }
+            let mut b = [0u8; 512];
+            match stream.read(&mut b) {
+                Ok(0) => return Ok(()),
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline || !stream.wait_readable(deadline - now).unwrap_or(false) {
+                        let _ = stream.write_all(b"idle timeout\r\n");
+                        let _ = stream.flush();
+                        return Ok(());
+                    }
+                }
+                Err(_) => return Ok(()),
+            }
+        };
+        let line = String::from_utf8_lossy(&line).trim().to_string();
+        let mut it = line.split_whitespace();
+        let resp = match it.next().unwrap_or("") {
+            "" => None,
+            "help" => Some(
+                "commands: help, version, ls, peers, auth <psk>, quit\r\n\
+                 ls = sessions, peers = known servers (manager cache)"
+                    .to_string(),
+            ),
+            "version" => Some(format!("lrmux {}", crate::version::VERSION)),
+            "quit" | "exit" => {
+                let _ = stream.write_all(b"bye\r\n");
+                let _ = stream.flush();
+                return Ok(());
+            }
+            "auth" => {
+                let tok = it.next().unwrap_or("");
+                if authed || (!is_tcp || psk.is_empty()) || (!psk.is_empty() && tok == psk) {
+                    authed = true;
+                    Some("ok".to_string())
+                } else {
+                    Some("auth failed".to_string())
+                }
+            }
+            "ls" | "list-sessions" => {
+                if !authed {
+                    Some("authentication required — send: auth <psk>".to_string())
+                } else {
+                    let list = build_session_list(sessions, clients);
+                    if list.is_empty() {
+                        Some("no sessions".to_string())
+                    } else {
+                        Some(
+                            list.iter()
+                                .map(|s| {
+                                    format!(
+                                        "{}\tattached={}\tactivity={}",
+                                        s.name, s.attached, s.has_activity
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\r\n"),
+                        )
+                    }
+                }
+            }
+            "peers" | "list-peers" => {
+                if !authed {
+                    Some("authentication required — send: auth <psk>".to_string())
+                } else {
+                    match peer_cache {
+                        Some(cache) if !cache.is_empty() => Some(
+                            cache
+                                .iter()
+                                .map(|p| {
+                                    format!(
+                                        "{}\t{:?}\t{}:{}\tsessions={}",
+                                        p.name,
+                                        p.state,
+                                        p.addrs.join(","),
+                                        p.tcp_port,
+                                        p.sessions.join(",")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\r\n"),
+                        ),
+                        _ => Some("no peers".to_string()),
+                    }
+                }
+            }
+            other => Some(format!("unknown command '{other}' — try 'help'")),
+        };
+        let out = match resp {
+            Some(r) => format!("{r}\r\n> "),
+            None => "> ".to_string(),
+        };
+        if stream.write_all(out.as_bytes()).is_err() || stream.flush().is_err() {
+            return Ok(());
+        }
+    }
+}
+
 /// Accept a new client, do the handshake, and add it to the clients list.
 /// New clients default to session 0, window 0.
 fn accept_new_client(
@@ -2202,6 +2850,7 @@ fn accept_new_client(
     grid_rows: u16,
     grid_cols: u16,
     clients: &mut Vec<ClientConn>,
+    peer_cache: Option<&crate::peers::PeerCache>,
 ) -> io::Result<()> {
     match listener.accept() {
         Ok(stream) => {
@@ -2214,13 +2863,23 @@ fn accept_new_client(
                     return Ok(());
                 }
             };
-            stream.set_nonblocking(false)?;
+            let is_tcp = stream.is_tcp();
+            // Sniff the first bytes: binary client frames start with a
+            // u32-LE length under 16 MiB (top byte always 0x00); anything
+            // else is the ASCII line protocol (telnet/nc). The sniffed
+            // bytes are replayed ahead of the stream on the binary path.
+            let sniffed = match sniff_prefix(&mut stream, std::time::Duration::from_secs(2)) {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            if sniffed.len() < 4 || sniffed[3] != 0 {
+                return ascii_session(&mut stream, sniffed, sessions, clients, peer_cache);
+            }
             // Bound the handshake read: a client that connects and stays
             // silent must not freeze the whole event loop.
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-            let is_tcp = stream.is_tcp();
-
-            let (attach, is_control, auth_token) = match proto::decode_client(&mut stream) {
+            let first =
+                decode_client_prefixed(&mut stream, sniffed, std::time::Duration::from_secs(2));
+            let (attach, is_control, auth_token) = match first {
                 Ok(ClientMsg::Identify {
                     attach: a,
                     auth_token,
@@ -2302,6 +2961,7 @@ fn accept_new_client(
                         cursor_row,
                         cursor_col,
                         cursor_visible,
+                        mouse_flags: pane.grid.mouse_flags(),
                     });
                     if proto::send(&mut stream, &snapshot).is_err() {
                         return Ok(());
@@ -2509,6 +3169,7 @@ fn send_grid_update_to_window_viewers(
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: pane.grid.mouse_flags(),
     });
     let mut i = 0;
     while i < clients.len() {
@@ -2558,6 +3219,7 @@ fn send_grid_update<W: Write>(
         cursor_row,
         cursor_col,
         cursor_visible,
+        mouse_flags: pane.grid.mouse_flags(),
     });
     proto::send(writer, &msg)
 }
@@ -3109,10 +3771,13 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             ClientMsg::SetPsk { psk }
         }
         _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown client msg type: {msg_type}"),
-            ));
+            // Newer messages (peer directory, relay, …) are not spelled
+            // out above — decode them with the shared proto decoder by
+            // re-prefixing the payload with its frame length.
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            framed.extend_from_slice(payload);
+            proto::decode_client(&mut &framed[..])?
         }
     };
     Ok(Some(msg))

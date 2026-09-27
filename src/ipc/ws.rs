@@ -39,6 +39,10 @@ impl WsByteBridge {
         self.ws.get_ref().as_raw_fd()
     }
 
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.ws.get_ref().peer_addr()
+    }
+
     fn fill_read_buf(&mut self) -> io::Result<()> {
         loop {
             if !self.read_buf.is_empty() {

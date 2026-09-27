@@ -7,6 +7,7 @@
 use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -218,26 +219,55 @@ pub fn cert_fingerprint_hex(cert_path: &Path) -> io::Result<String> {
     Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Drive a rustls handshake on a nonblocking socket with a deadline.
+/// `complete_io` reports WouldBlock when the socket isn't ready; poll()
+/// and retry. Portable replacement for SO_RCVTIMEO — it is unimplemented on some platforms.
+fn drive_handshake<D: rustls::SideData>(
+    conn: &mut rustls::ConnectionCommon<D>,
+    tcp: &mut TcpStream,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while conn.is_handshaking() {
+        match conn.complete_io(tcp) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TLS handshake timed out",
+                    ));
+                }
+                let ev = if conn.wants_write() {
+                    libc::POLLIN | libc::POLLOUT
+                } else {
+                    libc::POLLIN
+                };
+                super::stream::wait_io(tcp.as_raw_fd(), ev, deadline - now)?;
+            }
+            r => {
+                r.map_err(handshake_io_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Perform a TLS server handshake on an accepted TCP stream.
 ///
 /// The listening socket is non-blocking, and on macOS the accepted socket
 /// inherits that. `complete_io` treats `WouldBlock` as a failed handshake
-/// and the server would drop the client (lrmux or telnet) immediately.
-/// Force blocking I/O with a short timeout for the handshake only.
+/// and the server would drop the client (lrmux or telnet) immediately,
+/// so the handshake runs nonblocking with poll() waits and a deadline.
 pub fn wrap_server(
     mut tcp: TcpStream,
     config: Arc<ServerConfig>,
 ) -> io::Result<StreamOwned<ServerConnection, TcpStream>> {
-    tcp.set_nonblocking(false)?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    tcp.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    tcp.set_nonblocking(true)?;
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::other(format!("tls server conn: {e}")))?;
-    while conn.is_handshaking() {
-        conn.complete_io(&mut tcp).map_err(handshake_io_error)?;
-    }
-    tcp.set_read_timeout(None)?;
-    tcp.set_write_timeout(None)?;
+    drive_handshake(&mut conn, &mut tcp, std::time::Duration::from_secs(5))?;
+    tcp.set_nonblocking(false)?;
     Ok(StreamOwned::new(conn, tcp))
 }
 
@@ -278,10 +308,10 @@ pub fn wrap_client(
         .map_err(|e| io::Error::other(format!("invalid server name: {e}")))?;
     let mut conn = ClientConnection::new(config, name)
         .map_err(|e| io::Error::other(format!("tls client conn: {e}")))?;
-    while conn.is_handshaking() {
-        conn.complete_io(&mut tcp)
-            .map_err(|e| io::Error::other(format!("tls handshake: {e}")))?;
-    }
+    tcp.set_nonblocking(true)?;
+    drive_handshake(&mut conn, &mut tcp, std::time::Duration::from_secs(10))
+        .map_err(|e| io::Error::other(format!("tls handshake: {e}")))?;
+    tcp.set_nonblocking(false)?;
     Ok(StreamOwned::new(conn, tcp))
 }
 
