@@ -138,7 +138,7 @@ All elements are configurable and the status bar can be disabled entirely.
 
 - **Mouse events are never consumed by lrmux.** When the child enables mouse tracking (DECSET 1000/1002/1003), the client enables reporting on the outer terminal and forwards each event to the pane, re-encoded in the format the child requested: legacy X10, UTF-8 extended (1005) or SGR (1006). The server-side VT parser tracks the requested modes and ships them to the client in `GridSnapshot`/`GridUpdate` (`mouse_flags` byte); the client decodes terminal reports (SGR is requested, X10 tolerated) and re-encodes — preserving the passthrough invariant.
 - Alternate scroll (DECSET 1007): when a child sets it without a tracking mode, wheel ticks are translated into three arrow-key presses (app-cursor-keys aware) — the standard xterm behavior.
-- If the child requests no mouse handling, reports are not forwarded to the pane — they are available for local client features (e.g. copy-mode selection) without affecting the child.
+- **Local selection**: the client always keeps the outer terminal in button-event reporting (1002+1006) while attached. When the child requests no mouse handling, a left-drag selects text against the client-side grid — never including pane borders, filler, or the status bar — and releasing copies it (clipboard + internal paste buffer), exiting copy mode. A plain click without drag does nothing. The wheel scrolls copy-mode scrollback (enters on wheel-up, exits at the bottom). Local handling also takes over whenever copy mode is active, even if the child tracks the mouse.
 - Reporting is disabled again when the child turns tracking off, and always restored on client exit.
 
 ### 2.11 Window numbering

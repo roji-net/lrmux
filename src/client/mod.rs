@@ -144,13 +144,19 @@ pub fn run(
     // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
     // responses to our probes are client-side traffic, not pane input.
     let mut input_filter = input_filter::InputFilter::new();
-    // Mouse report decoder — active only while the outer terminal is in
-    // a reporting mode we enabled (the child asked for mouse tracking,
-    // or alternate scroll).
+    // Mouse report decoder — the outer terminal is always in a reporting
+    // mode while attached: reports feed the child (when it tracks the
+    // mouse) or local copy-mode selection otherwise.
     let mut mouse_decoder = mouse::Decoder::new();
-    // Mouse modes currently applied to the outer terminal:
-    // (tracking mask, altscroll-driven reporting).
-    let mut applied_mouse: (u8, bool) = (0, false);
+    mouse_decoder.set_active(true);
+    // Tracking mask currently applied to the outer terminal (None = not yet).
+    let mut applied_mouse: Option<u8> = None;
+    // Pending mouse-press position (x, y): arms a local selection — the
+    // drag that follows enters copy mode anchored here. A release without
+    // motion is a plain click and does nothing.
+    let mut mouse_anchor: Option<(u16, u16)> = None;
+    // True while copy mode was entered by a mouse drag (release copies).
+    let mut mouse_auto_copy = false;
 
     // Probe outer TTY defaults (OSC 10/11) so the server can paint HTML
     // captures without waiting for vim to ask. Raw mode is already on —
@@ -361,52 +367,175 @@ pub fn run(
             if !filtered.is_empty() || !mouse_events.is_empty() {
                 let input = &filtered[..];
 
-                // Route decoded mouse events.
-                if grid.wants_mouse() {
-                    for ev in &mouse_events {
-                        // Drop clicks landing outside the pane viewport
-                        // (status bar, filler region).
-                        let view_rows = term_rows.saturating_sub(1);
+                // Route decoded mouse events: to the pane when it tracks
+                // the mouse, or to local copy-mode selection otherwise
+                // (and always locally while copy mode is active).
+                let view_rows = term_rows.saturating_sub(1);
+                let mut mouse_copy_action: Option<copy_mode::CopyAction> = None;
+                for ev in &mouse_events {
+                    let local = copy_mode.is_some() || !grid.wants_mouse();
+                    if !local {
+                        // Forward to the pane in the child's encoding.
+                        // Motion events only when the child asked for drag
+                        // (1002) or any-motion (1003) reporting.
+                        if ev.is_motion() && grid.mouse_tracking & 0b110 == 0 {
+                            continue;
+                        }
                         if ev.x == 0
                             || ev.x as usize > grid.cols()
                             || ev.y == 0
                             || ev.y as usize > grid.rows().min(view_rows)
                         {
-                            continue;
+                            continue; // status bar / filler region
                         }
                         let data = mouse::encode_report(grid.mouse_fmt, ev);
                         let msg = proto::encode_client(&ClientMsg::PaneInput { data });
                         proto::send(&mut stream, &msg)?;
+                        continue;
                     }
-                } else if grid.mouse_altscroll {
-                    // DECSET 1007 without tracking: wheel becomes arrows.
-                    let up = if grid.app_cursor_keys {
-                        b"\x1bOA".as_slice()
-                    } else {
-                        b"\x1b[A".as_slice()
-                    };
-                    let down = if grid.app_cursor_keys {
-                        b"\x1bOB".as_slice()
-                    } else {
-                        b"\x1b[B".as_slice()
-                    };
-                    for ev in &mouse_events {
-                        if !ev.is_wheel() {
+                    // Local handling.
+                    if ev.is_wheel() {
+                        if grid.mouse_altscroll && !grid.wants_mouse() && copy_mode.is_none() {
+                            // DECSET 1007 without tracking: wheel → arrows.
+                            let arrow = match (ev.is_wheel_up(), grid.app_cursor_keys) {
+                                (true, true) => b"\x1bOA".as_slice(),
+                                (true, false) => b"\x1b[A".as_slice(),
+                                (false, true) => b"\x1bOB".as_slice(),
+                                (false, false) => b"\x1b[B".as_slice(),
+                            };
+                            // xterm emits three presses per wheel tick.
+                            let mut data = Vec::with_capacity(arrow.len() * 3);
+                            for _ in 0..3 {
+                                data.extend_from_slice(arrow);
+                            }
+                            let msg = proto::encode_client(&ClientMsg::PaneInput { data });
+                            proto::send(&mut stream, &msg)?;
                             continue;
                         }
-                        let arrow = if ev.is_wheel_up() { up } else { down };
-                        // xterm emits three arrow presses per wheel tick.
-                        let mut data = Vec::with_capacity(arrow.len() * 3);
-                        for _ in 0..3 {
-                            data.extend_from_slice(arrow);
+                        // Wheel scrolls the copy-mode view (entering it on
+                        // wheel-up — like tmux mouse mode).
+                        if copy_mode.is_none() {
+                            if !ev.is_wheel_up() {
+                                continue;
+                            }
+                            copy_mode = Some(copy_mode::CopyMode::new(
+                                grid.scrollback.len(),
+                                grid.cursor_row,
+                                grid.cursor_col,
+                            ));
                         }
-                        let msg = proto::encode_client(&ClientMsg::PaneInput { data });
-                        proto::send(&mut stream, &msg)?;
+                        let cm = copy_mode.as_mut().unwrap();
+                        let total = grid.scrollback.len() + grid.rows();
+                        if ev.is_wheel_up() {
+                            cm.vrow = cm.vrow.saturating_sub(3);
+                        } else {
+                            if cm.vrow >= total.saturating_sub(1) {
+                                // Already at the bottom — leave copy mode.
+                                mouse_copy_action = Some(copy_mode::CopyAction::Quit);
+                                break;
+                            }
+                            cm.vrow = (cm.vrow + 3).min(total - 1);
+                        }
+                        cm.ensure_cursor_visible(view_rows);
+                        let mut stdout = io::stdout();
+                        cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        continue;
+                    }
+                    if ev.is_motion() {
+                        // Drag: arm/extend the local selection.
+                        if let Some((ax, ay)) = mouse_anchor.take() {
+                            // First motion after a press — enter copy mode
+                            // anchored at the press position.
+                            if copy_mode.is_none() {
+                                copy_mode = Some(copy_mode::CopyMode::new(
+                                    grid.scrollback.len(),
+                                    grid.cursor_row,
+                                    grid.cursor_col,
+                                ));
+                            }
+                            mouse_auto_copy = true;
+                            let cm = copy_mode.as_mut().unwrap();
+                            cm.vrow = (grid.scrollback.len() + ay.saturating_sub(1) as usize)
+                                .min(grid.scrollback.len() + grid.rows() - 1);
+                            cm.vcol = (ax.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.selection_start = Some((cm.vrow, cm.vcol));
+                        }
+                        if let Some(cm) = copy_mode.as_mut()
+                            && cm.selection_start.is_some()
+                        {
+                            let total = grid.scrollback.len() + grid.rows();
+                            cm.vrow =
+                                (cm.viewport_top + ev.y.saturating_sub(1) as usize).min(total - 1);
+                            cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.ensure_cursor_visible(view_rows);
+                            let mut stdout = io::stdout();
+                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        }
+                        continue;
+                    }
+                    if ev.release {
+                        if mouse_auto_copy {
+                            // Drag ended — copy the selection and leave.
+                            mouse_auto_copy = false;
+                            if let Some(cm) = &copy_mode
+                                && let Some(text) = cm.copy_selection(&grid)
+                                && !text.is_empty()
+                            {
+                                mouse_copy_action = Some(copy_mode::CopyAction::Copy(text));
+                                break;
+                            }
+                            mouse_copy_action = Some(copy_mode::CopyAction::Quit);
+                            break;
+                        }
+                        // Release without a drag: plain click — cancel the
+                        // pending anchor (and any selection if in copy mode).
+                        if let Some(cm) = copy_mode.as_mut() {
+                            cm.selection_start = None;
+                            cm.vrow = (cm.viewport_top + ev.y.saturating_sub(1) as usize)
+                                .min(grid.scrollback.len() + grid.rows() - 1);
+                            cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.ensure_cursor_visible(view_rows);
+                            let mut stdout = io::stdout();
+                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        }
+                        mouse_anchor = None;
+                        continue;
+                    }
+                    // Button press: arm a selection anchor (drag enters
+                    // copy mode; release without drag = plain click).
+                    // Left button only.
+                    if ev.cb & 3 == 0 {
+                        mouse_anchor = Some((ev.x, ev.y));
                     }
                 }
-                // When the child wants no mouse and no altscroll, events
-                // are dropped — local copy-mode selection (drag) hooks in
-                // here later.
+                // Apply copy-mode exit/copy triggered by the mouse.
+                if let Some(action) = mouse_copy_action {
+                    match action {
+                        copy_mode::CopyAction::Quit => {
+                            copy_mode = None;
+                            restore_normal_view(
+                                &mut renderer,
+                                &mut grid,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                            )?;
+                        }
+                        copy_mode::CopyAction::Copy(text) => {
+                            paste_buffer = text.clone();
+                            let _ = copy_mode::copy_to_clipboard(&text);
+                            copy_mode = None;
+                            restore_normal_view(
+                                &mut renderer,
+                                &mut grid,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                            )?;
+                        }
+                        copy_mode::CopyAction::Continue => {}
+                    }
+                }
 
                 if copy_mode.is_some() {
                     // In copy mode: all input goes to copy mode key handling.
@@ -1807,23 +1936,20 @@ fn restore_terminal() {
     let _ = stdout.flush();
 }
 
-/// Enable/disable mouse reporting on the outer terminal to match the
-/// child's requested state (`applied` tracks the last emitted modes so
-/// unchanged updates emit nothing).
-fn sync_mouse_modes(applied: &mut (u8, bool), grid: &Grid, decoder: &mut mouse::Decoder) {
-    let desired = (
-        grid.mouse_tracking,
-        grid.mouse_altscroll && grid.mouse_tracking == 0,
-    );
-    if *applied == desired {
+/// Keep the outer terminal's mouse reporting in sync with the child's
+/// requested tracking mask. Reporting is always on while attached (it
+/// backs local drag-to-select), only the tracking level changes.
+fn sync_mouse_modes(applied: &mut Option<u8>, grid: &Grid, decoder: &mut mouse::Decoder) {
+    let desired = grid.mouse_tracking;
+    if *applied == Some(desired) {
         return;
     }
     let mut stdout = io::stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
-    let _ = stdout.write_all(mouse::terminal_setup(desired.0, desired.1).as_bytes());
+    let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
     let _ = stdout.flush();
-    *applied = desired;
-    decoder.set_active(desired.0 != 0 || desired.1);
+    *applied = Some(desired);
+    decoder.set_active(true);
 }
 
 /// Try to parse a complete server frame from the buffer.

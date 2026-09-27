@@ -293,20 +293,16 @@ pub fn encode_report(fmt: u8, ev: &Event) -> Vec<u8> {
     }
 }
 
-/// DECSET string to enable/disable mouse reporting on the outer terminal,
-/// matching the child's tracking level (bits 0-2 = 1000/1002/1003).
-/// Returns "" when nothing needs reporting. SGR encoding (1006) is always
-/// requested alongside tracking so reports are unambiguous on stdin.
-pub fn terminal_setup(tracking: u8, altscroll: bool) -> String {
-    if tracking == 0 && !altscroll {
-        return String::new();
-    }
-    // Any report we need implies at least click tracking (1000): alternate
-    // scroll needs wheel reports, which arrive under button tracking too.
-    let track = if tracking == 0 { 1 } else { tracking };
-    let mut s = String::from("\x1b[?1000h");
-    if track & 2 != 0 {
-        s.push_str("\x1b[?1002h");
+/// DECSET string to enable mouse reporting on the outer terminal.
+/// `tracking` is the child's mask (bits 0-2 = 1000/1002/1003); the client
+/// always ORs in 1002 itself — button-event tracking gives drag reports,
+/// which local copy-mode selection needs even when the child wants nothing.
+/// SGR encoding (1006) is always requested so reports are unambiguous.
+pub fn terminal_setup(tracking: u8) -> String {
+    let track = tracking | 0b010;
+    let mut s = String::from("\x1b[?1002h");
+    if track & 1 != 0 {
+        s.push_str("\x1b[?1000h");
     }
     if track & 4 != 0 {
         s.push_str("\x1b[?1003h");
