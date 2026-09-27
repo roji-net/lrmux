@@ -184,6 +184,9 @@ pub enum ServerMsg {
         cursor_row: u16,
         cursor_col: u16,
         cursor_visible: bool,
+        /// Packed mouse state (`Grid::mouse_flags`). Missing on messages
+        /// from an older server (pre-mouse): decode as 0.
+        mouse_flags: u8,
     },
     /// Dirty rows update (sent after PTY output is parsed into the grid).
     GridUpdate {
@@ -191,6 +194,9 @@ pub enum ServerMsg {
         cursor_row: u16,
         cursor_col: u16,
         cursor_visible: bool,
+        /// Packed mouse state (`Grid::mouse_flags`). Missing on messages
+        /// from an older server: decode as 0.
+        mouse_flags: u8,
     },
     /// Scrollback rows that scrolled off the top since the last update.
     /// Sent before GridUpdate so the client can push them to scrollback.
@@ -591,6 +597,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             cursor_row,
             cursor_col,
             cursor_visible,
+            mouse_flags,
         } => {
             payload.push(S_GRID_SNAPSHOT);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -602,12 +609,14 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_row.to_le_bytes());
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
+            payload.push(*mouse_flags);
         }
         ServerMsg::GridUpdate {
             dirty,
             cursor_row,
             cursor_col,
             cursor_visible,
+            mouse_flags,
         } => {
             payload.push(S_GRID_UPDATE);
             payload.extend_from_slice(&(dirty.len() as u32).to_le_bytes());
@@ -621,6 +630,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_row.to_le_bytes());
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
+            payload.push(*mouse_flags);
         }
         ServerMsg::ScrollbackUpdate { rows, replay } => {
             payload.push(S_SCROLLBACK_UPDATE);
@@ -1152,6 +1162,8 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let cursor_row = read_u16(&mut r)?;
             let cursor_col = read_u16(&mut r)?;
             let cursor_visible = read_u8(&mut r)? != 0;
+            // Trailing field — absent on pre-mouse servers.
+            let mouse_flags = if r.is_empty() { 0 } else { read_u8(&mut r)? };
             Ok(ServerMsg::GridSnapshot {
                 rows,
                 cols,
@@ -1159,6 +1171,7 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 cursor_row,
                 cursor_col,
                 cursor_visible,
+                mouse_flags,
             })
         }
         S_GRID_UPDATE => {
@@ -1176,11 +1189,14 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let cursor_row = read_u16(&mut r)?;
             let cursor_col = read_u16(&mut r)?;
             let cursor_visible = read_u8(&mut r)? != 0;
+            // Trailing field — absent on pre-mouse servers.
+            let mouse_flags = if r.is_empty() { 0 } else { read_u8(&mut r)? };
             Ok(ServerMsg::GridUpdate {
                 dirty,
                 cursor_row,
                 cursor_col,
                 cursor_visible,
+                mouse_flags,
             })
         }
         S_SCROLLBACK_UPDATE => {
@@ -1644,6 +1660,57 @@ mod tests {
                 }
                 other => panic!("unexpected {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn grid_messages_carry_mouse_flags() {
+        let snap = encode_server(&ServerMsg::GridSnapshot {
+            rows: 24,
+            cols: 80,
+            cells: vec![],
+            cursor_row: 1,
+            cursor_col: 2,
+            cursor_visible: true,
+            mouse_flags: 0x4e, // tracking 1002|1003, SGR fmt, altscroll, app cur
+        });
+        match decode_server(&mut &snap[..]).unwrap() {
+            ServerMsg::GridSnapshot { mouse_flags, .. } => assert_eq!(mouse_flags, 0x4e),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let upd = encode_server(&ServerMsg::GridUpdate {
+            dirty: vec![],
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            mouse_flags: 0x12,
+        });
+        match decode_server(&mut &upd[..]).unwrap() {
+            ServerMsg::GridUpdate { mouse_flags, .. } => assert_eq!(mouse_flags, 0x12),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grid_messages_without_flags_decode_zero() {
+        // A pre-mouse server sends no trailing byte — decode as 0.
+        let mut snap = encode_server(&ServerMsg::GridSnapshot {
+            rows: 24,
+            cols: 80,
+            cells: vec![],
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mouse_flags: 0x55,
+        });
+        snap.pop(); // strip the trailing mouse_flags byte
+        // Fix the length prefix so the frame stays well-formed.
+        let len = u32::from_le_bytes([snap[0], snap[1], snap[2], snap[3]]) - 1;
+        snap[..4].copy_from_slice(&len.to_le_bytes());
+        match decode_server(&mut &snap[..]).unwrap() {
+            ServerMsg::GridSnapshot { mouse_flags, .. } => assert_eq!(mouse_flags, 0),
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

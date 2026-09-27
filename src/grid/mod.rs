@@ -39,6 +39,16 @@ pub struct Grid {
     /// Application cursor keys mode (DECCKM). When true, arrow keys
     /// should be translated from \x1b[A/B/C/D to \x1bOA/B/C/D.
     pub app_cursor_keys: bool,
+    /// Mouse tracking requested by the child app — DECSET bitmask:
+    /// bit0 = 1000 (click), bit1 = 1002 (button-event/drag),
+    /// bit2 = 1003 (any-motion).
+    pub mouse_tracking: u8,
+    /// Mouse encoding the child asked for: 0 = legacy X10,
+    /// 5 = UTF-8 extended (DECSET 1005), 6 = SGR (DECSET 1006).
+    pub mouse_fmt: u8,
+    /// Alternate scroll (DECSET 1007): in the alternate screen a wheel
+    /// event is turned into arrow keys by the terminal.
+    pub mouse_altscroll: bool,
     /// Rows modified since the last render. The renderer uses this to
     /// skip unchanged rows instead of scanning the entire grid.
     dirty: Vec<bool>,
@@ -65,10 +75,46 @@ impl Grid {
             wrap_pending: false,
             saved_cursor: None,
             app_cursor_keys: false,
+            mouse_tracking: 0,
+            mouse_fmt: 0,
+            mouse_altscroll: false,
             dirty: vec![true; rows],
         };
         grid.scroll_bottom = rows;
         grid
+    }
+
+    /// True when the child requested any mouse tracking.
+    pub fn wants_mouse(&self) -> bool {
+        self.mouse_tracking != 0
+    }
+
+    /// Pack mouse state for the wire: bits 0-2 tracking (1000/1002/1003),
+    /// bits 3-4 encoding (0/5/6 → 0/1/2), bit 5 altscroll,
+    /// bit 6 application cursor keys (needed to pick the right arrow
+    /// sequence when translating wheel events locally).
+    pub fn mouse_flags(&self) -> u8 {
+        let fmt = match self.mouse_fmt {
+            5 => 1,
+            6 => 2,
+            _ => 0,
+        };
+        self.mouse_tracking
+            | (fmt << 3)
+            | ((self.mouse_altscroll as u8) << 5)
+            | ((self.app_cursor_keys as u8) << 6)
+    }
+
+    /// Unpack wire flags written by `mouse_flags`.
+    pub fn set_mouse_flags(&mut self, f: u8) {
+        self.mouse_tracking = f & 0x07;
+        self.mouse_fmt = match (f >> 3) & 0x03 {
+            1 => 5,
+            2 => 6,
+            _ => 0,
+        };
+        self.mouse_altscroll = f & 0x20 != 0;
+        self.app_cursor_keys = f & 0x40 != 0;
     }
 
     pub fn rows(&self) -> usize {
@@ -720,5 +766,28 @@ mod tests {
         grid.move_cursor(0, 1);
         grid.erase_chars(2);
         assert_eq!(row_chars(&grid, 0), "h  lo");
+    }
+
+    #[test]
+    fn mouse_flags_pack_unpack() {
+        let mut grid = Grid::new(1, 8, 10);
+        grid.mouse_tracking = 0b101; // 1000 + 1003
+        grid.mouse_fmt = 6;
+        grid.mouse_altscroll = true;
+        grid.app_cursor_keys = true;
+        let f = grid.mouse_flags();
+        let mut g2 = Grid::new(1, 8, 10);
+        g2.set_mouse_flags(f);
+        assert_eq!(g2.mouse_tracking, 0b101);
+        assert_eq!(g2.mouse_fmt, 6);
+        assert!(g2.mouse_altscroll);
+        assert!(g2.app_cursor_keys);
+        assert_eq!(g2.mouse_flags(), f);
+
+        // Zero flags round-trip cleanly.
+        let mut g3 = Grid::new(1, 8, 10);
+        g3.set_mouse_flags(0);
+        assert!(!g3.wants_mouse());
+        assert_eq!(g3.mouse_flags(), 0);
     }
 }

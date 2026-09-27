@@ -217,6 +217,12 @@ impl Perform for VtHandler<'_> {
                         match *m {
                             1 => self.grid.app_cursor_keys = true,
                             25 => self.grid.cursor_visible = true,
+                            1000 => self.grid.mouse_tracking |= 1,
+                            1002 => self.grid.mouse_tracking |= 2,
+                            1003 => self.grid.mouse_tracking |= 4,
+                            1005 => self.grid.mouse_fmt = 5,
+                            1006 => self.grid.mouse_fmt = 6,
+                            1007 => self.grid.mouse_altscroll = true,
                             _ => {}
                         }
                     }
@@ -229,6 +235,11 @@ impl Perform for VtHandler<'_> {
                         match *m {
                             1 => self.grid.app_cursor_keys = false,
                             25 => self.grid.cursor_visible = false,
+                            1000 => self.grid.mouse_tracking &= !1,
+                            1002 => self.grid.mouse_tracking &= !2,
+                            1003 => self.grid.mouse_tracking &= !4,
+                            1005 | 1006 => self.grid.mouse_fmt = 0,
+                            1007 => self.grid.mouse_altscroll = false,
                             _ => {}
                         }
                     }
@@ -425,5 +436,21 @@ mod tests {
         parse_bytes(&mut parser, &mut grid, b"\x1b[4mU\x1b[24m");
         let u = grid.row(0).unwrap()[6].attrs.underline;
         assert!(u, "plain CSI 4 m must still set underline");
+    }
+
+    #[test]
+    fn decset_mouse_modes() {
+        let mut grid = Grid::new(1, 20, 10);
+        let mut parser = vte::Parser::new();
+        parse_bytes(&mut parser, &mut grid, b"\x1b[?1002h\x1b[?1006h\x1b[?1007h");
+        assert_eq!(grid.mouse_tracking, 2);
+        assert_eq!(grid.mouse_fmt, 6);
+        assert!(grid.mouse_altscroll);
+        assert!(grid.wants_mouse());
+        parse_bytes(&mut parser, &mut grid, b"\x1b[?1002l\x1b[?1006l");
+        assert_eq!(grid.mouse_tracking, 0);
+        assert_eq!(grid.mouse_fmt, 0);
+        assert!(!grid.wants_mouse());
+        assert!(grid.mouse_altscroll); // 1007 untouched
     }
 }

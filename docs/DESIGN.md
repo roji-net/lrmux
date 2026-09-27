@@ -136,9 +136,10 @@ All elements are configurable and the status bar can be disabled entirely.
 
 ### 2.10 Mouse support
 
-- **lrmux does not parse or handle mouse events.** All mouse input (scroll wheel, clicks, drags) is passed through to the child process untouched, exactly like every other non-prefix key.
-- This keeps the passthrough invariant pure: only the prefix key (and optionally F-keys) is ever intercepted; everything else — keyboard and mouse alike — flows to the child. AI CLIs, TUIs, and terminal apps that use the mouse get full, unmodified mouse control.
-- No mouse-related config option is needed in v1 (there's nothing to toggle). If mouse-aware features like click-to-select-pane or drag-to-resize are ever added, they would be a separate opt-in layer in a future phase.
+- **Mouse events are never consumed by lrmux.** When the child enables mouse tracking (DECSET 1000/1002/1003), the client enables reporting on the outer terminal and forwards each event to the pane, re-encoded in the format the child requested: legacy X10, UTF-8 extended (1005) or SGR (1006). The server-side VT parser tracks the requested modes and ships them to the client in `GridSnapshot`/`GridUpdate` (`mouse_flags` byte); the client decodes terminal reports (SGR is requested, X10 tolerated) and re-encodes — preserving the passthrough invariant.
+- Alternate scroll (DECSET 1007): when a child sets it without a tracking mode, wheel ticks are translated into three arrow-key presses (app-cursor-keys aware) — the standard xterm behavior.
+- If the child requests no mouse handling, reports are not forwarded to the pane — they are available for local client features (e.g. copy-mode selection) without affecting the child.
+- Reporting is disabled again when the child turns tracking off, and always restored on client exit.
 
 ### 2.11 Window numbering
 
