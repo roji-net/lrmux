@@ -475,6 +475,7 @@ These are the keybindings for the first working version — enough to use lrmux 
 | `[` | Enter scrollback/copy mode |
 | `?` | Show keybindings (help) |
 | `d` | Detach from session |
+| `/` | Detach and return to the session/server selector |
 | `x` | Kill active pane (with confirmation) |
 | `M` | Open session manager (switch/create session or server without detaching) |
 | Double prefix | Send literal prefix key to child |
