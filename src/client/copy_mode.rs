@@ -231,6 +231,12 @@ impl CopyMode {
     }
 
     /// Get the selected text as a string. Returns None if no selection.
+    /// Public wrapper for mouse-driven selection (drag ends → copy).
+    pub fn copy_selection(&self, grid: &Grid) -> Option<String> {
+        self.get_selected_text(grid)
+    }
+
+    /// Get the selected text as a string. Returns None if no selection.
     fn get_selected_text(&self, grid: &Grid) -> Option<String> {
         let start = self.selection_start?;
         let end = (self.vrow, self.vcol);
