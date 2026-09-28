@@ -221,6 +221,7 @@ fn relay_open(
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     crate::proto::send(&mut stream, &ident)?;
     match stream::decode_with_deadline(&mut stream, timeout, |r| crate::proto::decode_server(r))? {

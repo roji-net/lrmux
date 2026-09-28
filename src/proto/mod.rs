@@ -54,6 +54,11 @@ pub enum ClientMsg {
         cols: u16,
         attach: bool,
         auth_token: String,
+        /// Terminal-identity vars from the attaching client's env
+        /// (COLORTERM, TERM_PROGRAM, …). The server applies them so
+        /// panes spawned later inherit the freshest terminal identity —
+        /// tmux's `update-environment` equivalent. Empty for probes.
+        env: Vec<(String, String)>,
     },
     /// Raw keystrokes from the client's stdin → forward to PTY.
     PaneInput { data: Vec<u8> },
@@ -315,6 +320,7 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             cols,
             attach,
             auth_token,
+            env,
         } => {
             payload.push(C_IDENTIFY);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -322,6 +328,13 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.push(if *attach { 1 } else { 0 });
             payload.extend_from_slice(&(auth_token.len() as u32).to_le_bytes());
             payload.extend_from_slice(auth_token.as_bytes());
+            payload.extend_from_slice(&(env.len() as u32).to_le_bytes());
+            for (k, v) in env {
+                payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                payload.extend_from_slice(k.as_bytes());
+                payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                payload.extend_from_slice(v.as_bytes());
+            }
         }
         ClientMsg::PaneInput { data } => {
             payload.push(C_PANE_INPUT);
@@ -843,11 +856,22 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
                 r = &r[1..];
             }
             let auth_token = read_optional_string(&mut r)?;
+            // Trailing env pairs (newer clients; absent on old ones).
+            let mut env: Vec<(String, String)> = Vec::new();
+            if r.len() >= 4 {
+                let count = read_u32(&mut r)? as usize;
+                for _ in 0..count.min(64) {
+                    let k = read_optional_string(&mut r)?;
+                    let v = read_optional_string(&mut r)?;
+                    env.push((k, v));
+                }
+            }
             Ok(ClientMsg::Identify {
                 rows,
                 cols,
                 attach,
                 auth_token,
+                env,
             })
         }
         C_PANE_INPUT => Ok(ClientMsg::PaneInput { data: r.to_vec() }),

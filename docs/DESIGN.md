@@ -668,11 +668,26 @@ while revealing the real implementation.
 | `display-message -p [-t <target>] <fmt>` | expands `#{}` formats and `#S/#I/#W/#P` shorthands |
 | `set-window-option -t @N remain-on-exit on\|off` | keeps the pane after child exit on any code |
 | `show-environment` | the server's environment as `K=V` lines |
+| `set-environment [-u] <name> [value]`, `unset-environment <name>` | edits the server env that future panes inherit |
 | `list-sessions`, `list-windows` | existing control-mode behavior |
 
 A bad `-t` target answers `%error` (non-zero exit), like tmux's
 "can't find window". Unimplemented commands return success with empty
 output rather than failing.
+
+#### Server environment refresh (tmux `update-environment`)
+
+Panes inherit the **server's** environment, captured when the server
+process was spawned — a server started under a stale or minimal env
+(e.g. no `COLORTERM`) produces color-limited panes forever. To fix
+this, an interactive attach sends an allowlist of terminal-identity
+vars (`COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`,
+`LC_TERMINAL`, `TERMINAL_EMULATOR`, `WEZTERM_EXECUTABLE`,
+`KITTY_WINDOW_ID`) in `Identify`, and the server applies them to its
+own env. `TERM` is deliberately not refreshed — a pane's `TERM`
+describes lrmux's own emulation, not the outer terminal's. This is not
+gated on `tmux_compat`; it benefits all panes. `set-environment`
+/`unset-environment` edit the same env manually.
 
 ---
 

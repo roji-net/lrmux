@@ -752,6 +752,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -790,6 +791,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -827,6 +829,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -871,6 +874,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -1017,6 +1021,7 @@ fn run() -> io::Result<()> {
                         cols: 80,
                         attach: false,
                         auth_token: crate::config::effective_psk(),
+                        env: Vec::new(),
                     });
                     proto::send(&mut stream, &msg)?;
                     match proto::decode_server(&mut stream) {
@@ -1116,6 +1121,7 @@ fn run() -> io::Result<()> {
                 cols: 80,
                 attach: false,
                 auth_token: crate::config::effective_psk(),
+                env: Vec::new(),
             });
             proto::send(&mut stream, &msg)?;
             match proto::decode_server(&mut stream) {
@@ -1593,6 +1599,7 @@ fn list_peers(server: Option<&str>) -> io::Result<()> {
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &ident)?;
     match ipc::stream::decode_with_deadline(&mut stream, std::time::Duration::from_secs(2), |r| {
@@ -1764,6 +1771,7 @@ fn push_psk_to_running_server(psk: &str) -> io::Result<()> {
         cols: 80,
         attach: true,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     let _ = proto::decode_server(&mut stream)?;
@@ -1833,6 +1841,7 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &identify)?;
     let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
@@ -1908,6 +1917,7 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
         cols,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     // Wait for IdentifyAck.
@@ -1951,6 +1961,7 @@ fn cli_capture_window(
         cols,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
@@ -2013,6 +2024,7 @@ fn cli_send_keys(target: &cmd::Target, keys: &[u8], quiet: bool) -> io::Result<(
         cols,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {

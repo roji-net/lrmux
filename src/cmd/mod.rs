@@ -433,6 +433,7 @@ pub fn canonical_name(name: &str) -> &str {
         "display" | "displayp" => "display-message",
         "show" => "show-option",
         "showenv" => "show-environment",
+        "setenv" => "set-environment",
         "set" => "set-option",
         "setw" | "set-window-option" => "set-window-option",
         "neww" => "new-window",

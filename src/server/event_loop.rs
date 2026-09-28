@@ -159,6 +159,29 @@ fn pump_relay_peer(client: &mut ClientConn) -> bool {
     }
 }
 
+/// Terminal-identity vars an attached client may refresh in the
+/// server's environment. Server-side allowlist: clients only send
+/// these anyway, but a hand-rolled TCP client must not be able to
+/// rewrite arbitrary server env (PATH, HOME, …) for future panes.
+const CLIENT_ENV_KEYS: &[&str] = &[
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "TERMINAL_EMULATOR",
+    "WEZTERM_EXECUTABLE",
+    "KITTY_WINDOW_ID",
+];
+
+fn apply_client_env(env: &[(String, String)]) {
+    for (k, v) in env {
+        if CLIENT_ENV_KEYS.contains(&k.as_str()) {
+            // Safety: the event loop is single-threaded.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
 /// TCP clients must present a matching auth_token when the server has one.
 fn check_tcp_auth(client: &ClientConn, token: &str) -> bool {
     tcp_auth_ok(client.is_tcp, token)
@@ -2902,8 +2925,19 @@ fn accept_new_client(
                 Ok(ClientMsg::Identify {
                     attach: a,
                     auth_token,
+                    env,
                     ..
-                }) => (a, false, auth_token),
+                }) => {
+                    // tmux `update-environment`: an interactive attach
+                    // refreshes terminal-identity vars in the server's
+                    // env, so panes spawned later inherit the freshest
+                    // capabilities (e.g. a server started under an old
+                    // terminal gains COLORTERM on the next attach).
+                    if a {
+                        apply_client_env(&env);
+                    }
+                    (a, false, auth_token)
+                }
                 Ok(ClientMsg::IdentifyControl { auth_token, .. }) => (false, true, auth_token),
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
@@ -3283,11 +3317,47 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             } else {
                 String::new()
             };
+            // Optional trailing env pairs (newer clients).
+            let mut env: Vec<(String, String)> = Vec::new();
+            let tok_end = 9 + auth_token.len();
+            if data.len() >= tok_end + 4 {
+                let mut r = &data[tok_end + 4..];
+                let count = u32::from_le_bytes([
+                    data[tok_end],
+                    data[tok_end + 1],
+                    data[tok_end + 2],
+                    data[tok_end + 3],
+                ]) as usize;
+                for _ in 0..count.min(64) {
+                    if r.len() < 4 {
+                        break;
+                    }
+                    let kl = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+                    r = &r[4..];
+                    if r.len() < kl {
+                        break;
+                    }
+                    let k = String::from_utf8_lossy(&r[..kl]).into_owned();
+                    r = &r[kl..];
+                    if r.len() < 4 {
+                        break;
+                    }
+                    let vl = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+                    r = &r[4..];
+                    if r.len() < vl {
+                        break;
+                    }
+                    let v = String::from_utf8_lossy(&r[..vl]).into_owned();
+                    r = &r[vl..];
+                    env.push((k, v));
+                }
+            }
             ClientMsg::Identify {
                 rows,
                 cols,
                 attach,
                 auth_token,
+                env,
             }
         }
         0x02 => ClientMsg::PaneInput {
@@ -4802,6 +4872,40 @@ fn handle_single_control_command(
             }
             // Other window options are accepted as no-ops (lrmux has no
             // per-window option table to store them in).
+            respond(client, &[]);
+        }
+        "set-environment" => {
+            // tmux: set-environment [-g] [-u] <name> [value]
+            // lrmux applies to the server's process env directly, so
+            // `show-environment` and future pane spawns both see it.
+            let args = split_args_shell(args_str);
+            let mut positional: Vec<String> = Vec::new();
+            let mut unset = false;
+            for a in &args {
+                if a == "-u" {
+                    unset = true;
+                } else if !a.starts_with('-') {
+                    positional.push(a.clone());
+                }
+            }
+            if let Some(name) = positional.first() {
+                // Safety: the event loop is single-threaded.
+                unsafe {
+                    if unset {
+                        std::env::remove_var(name);
+                    } else if let Some(val) = positional.get(1) {
+                        std::env::set_var(name, val);
+                    }
+                }
+            }
+            respond(client, &[]);
+        }
+        "unset-environment" => {
+            let args = split_args_shell(args_str);
+            if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
+                // Safety: the event loop is single-threaded.
+                unsafe { std::env::remove_var(name) };
+            }
             respond(client, &[]);
         }
         "show-environment" => {

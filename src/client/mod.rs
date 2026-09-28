@@ -92,6 +92,28 @@ pub struct SelectHint {
     pub session: Option<String>,
 }
 
+/// Terminal-identity vars sent in Identify on interactive attach.
+/// The server refreshes its spawn env with them (tmux
+/// `update-environment`-style), so panes created later inherit the
+/// freshest attaching terminal's capabilities instead of whatever env
+/// the server happened to start with. `TERM` is deliberately absent:
+/// the pane's TERM describes lrmux's own emulation, not the outer
+/// terminal's terminfo name.
+pub fn terminal_env_overlay() -> Vec<(String, String)> {
+    const KEYS: &[&str] = &[
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "LC_TERMINAL",
+        "TERMINAL_EMULATOR",
+        "WEZTERM_EXECUTABLE",
+        "KITTY_WINDOW_ID",
+    ];
+    KEYS.iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect()
+}
+
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
 /// If `select_session` is provided, a SelectSession command is sent to switch to that session.
@@ -129,6 +151,7 @@ pub fn run(
         cols,
         attach: true,
         auth_token: crate::config::effective_psk(),
+        env: terminal_env_overlay(),
     });
     proto::send(&mut stream, &identify)?;
 
