@@ -208,7 +208,7 @@ pub fn run(
     // scrolls only the content area, pushing lines into the terminal's
     // scrollback buffer.
     {
-        let mut stdout = io::stdout();
+        let mut stdout = client_stdout();
         // Clear screen, hide cursor, set scroll region to exclude status bar.
         let view_rows = terminal::get_size().0.saturating_sub(1);
         write!(stdout, "\x1b[2J\x1b[H\x1b[?25l\x1b[1;{}r", view_rows.max(1))?;
@@ -348,7 +348,7 @@ pub fn run(
 
     // Clear screen and do initial render.
     {
-        let mut stdout = io::stdout();
+        let mut stdout = client_stdout();
         stdout.write_all(b"\x1b[2J\x1b[H")?;
         stdout.flush()?;
     }
@@ -378,10 +378,11 @@ pub fn run(
             let (new_rows, new_cols) = terminal::get_size();
             term_rows = new_rows as usize;
             term_cols = new_cols as usize;
+            client_trace_msg("EVT", &format!("sigwinch term={new_cols}x{new_rows}"));
             // Update scroll region to exclude the status bar.
             {
                 let view_rows = term_rows.saturating_sub(1).max(1);
-                let mut stdout = io::stdout();
+                let mut stdout = client_stdout();
                 write!(stdout, "\x1b[1;{}r", view_rows)?;
                 stdout.flush()?;
             }
@@ -395,11 +396,11 @@ pub fn run(
             if let Some(ref cm) = copy_mode {
                 // In copy mode: re-render the copy mode view.
                 let view_rows = term_rows.saturating_sub(1);
-                let mut stdout = io::stdout();
+                let mut stdout = client_stdout();
                 cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
             } else {
                 // Clear screen and re-render everything.
-                let mut stdout = io::stdout();
+                let mut stdout = client_stdout();
                 stdout.write_all(b"\x1b[2J\x1b[H")?;
                 renderer.invalidate();
                 grid.mark_all_dirty();
@@ -450,13 +451,13 @@ pub fn run(
             flash_msg = None;
             flash_deadline = None;
             // Re-render the normal status bar.
-            let mut stdout = io::stdout();
+            let mut stdout = client_stdout();
             render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
         }
 
         // If we have a flash message, render it on the status bar.
         if let Some(ref msg) = flash_msg {
-            let mut stdout = io::stdout();
+            let mut stdout = client_stdout();
             render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
         }
 
@@ -474,6 +475,7 @@ pub fn run(
                 let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n > 0 {
                     raw.extend_from_slice(&buf[..n as usize]);
+                    client_trace("KEY", &buf[..n as usize]);
                 } else if n == 0 {
                     stdin_eof = true;
                 }
@@ -483,6 +485,9 @@ pub fn run(
             // re-encoded for the pane (or handled locally) rather than
             // reaching the child as stray escape bytes.
             let (filtered, mouse_events) = mouse_decoder.feed(&filtered);
+            if !filtered.is_empty() {
+                client_trace("IN", &filtered);
+            }
             if !filtered.is_empty() || !mouse_events.is_empty() {
                 let input = &filtered[..];
 
@@ -579,7 +584,7 @@ pub fn run(
                             cm.vrow = (cm.vrow + 3).min(total - 1);
                         }
                         cm.ensure_cursor_visible(view_rows);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                         continue;
                     }
@@ -610,7 +615,7 @@ pub fn run(
                                 (cm.viewport_top + ev.y.saturating_sub(1) as usize).min(total - 1);
                             cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                         }
                         continue;
@@ -637,7 +642,7 @@ pub fn run(
                                 .min(grid.scrollback.len() + grid.rows() - 1);
                             cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                         }
                         mouse_anchor = None;
@@ -721,7 +726,7 @@ pub fn run(
                                 };
                                 if handled {
                                     i += 3;
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     cm.render(
                                         &mut stdout,
                                         &grid,
@@ -751,7 +756,7 @@ pub fn run(
                                 };
                                 if handled {
                                     i += 4;
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     cm.render(
                                         &mut stdout,
                                         &grid,
@@ -773,7 +778,7 @@ pub fn run(
                             let action = cm.process_key(input[i], &grid, view_rows);
                             match action {
                                 copy_mode::CopyAction::Continue => {
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     cm.render(
                                         &mut stdout,
                                         &grid,
@@ -844,7 +849,7 @@ pub fn run(
                         renderer.invalidate();
                         // Re-establish the scroll region and re-render.
                         let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                         renderer.render(&mut stdout, &mut grid)?;
                         render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
@@ -860,7 +865,7 @@ pub fn run(
                         flash_msg = Some(msg);
                         flash_deadline =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         render_flash_status_bar(
                             &mut stdout,
                             flash_msg.as_ref().unwrap(),
@@ -891,7 +896,7 @@ pub fn run(
                             grid.cursor_col,
                         ));
                         let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         copy_mode.as_ref().unwrap().render(
                             &mut stdout,
                             &grid,
@@ -931,7 +936,7 @@ pub fn run(
                             match action {
                                 ConfirmAction::Confirmed | ConfirmAction::Cancelled => {
                                     confirm_state = ConfirmState::None;
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     render_status_bar(
                                         &mut stdout,
                                         &status_text,
@@ -958,7 +963,7 @@ pub fn run(
                                     std::time::Instant::now() + std::time::Duration::from_secs(8),
                                 );
                             }
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             render_status_bar(
                                 &mut stdout,
                                 &status_text,
@@ -969,7 +974,7 @@ pub fn run(
                         }
                         ConfirmAction::Cancelled => {
                             confirm_state = ConfirmState::None;
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             render_status_bar(
                                 &mut stdout,
                                 &status_text,
@@ -1033,7 +1038,7 @@ pub fn run(
                             // GridSnapshot) would scroll the just-rendered
                             // content off screen, leaving it blank.
                             if n > 0 && copy_mode.is_none() && !replay {
-                                let mut stdout = io::stdout();
+                                let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
                                 // The terminal shifted all content up by n lines.
@@ -1058,6 +1063,13 @@ pub fn run(
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
                             grid.set_mouse_flags(mouse_flags);
+                            client_trace_msg(
+                                "EVT",
+                                &format!(
+                                    "grid-update dirty={}rows cur={cursor_row};{cursor_col} vis={cursor_visible}",
+                                    dirty.len()
+                                ),
+                            );
                             needs_render = true;
                         }
                         ServerMsg::GridSnapshot {
@@ -1095,7 +1107,11 @@ pub fn run(
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
                             grid.set_mouse_flags(mouse_flags);
-                            let mut stdout = io::stdout();
+                            client_trace_msg(
+                                "EVT",
+                                &format!("snapshot {rows}x{cols} cur={cursor_row};{cursor_col}"),
+                            );
+                            let mut stdout = client_stdout();
                             // Reset scroll region to full screen, clear, then
                             // re-establish the scroll region. This ensures the
                             // clear affects the entire screen and the terminal
@@ -1145,7 +1161,7 @@ pub fn run(
                                 &server,
                                 &activity,
                             );
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             if let Some(ref msg) = flash_msg {
                                 render_flash_status_bar(
                                     &mut stdout,
@@ -1187,7 +1203,7 @@ pub fn run(
                                 // Invalidate the renderer so the screen is fully redrawn.
                                 renderer.invalidate();
                                 let view_rows = term_rows.saturating_sub(1);
-                                let mut stdout = io::stdout();
+                                let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                                 renderer.render(&mut stdout, &mut grid)?;
                             }
@@ -1199,7 +1215,7 @@ pub fn run(
                             renderer.invalidate();
                             // Re-establish the scroll region and re-render.
                             let view_rows = term_rows.saturating_sub(1);
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                             renderer.render(&mut stdout, &mut grid)?;
                         }
@@ -1219,7 +1235,7 @@ pub fn run(
                             // Child asked for the real terminal's fg/bg color.
                             // Flush any pending render bytes first so the OSC
                             // query isn't stuck behind a partial stdout write.
-                            let _ = io::stdout().flush();
+                            let _ = client_stdout().flush();
                             let mut probe_leftover = Vec::new();
                             if let Some(reply) =
                                 query_outer_osc_color(code, bell_terminated, &mut probe_leftover)
@@ -1250,12 +1266,16 @@ pub fn run(
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
                 if needs_render && exit_reason.is_none() {
+                    client_trace_msg(
+                        "EVT",
+                        &format!("render cur={};{}", grid.cursor_row, grid.cursor_col),
+                    );
                     if let Some(ref cm) = copy_mode {
                         let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                     } else {
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         renderer.render(&mut stdout, &mut grid)?;
                         render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
                     }
@@ -1713,7 +1733,7 @@ fn take_network_setup_flash() -> Option<String> {
 
 /// Render the confirmation prompt on the status bar line.
 fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let row = term_rows;
     // Reset SGR before clear/write so reverse/underline from the pane
     // cannot bleed into the prompt (same issue as the status bar).
@@ -1862,7 +1882,7 @@ fn format_status_bar(
 /// The status bar always occupies the last row of the terminal (term_rows).
 /// After rendering, the cursor is repositioned to the grid cursor location.
 fn render_status_bar(
-    stdout: &mut io::Stdout,
+    stdout: &mut TraceStdout,
     text: &str,
     term_rows: usize,
     term_cols: usize,
@@ -1909,7 +1929,7 @@ fn render_status_bar(
 
 /// Render the status bar with a flash message appended on the right.
 fn render_flash_status_bar(
-    stdout: &mut io::Stdout,
+    stdout: &mut TraceStdout,
     msg: &str,
     normal_text: &str,
     term_rows: usize,
@@ -2010,7 +2030,7 @@ fn restore_normal_view(
     term_rows: usize,
     term_cols: usize,
 ) -> io::Result<()> {
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     // Hide cursor (copy mode shows it; normal mode hides it).
     stdout.write_all(b"\x1b[?25l")?;
     // Reset scroll region to exclude status bar, then clear and re-render.
@@ -2020,7 +2040,13 @@ fn restore_normal_view(
     grid.mark_all_dirty();
     renderer.render(&mut stdout, grid)?;
     render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
-    render_status_bar(&mut io::stdout(), status_text, term_rows, term_cols, grid)?;
+    render_status_bar(
+        &mut client_stdout(),
+        status_text,
+        term_rows,
+        term_cols,
+        grid,
+    )?;
     Ok(())
 }
 
@@ -2028,7 +2054,7 @@ fn restore_normal_view(
 /// terminal is larger than the grid. Uses a dim background with a thin
 /// border line separating content from filler (per §2.16 of the design doc).
 fn render_filler(
-    stdout: &mut io::Stdout,
+    stdout: &mut TraceStdout,
     grid_rows: usize,
     grid_cols: usize,
     term_rows: usize,
@@ -2132,7 +2158,7 @@ fn apply_row(grid: &mut Grid, row: usize, cells: &[Cell]) {
 
 /// Restore the terminal (exit alternate screen, show cursor).
 fn restore_terminal() {
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     // Disable mouse reporting we may have enabled, reset scroll region
     // to full screen, show cursor, clear screen.
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
@@ -2148,7 +2174,7 @@ fn sync_mouse_modes(applied: &mut Option<u8>, grid: &Grid, decoder: &mut mouse::
     if *applied == Some(desired) {
         return;
     }
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
     let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
     let _ = stdout.flush();
@@ -2175,7 +2201,7 @@ fn try_parse_server_frame(buf: &mut Vec<u8>) -> io::Result<Option<ServerMsg>> {
 /// Waits for any key to dismiss.
 fn show_log_overlay(lines: &[String]) {
     use std::io::Read;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let (rows, cols) = terminal::get_size();
 
     // Clear screen and show the log.
@@ -2218,7 +2244,7 @@ fn show_log_overlay(lines: &[String]) {
 /// Returns the selected session name, or None if cancelled.
 fn show_session_chooser(sessions: &[String]) -> Option<String> {
     use std::io::Read;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let (rows, _cols) = terminal::get_size();
 
     write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
@@ -2257,7 +2283,7 @@ fn show_session_chooser(sessions: &[String]) -> Option<String> {
 /// Waits for any key to dismiss.
 fn show_help_overlay(server_version: &str) {
     use std::io::Read;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let (rows, _cols) = terminal::get_size();
 
     write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
@@ -2474,6 +2500,7 @@ fn query_osc_on_fds(
             let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
             if n > 0 {
                 extra_input.extend_from_slice(&tmp[..n as usize]);
+                client_trace("KEY", &tmp[..n as usize]);
                 continue;
             }
             break;
@@ -2481,6 +2508,7 @@ fn query_osc_on_fds(
     }
 
     let w = unsafe { libc::write(write_fd, query.as_ptr() as *const _, query.len()) };
+    client_trace("QRY", query);
     if w < 0 {
         if fl >= 0 {
             unsafe {
@@ -2490,7 +2518,7 @@ fn query_osc_on_fds(
         return None;
     }
     if write_fd == libc::STDOUT_FILENO {
-        let _ = io::stdout().flush();
+        let _ = client_stdout().flush();
     }
 
     let mut buf = Vec::with_capacity(128);
@@ -2521,6 +2549,7 @@ fn query_osc_on_fds(
             continue;
         }
         buf.extend_from_slice(&tmp[..n as usize]);
+        client_trace("KEY", &tmp[..n as usize]);
         if let Some(end) = osc_reply_end(&buf) {
             // Anything before/after the reply bytes is user input that
             // raced the probe — hand it back, don't eat it.
@@ -2565,6 +2594,87 @@ fn osc_reply_end(buf: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+// --- Byte-level client trace (LRMUX_TRACE) ---
+//
+// `client-<pid>.trace` records, with millisecond timestamps relative to
+// the client's first traced event:
+//   KEY — raw bytes read from stdin (before filtering)
+//   IN  — bytes that survived the input filter / mouse split (pane-bound)
+//   OUT — bytes written to the outer terminal (renderer, status bar, …)
+//   EVT — non-byte events (snapshot applied, resize, refresh)
+
+/// Shared client trace file, opened lazily once per process.
+fn client_trace_file() -> Option<&'static Mutex<std::fs::File>> {
+    static F: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        crate::log::open_trace(&format!("client-{}.trace", std::process::id())).map(Mutex::new)
+    })
+    .as_ref()
+}
+
+/// Append a timestamped line to the client trace (no-op when disabled).
+fn client_trace(tag: &str, data: &[u8]) {
+    if let Some(f) = client_trace_file()
+        && let Ok(mut g) = f.lock()
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let ms = START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
+            * 1000.0;
+        let _ = writeln!(
+            g,
+            "[+{ms:>11.3}ms] {tag} len={:5} | {}",
+            data.len(),
+            crate::log::vis_bytes(data)
+        );
+    }
+}
+
+/// Same as `client_trace` for text events (resize, snapshot, …).
+fn client_trace_msg(tag: &str, msg: &str) {
+    client_trace(tag, msg.as_bytes());
+}
+
+/// stdout that tees every write into the client trace file.
+/// `write_fmt` (the `write!` macro path) lands as one traced line per
+/// call via the `write_all` override.
+pub(crate) struct TraceStdout {
+    inner: io::Stdout,
+}
+
+pub(crate) fn client_stdout() -> TraceStdout {
+    TraceStdout {
+        inner: io::stdout(),
+    }
+}
+
+impl Write for TraceStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        client_trace("OUT", buf);
+        self.inner.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        client_trace("OUT", buf);
+        self.inner.write_all(buf)
+    }
+
+    // `write!` would otherwise land as one line per format piece —
+    // materialize the arguments so a trace line holds a whole sequence.
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        if client_trace_file().is_some() {
+            client_trace("OUT", args.to_string().as_bytes());
+        }
+        self.inner.write_fmt(args)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(test)]

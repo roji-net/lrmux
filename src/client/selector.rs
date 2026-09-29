@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::client::inventory::{self, ServerEntry};
-use crate::client::terminal;
+use crate::client::{client_stdout, terminal};
 use crate::ipc;
 use crate::proto::SessionInfo;
 
@@ -355,7 +355,7 @@ fn name_prompt(
     _extra: Option<&str>,
 ) -> Option<(String, ())> {
     let _raw = terminal::enter_raw_mode().ok()?;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let mut name = default.to_string();
     // The prefilled default starts "selected": the first printable key
     // replaces it entirely (Save-As dialog style).
@@ -458,7 +458,7 @@ fn interactive_selector(
     hint: Option<crate::client::SelectHint>,
 ) -> io::Result<SelectorResult> {
     let _raw_guard = terminal::enter_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
 
     // Pre-select the session the user just detached from (Ctrl-A /).
     let mut selected: usize = hint
@@ -899,7 +899,7 @@ fn view_popup(title: &str, content: &str) -> io::Result<()> {
     let lines: Vec<&str> = content.lines().collect();
     let view_rows = (rows as usize).saturating_sub(3);
     let mut scroll = 0usize;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let max_scroll = lines.len().saturating_sub(view_rows);
     loop {
         write!(stdout, "\x1b[2J\x1b[H")?;

@@ -37,6 +37,10 @@ pub struct Pane {
     pub default_fg: Option<(u8, u8, u8)>,
     /// Last known outer-terminal default background (OSC 11), if observed.
     pub default_bg: Option<(u8, u8, u8)>,
+    /// Byte-level trace file for this pane (enabled by LRMUX_TRACE).
+    trace: Option<std::fs::File>,
+    /// Trace clock origin (pane spawn time).
+    trace_start: std::time::Instant,
 }
 
 impl Pane {
@@ -103,6 +107,15 @@ impl Pane {
         extra_env.extend(env.iter().cloned());
         let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd, &extra_env);
 
+        let mut trace = open_pane_trace(id);
+        if let Some(ref mut f) = trace {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "# pane %{id} session ${session_id} argv={:?} size={}x{}",
+                argv, cols, rows
+            );
+        }
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {
@@ -118,6 +131,8 @@ impl Pane {
             cc_utf8_pending: Vec::new(),
             default_fg: None,
             default_bg: None,
+            trace,
+            trace_start: std::time::Instant::now(),
         }
     }
 
@@ -165,6 +180,27 @@ impl Pane {
         format!("%{}", self.id)
     }
 
+    /// Trace a non-byte event (resize, exit, …) as an EVT line.
+    pub fn trace_event(&mut self, msg: &str) {
+        self.trace("EVT", msg.as_bytes());
+    }
+
+    /// Append one timestamped line to this pane's trace file, when enabled
+    /// (`LRMUX_TRACE`). Tags: IN = client keystrokes→PTY, OUT = PTY→grid,
+    /// RPL = our replies to the child's terminal queries.
+    fn trace(&mut self, tag: &str, data: &[u8]) {
+        if let Some(ref mut f) = self.trace {
+            use std::io::Write;
+            let ms = self.trace_start.elapsed().as_secs_f64() * 1000.0;
+            let _ = writeln!(
+                f,
+                "[+{ms:>11.3}ms] {tag} len={:5} | {}",
+                data.len(),
+                crate::log::vis_bytes(data)
+            );
+        }
+    }
+
     /// Get the PTY master fd (for poll). Returns -1 if the child has exited.
     pub fn pty_fd(&self) -> i32 {
         if self.exited {
@@ -196,6 +232,7 @@ impl Pane {
             if n > 0 {
                 let n = n as usize;
                 raw.extend_from_slice(&buf[..n]);
+                self.trace("OUT", &buf[..n]);
                 if let Ok(path) = std::env::var("LRMUX_VT_DUMP") {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -209,7 +246,7 @@ impl Pane {
                 let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
                 if !parsed.immediate_replies.is_empty() {
                     // CPR / DSR / DA — answer from our grid state.
-                    self.write_input(&parsed.immediate_replies)?;
+                    self.write_input_tagged("RPL", &parsed.immediate_replies)?;
                 }
                 osc_queries.extend(parsed.osc_queries);
                 if raw.len() >= MAX_DRAIN {
@@ -290,6 +327,13 @@ impl Pane {
     /// event loop when the PTY becomes writable. This keeps escape sequences
     /// intact (e.g., arrow keys) instead of splitting them across writes.
     pub fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_input_tagged("IN", data)
+    }
+
+    /// `write_input` with a trace tag distinguishing the byte source
+    /// ("IN" = client input, "RPL" = our terminal-query replies).
+    pub(crate) fn write_input_tagged(&mut self, tag: &str, data: &[u8]) -> io::Result<()> {
+        self.trace(tag, data);
         self.pending_input.extend_from_slice(data);
         self.flush_pending_input()?;
         // `flush_pending_input` holds an incomplete ESC sequence until more
@@ -638,6 +682,19 @@ mod tests {
     }
 
     #[test]
+    fn vis_bytes_escapes_controls_keeps_utf8() {
+        use crate::log::vis_bytes;
+        assert_eq!(vis_bytes(b"hi\r\n"), "hi\\r\\n");
+        assert_eq!(vis_bytes(b"\x1b[6n"), "\\e[6n");
+        assert_eq!(vis_bytes(b"\x07bel\x01"), "\\abel\\x01");
+        // Box-drawing char ─ stays a char, not three \xNN escapes.
+        assert_eq!(vis_bytes("─x".as_bytes()), "─x");
+        // Invalid UTF-8 byte -> hex escape; C1 control -> \u{..}
+        assert_eq!(vis_bytes(&[0xff]), "\\xff");
+        assert_eq!(vis_bytes(&[0xc2, 0x9b]), "\\u{9b}");
+    }
+
+    #[test]
     fn tmux_env_pairs_match_tmux_shape() {
         let env = tmux_env_pairs("/tmp/lrmux-501/srv", 12345, 7, 3);
         assert_eq!(env.len(), 4);
@@ -732,4 +789,10 @@ fn tmux_env_pairs(
             crate::client::tmux_shim::TMUX_VERSION.into(),
         ),
     ]
+}
+
+/// Open this pane's byte-trace file (`LRMUX_TRACE`), or None when
+/// tracing is disabled.
+fn open_pane_trace(pane_id: u32) -> Option<std::fs::File> {
+    crate::log::open_trace(&format!("pane-%{pane_id}.trace"))
 }

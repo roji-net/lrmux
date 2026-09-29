@@ -710,6 +710,35 @@ server replies with the available session/window names and a "did you
 mean …" suggestion for near matches (edit distance or prefix). If the
 missed session name is also a running server, the CLI hints at `-s`.
 
+#### Diagnostics and byte tracing
+
+Logging (`/tmp/lrmux-<uid>/logs/<server>.log`, `Ctrl-A \` ring view,
+`LRMUX_LOG_LEVEL=debug|info|warn|error`, `LRMUX_SYSLOG=host:port`)
+records events; sometimes a bug needs the exact byte stream instead.
+`LRMUX_TRACE` enables per-process byte traces:
+
+- **Panes** — `pane-%<id>.trace`: `IN` client keystrokes written to the
+  PTY, `OUT` raw bytes read from the PTY (child output before VT
+  parsing), `RPL` replies we generate to the child's terminal queries
+  (CPR/DSR/DA and proxied OSC answers), `EVT` pane events (resize,
+  child exit).
+- **Attached clients** — `client-<pid>.trace`: `KEY` raw bytes read
+  from stdin (including bytes consumed by palette probes), `IN` bytes
+  that survived the input filter toward the pane, `QRY` queries we send
+  to the outer terminal, `OUT` everything written to the outer
+  terminal, `EVT` client events (snapshot, render cursor, SIGWINCH).
+
+`LRMUX_TRACE=<dir>` places the files there; any other non-empty value
+defaults to `/tmp/lrmux-<uid>/logs`. Lines are
+`[+mmmmm.mmmms] TAG len=N | bytes`, relative to the trace's first
+event; printable UTF-8 is kept, control bytes appear as
+`\e`/`\r`/`\n`/`\a`/`\xNN`. `LRMUX_VT_DUMP=<file>` remains as a raw
+(byte-exact, unannotated) dump of PTY output for replay through a
+parser.
+
+Traces may contain everything typed or displayed — commands, prompts,
+secrets. Share or retain them accordingly.
+
 ---
 
 ## 8. Development Roadmap

@@ -666,6 +666,7 @@ pub fn run(
                             proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
                         }
                         let exit_code = pane.reap_child().unwrap_or(0);
+                        pane.trace_event(&format!("child exited, code {exit_code}"));
                         pty_exits.push((si, wi, exit_code));
                     }
                     Err(e) => {
@@ -853,6 +854,10 @@ pub fn run(
                                             if si < sessions.len() {
                                                 for w in &mut sessions[si].windows {
                                                     w.pane.resize(new_grid_rows, new_grid_cols);
+                                                    w.pane.trace_event(&format!(
+                                                        "resize {}x{new_grid_rows}",
+                                                        new_grid_cols
+                                                    ));
                                                 }
                                             }
                                             // Update global grid size if the first session was resized
@@ -895,7 +900,7 @@ pub fn run(
                                                     .note_osc_color_reply(&data);
                                                 let _ = sessions[si].windows[wi]
                                                     .pane
-                                                    .write_input(&data);
+                                                    .write_input_tagged("RPL", &data);
                                             }
                                         }
                                         ClientMsg::TermPalette { fg, bg } => {
@@ -4848,6 +4853,7 @@ fn handle_single_control_command(
                             && (window.pane.cols != cols || window.pane.rows != rows)
                         {
                             window.pane.resize(rows, cols);
+                            window.pane.trace_event(&format!("resize {cols}x{rows}"));
                             send_control_notify(
                                 client,
                                 &format!(
