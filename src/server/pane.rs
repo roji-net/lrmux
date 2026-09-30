@@ -794,5 +794,8 @@ fn tmux_env_pairs(
 /// Open this pane's byte-trace file (`LRMUX_TRACE`), or None when
 /// tracing is disabled.
 fn open_pane_trace(pane_id: u32) -> Option<std::fs::File> {
-    crate::log::open_trace(&format!("pane-%{pane_id}.trace"))
+    // Namespace by server name: every server shares the same logs dir,
+    // so a bare pane-%N.trace would be overwritten by each server.
+    let server = crate::server::server_name();
+    crate::log::open_trace(&format!("pane-{server}-%{pane_id}.trace"))
 }

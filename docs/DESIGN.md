@@ -719,7 +719,9 @@ Logging (`/tmp/lrmux-<uid>/logs/<server>.log`, `Ctrl-A \` ring view,
 records events; sometimes a bug needs the exact byte stream instead.
 `LRMUX_TRACE` enables per-process byte traces:
 
-- **Panes** — `pane-%<id>.trace`: `IN` client keystrokes written to the
+- **Panes** — `pane-<server>-%<id>.trace` (namespaced by server name so
+  concurrent servers don't overwrite each other's pane traces):
+  `IN` client keystrokes written to the
   PTY, `OUT` raw bytes read from the PTY (child output before VT
   parsing), `RPL` replies we generate to the child's terminal queries
   (CPR/DSR/DA and OSC color answers, local or proxied), `EVT` pane
