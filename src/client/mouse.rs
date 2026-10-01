@@ -294,20 +294,24 @@ pub fn encode_report(fmt: u8, ev: &Event) -> Vec<u8> {
 }
 
 /// DECSET string to enable mouse reporting on the outer terminal.
-/// `tracking` is the child's mask (bits 0-2 = 1000/1002/1003); the client
-/// always ORs in 1002 itself — button-event tracking gives drag reports,
-/// which local copy-mode selection needs even when the child wants nothing.
+/// `tracking` is the mask to enable (bits 0-2 = 1000/1002/1003). A zero
+/// mask returns an empty string: reporting stays off and the outer
+/// terminal keeps its native wheel scrollback and drag selection.
 /// SGR encoding (1006) is always requested so reports are unambiguous.
 pub fn terminal_setup(tracking: u8) -> String {
-    let track = tracking | 0b010;
-    let mut s = String::from("\x1b[?1002h");
-    if track & 1 != 0 {
+    let mut s = String::new();
+    if tracking & 1 != 0 {
         s.push_str("\x1b[?1000h");
     }
-    if track & 4 != 0 {
+    if tracking & 2 != 0 {
+        s.push_str("\x1b[?1002h");
+    }
+    if tracking & 4 != 0 {
         s.push_str("\x1b[?1003h");
     }
-    s.push_str("\x1b[?1006h");
+    if tracking != 0 {
+        s.push_str("\x1b[?1006h");
+    }
     s
 }
 
@@ -476,5 +480,36 @@ mod tests {
         let (kb, evs) = d.feed(&bytes);
         assert!(kb.is_empty());
         assert_eq!(evs, [ev]);
+    }
+
+    #[test]
+    fn inactive_decoder_passes_through() {
+        // Reporting off: every byte — including a report-looking escape —
+        // reaches the pane untouched and a bare Esc is never held.
+        let mut d = Decoder::new();
+        let (kb, evs) = d.feed(b"\x1b\x1b[<0;1;1Mabc");
+        assert_eq!(kb, b"\x1b\x1b[<0;1;1Mabc");
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn deactivate_flushes_held_bytes() {
+        let mut d = Decoder::new();
+        d.set_active(true);
+        let (kb, _) = d.feed(b"\x1b[<0;1");
+        assert!(kb.is_empty()); // held as a possible report fragment
+        d.set_active(false);
+        let (kb, evs) = d.feed(b"x");
+        assert_eq!(kb, b"\x1b[<0;1x");
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn setup_empty_without_tracking() {
+        // No tracking mask → no DECSET at all: the outer terminal keeps
+        // native wheel scrollback and drag selection.
+        assert_eq!(terminal_setup(0), "");
+        assert_eq!(terminal_setup(0b010), "\x1b[?1002h\x1b[?1006h");
+        assert_eq!(terminal_setup(0b101), "\x1b[?1000h\x1b[?1003h\x1b[?1006h");
     }
 }

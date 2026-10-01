@@ -132,8 +132,9 @@ enum CliAction {
     ListWindows(Option<String>),
     /// `kill-server -t <name>`: kill a named server.
     KillServer(String),
-    /// `new-window -t <target> -n <name> -c <cwd> [-- <cmd>]`
+    /// `new-window -s <server> -t <target> -n <name> -c <cwd> [-- <cmd>]`
     NewWindow {
+        server: Option<String>,
         target: cmd::Target,
         name: Option<String>,
         cwd: Option<String>,
@@ -151,8 +152,9 @@ enum CliAction {
         clipboard: bool,
         file: Option<String>,
     },
-    /// `send-keys -t <target> <keys> -q`: send keys to a pane's PTY.
+    /// `send-keys -s <server> -t <target> <keys> -q`: send keys to a pane's PTY.
     SendKeys {
+        server: Option<String>,
         target: cmd::Target,
         keys: Vec<u8>,
         quiet: bool,
@@ -588,6 +590,10 @@ fn parse_new_window(args: &[String]) -> CliAction {
         .map(|s| s.to_string());
     let command = shell_command_from_parsed(&parsed);
     CliAction::NewWindow {
+        server: parsed
+            .get("s")
+            .or_else(|| parsed.get("server"))
+            .map(|s| s.to_string()),
         target: parsed.target(),
         name,
         cwd,
@@ -602,6 +608,10 @@ fn parse_send_keys(args: &[String]) -> CliAction {
     let quiet = parsed.has("q") || parsed.has("quiet");
     let keys = parse_tmux_keys(&parsed.positional);
     CliAction::SendKeys {
+        server: parsed
+            .get("s")
+            .or_else(|| parsed.get("server"))
+            .map(|s| s.to_string()),
         target: parsed.target(),
         keys,
         quiet,
@@ -1241,11 +1251,12 @@ fn run() -> io::Result<()> {
         }
         CliAction::KillServer(name) => kill_server(&name),
         CliAction::NewWindow {
+            server,
             target,
             name: _,
             cwd: _,
             command,
-        } => cli_new_window(&target, command),
+        } => cli_new_window(server.as_deref(), &target, command),
         CliAction::KillWindow(_target) => {
             eprintln!("lrmux: kill-window not yet implemented");
             Ok(())
@@ -1276,10 +1287,11 @@ fn run() -> io::Result<()> {
             file.as_deref(),
         ),
         CliAction::SendKeys {
+            server,
             target,
             keys,
             quiet,
-        } => cli_send_keys(&target, &keys, quiet),
+        } => cli_send_keys(server.as_deref(), &target, &keys, quiet),
     }
 }
 
@@ -1926,11 +1938,18 @@ fn kill_server(name: &str) -> io::Result<()> {
 }
 
 /// CLI: create a new window in a session.
-fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<()> {
+fn cli_new_window(
+    server_flag: Option<&str>,
+    target: &cmd::Target,
+    command: Option<String>,
+) -> io::Result<()> {
     // Inside a pane, default to the pane's server (LRMUX_SERVER) and
     // session (LRMUX_SESSION, "$id" form) — otherwise the window lands
     // on server "default"/session 0 regardless of where lrmux ran.
-    let server = std::env::var("LRMUX_SERVER").unwrap_or_else(|_| "default".to_string());
+    let server = server_flag
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LRMUX_SERVER").ok())
+        .unwrap_or_else(|| "default".to_string());
     let session = target
         .session
         .clone()
@@ -2120,8 +2139,19 @@ fn cli_capture_window(
 }
 
 /// CLI: send keys to a pane's PTY.
-fn cli_send_keys(target: &cmd::Target, keys: &[u8], quiet: bool) -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
+fn cli_send_keys(
+    server: Option<&str>,
+    target: &cmd::Target,
+    keys: &[u8],
+    quiet: bool,
+) -> io::Result<()> {
+    // Inside a pane, default to the pane's server (LRMUX_SERVER), like
+    // cli_new_window — otherwise send-keys always lands on "default".
+    let server = server
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LRMUX_SERVER").ok())
+        .unwrap_or_else(|| "default".to_string());
+    let mut stream = connect_to_server(&server)?;
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
         rows,

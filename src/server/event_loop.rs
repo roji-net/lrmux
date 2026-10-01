@@ -3027,36 +3027,6 @@ fn accept_new_client(
             {
                 let _ = clear_window_activity(&mut sessions[session_idx], active);
             }
-            // Only send snapshot + status bar to interactive clients (attach=true).
-            // CLI commands (attach=false) only need the IdentifyAck.
-            if attach {
-                if let Some(session) = sessions.get(session_idx)
-                    && let Some(window) = session.windows.get(active)
-                {
-                    let pane = &window.pane;
-                    let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-                    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-                        rows: pane.rows,
-                        cols: pane.cols,
-                        cells: pane.snapshot(),
-                        cursor_row,
-                        cursor_col,
-                        cursor_visible,
-                        mouse_flags: pane.grid.mouse_flags(),
-                    });
-                    if proto::send(&mut stream, &snapshot).is_err() {
-                        return Ok(());
-                    }
-                }
-
-                // Send status bar.
-                if let Some(session) = sessions.get(session_idx) {
-                    let status =
-                        encode_status_bar(session, active as u16, sessions.len() as u16, false);
-                    let _ = proto::send(&mut stream, &status);
-                }
-            }
-
             let mut conn = ClientConn::new(stream, attach);
             conn.session_idx = session_idx;
             conn.active_window = active;
@@ -3069,6 +3039,19 @@ fn accept_new_client(
             // outbuf so a stalled client can't freeze the event loop.
             let _ = conn.stream.set_nonblocking(true);
             clients.push(conn);
+            let ci = clients.len() - 1;
+            // Only send snapshot + status bar to interactive clients
+            // (attach=true). CLI commands (attach=false) only need the
+            // IdentifyAck. send_snapshot_to_client is the same path window
+            // switches use — it also replays pane scrollback so a fresh
+            // attach has history for copy mode.
+            if attach {
+                if send_snapshot_to_client(&mut clients[ci], sessions).is_err() {
+                    clients.remove(ci);
+                    return Ok(());
+                }
+                send_status_bar_to_client(&mut clients[ci], sessions);
+            }
             // Like real tmux -CC, emit the initial state right away —
             // silence after the DCS makes iTerm2 think tmux is hung.
             if is_control {

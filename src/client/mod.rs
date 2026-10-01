@@ -259,11 +259,11 @@ pub fn run(
     // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
     // responses to our probes are client-side traffic, not pane input.
     let mut input_filter = input_filter::InputFilter::new();
-    // Mouse report decoder — the outer terminal is always in a reporting
-    // mode while attached: reports feed the child (when it tracks the
-    // mouse) or local copy-mode selection otherwise.
+    // Mouse report decoder — only active while the outer terminal is in
+    // a reporting mode (see sync_mouse_modes): reports feed the child
+    // (when it tracks the mouse) or local copy-mode selection. Inactive
+    // it is a pass-through, so keystrokes see zero added latency.
     let mut mouse_decoder = mouse::Decoder::new();
-    mouse_decoder.set_active(true);
     // Tracking mask currently applied to the outer terminal (None = not yet).
     let mut applied_mouse: Option<u8> = None;
     // Pending mouse-press position (x, y): arms a local selection — the
@@ -496,6 +496,10 @@ pub fn run(
                 // (and always locally while copy mode is active).
                 let view_rows = term_rows.saturating_sub(1);
                 let mut mouse_copy_action: Option<copy_mode::CopyAction> = None;
+                // Copy-mode view dirty: drags/wheel arrive in bursts, so
+                // render once after the batch instead of per event — a full
+                // repaint per motion event is what made selection flicker.
+                let mut redraw_cm = false;
                 for ev in &mouse_events {
                     // The status bar row is lrmux's own UI — clicks there
                     // never reach the pane (the bounds check below already
@@ -559,33 +563,29 @@ pub fn run(
                             proto::send(&mut stream, &msg)?;
                             continue;
                         }
-                        // Wheel scrolls the copy-mode view (entering it on
-                        // wheel-up — like tmux mouse mode).
-                        if copy_mode.is_none() {
-                            if !ev.is_wheel_up() {
-                                continue;
+                        // Inside copy mode the wheel scrolls the copy-mode
+                        // view (exits when it reaches the bottom).
+                        if let Some(cm) = copy_mode.as_mut() {
+                            let total = grid.scrollback.len() + grid.rows();
+                            if ev.is_wheel_up() {
+                                cm.vrow = cm.vrow.saturating_sub(3);
+                            } else {
+                                if cm.vrow >= total.saturating_sub(1) {
+                                    // Already at the bottom — leave copy mode.
+                                    mouse_copy_action = Some(copy_mode::CopyAction::Quit);
+                                    break;
+                                }
+                                cm.vrow = (cm.vrow + 3).min(total - 1);
                             }
-                            copy_mode = Some(copy_mode::CopyMode::new(
-                                grid.scrollback.len(),
-                                grid.cursor_row,
-                                grid.cursor_col,
-                            ));
+                            cm.ensure_cursor_visible(view_rows);
+                            redraw_cm = true;
+                            continue;
                         }
-                        let cm = copy_mode.as_mut().unwrap();
-                        let total = grid.scrollback.len() + grid.rows();
-                        if ev.is_wheel_up() {
-                            cm.vrow = cm.vrow.saturating_sub(3);
-                        } else {
-                            if cm.vrow >= total.saturating_sub(1) {
-                                // Already at the bottom — leave copy mode.
-                                mouse_copy_action = Some(copy_mode::CopyAction::Quit);
-                                break;
-                            }
-                            cm.vrow = (cm.vrow + 3).min(total - 1);
-                        }
-                        cm.ensure_cursor_visible(view_rows);
-                        let mut stdout = client_stdout();
-                        cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        // Otherwise the wheel isn't ours to interpret: when
+                        // the child doesn't track the mouse and altscroll
+                        // isn't set, outer-terminal reporting is off and no
+                        // report can reach us — the terminal scrolls its own
+                        // scrollback natively.
                         continue;
                     }
                     if ev.is_motion() {
@@ -610,13 +610,17 @@ pub fn run(
                         if let Some(cm) = copy_mode.as_mut()
                             && cm.selection_start.is_some()
                         {
+                            let before = (cm.vrow, cm.vcol, cm.viewport_top);
                             let total = grid.scrollback.len() + grid.rows();
                             cm.vrow =
                                 (cm.viewport_top + ev.y.saturating_sub(1) as usize).min(total - 1);
                             cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
-                            let mut stdout = client_stdout();
-                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                            // Skip the redraw when the motion stayed inside
+                            // the same cell — nothing changed on screen.
+                            if (cm.vrow, cm.vcol, cm.viewport_top) != before {
+                                redraw_cm = true;
+                            }
                         }
                         continue;
                     }
@@ -642,8 +646,7 @@ pub fn run(
                                 .min(grid.scrollback.len() + grid.rows() - 1);
                             cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
-                            let mut stdout = client_stdout();
-                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                            redraw_cm = true;
                         }
                         mouse_anchor = None;
                         continue;
@@ -682,6 +685,11 @@ pub fn run(
                         }
                         copy_mode::CopyAction::Continue => {}
                     }
+                }
+                // One repaint per input batch for copy-mode view changes.
+                if redraw_cm && let Some(cm) = copy_mode.as_ref() {
+                    let mut stdout = client_stdout();
+                    cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                 }
 
                 if copy_mode.is_some() {
@@ -990,6 +998,14 @@ pub fn run(
                 }
             }
         }
+        // Copy mode toggles via input — keep outer mouse reporting in
+        // sync (it backs drag-select while copy mode is active).
+        sync_mouse_modes(
+            &mut applied_mouse,
+            &grid,
+            &mut mouse_decoder,
+            copy_mode.is_some(),
+        );
         if stdin_eof {
             break;
         }
@@ -1029,6 +1045,13 @@ pub fn run(
                         ServerMsg::ScrollbackUpdate { rows, replay } => {
                             // Push to internal scrollback (for copy mode).
                             let n = rows.len();
+                            client_trace_msg(
+                                "EVT",
+                                &format!(
+                                    "scrollback +{n}rows replay={replay} total={}",
+                                    grid.scrollback.len() + n
+                                ),
+                            );
                             for row in rows {
                                 grid.scrollback.push(row);
                             }
@@ -1036,7 +1059,9 @@ pub fn run(
                             // terminal's native scrollback buffer — but only
                             // for live scroll. Replay chunks (history after a
                             // GridSnapshot) would scroll the just-rendered
-                            // content off screen, leaving it blank.
+                            // content off screen, leaving it blank. The same
+                            // applies while in copy mode: the scroll would
+                            // push the viewed rows away.
                             if n > 0 && copy_mode.is_none() && !replay {
                                 let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
@@ -1262,7 +1287,12 @@ pub fn run(
                 }
                 // GridUpdate/Snapshot carry the child's mouse flags — keep
                 // the outer terminal's reporting modes in sync.
-                sync_mouse_modes(&mut applied_mouse, &grid, &mut mouse_decoder);
+                sync_mouse_modes(
+                    &mut applied_mouse,
+                    &grid,
+                    &mut mouse_decoder,
+                    copy_mode.is_some(),
+                );
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
                 if needs_render && exit_reason.is_none() {
@@ -1860,7 +1890,7 @@ fn format_status_bar(
     for (i, part) in parts.iter().enumerate() {
         let w = strip_ansi(part).chars().count() as u16;
         spans.push((col, col + w, i as u8));
-        col += w + 2; // entries are joined with two spaces
+        col += w + 3; // entries are joined with " | "
     }
 
     (
@@ -1871,7 +1901,7 @@ fn format_status_bar(
             server_hash,
             BAR,
             identity,
-            parts.join("  "),
+            parts.join(" | "),
             RESET
         ),
         spans,
@@ -2166,20 +2196,34 @@ fn restore_terminal() {
     let _ = stdout.flush();
 }
 
-/// Keep the outer terminal's mouse reporting in sync with the child's
-/// requested tracking mask. Reporting is always on while attached (it
-/// backs local drag-to-select), only the tracking level changes.
-fn sync_mouse_modes(applied: &mut Option<u8>, grid: &Grid, decoder: &mut mouse::Decoder) {
-    let desired = grid.mouse_tracking;
+/// Keep the outer terminal's mouse reporting in sync with what can use
+/// reports: the child's tracking mask, alternate-scroll (wheel→arrows
+/// translation needs wheel reports), or copy mode (drag-select). With
+/// none of those, reporting stays off and the terminal keeps its native
+/// wheel scrollback and selection — lrmux never interprets the wheel.
+fn sync_mouse_modes(
+    applied: &mut Option<u8>,
+    grid: &Grid,
+    decoder: &mut mouse::Decoder,
+    local: bool,
+) {
+    let mut desired = grid.mouse_tracking;
+    if local || (grid.mouse_altscroll && desired == 0) {
+        // Button-event reporting gives drag + wheel reports for local
+        // copy-mode selection or altscroll translation.
+        desired |= 0b010;
+    }
     if *applied == Some(desired) {
         return;
     }
     let mut stdout = client_stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
-    let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
+    if desired != 0 {
+        let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
+    }
     let _ = stdout.flush();
     *applied = Some(desired);
-    decoder.set_active(true);
+    decoder.set_active(desired != 0);
 }
 
 /// Try to parse a complete server frame from the buffer.
@@ -2745,6 +2789,7 @@ mod tests {
         let w1 = col_of("1:vim*");
         assert_eq!(spans[0], (w0, w0 + "●0:zsh".chars().count() as u16, 0));
         assert_eq!(spans[1], (w1, w1 + "1:vim*".chars().count() as u16, 1));
-        assert_eq!(spans[1].0, spans[0].1 + 2); // joined with two spaces
+        assert_eq!(spans[1].0, spans[0].1 + 3); // joined with " | "
+        assert!(visible.contains("●0:zsh | 1:vim*"), "{visible}");
     }
 }
