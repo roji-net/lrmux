@@ -82,6 +82,10 @@ pub struct BehaviorConfig {
     pub renumber_windows: bool,
     #[serde(default)]
     pub clipboard_cmd: String,
+    /// Export tmux-compatible env vars (`TMUX`, `TMUX_PANE`) to pane
+    /// children so tools that detect a multiplexer by env keep working.
+    #[serde(default)]
+    pub tmux_compat: bool,
 }
 
 impl Default for PrefixConfig {
@@ -307,6 +311,9 @@ static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
 /// Optional CLI / in-session override for the client PSK (`--psk` / `LRMUX_PSK`).
 static PSK_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
 
+/// CLI override for `--tmux-compat` (checked before the config file).
+static TMUX_COMPAT_OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
+
 pub fn global() -> &'static Config {
     CONFIG.get_or_init(load)
 }
@@ -320,6 +327,20 @@ pub fn set_global(cfg: Config) -> Result<(), Config> {
 /// Set a process-local PSK override (does not rewrite the config file).
 pub fn set_psk_override(psk: Option<String>) {
     *PSK_OVERRIDE.lock().unwrap() = psk;
+}
+
+/// Set a process-local tmux-compat override (`--tmux-compat`).
+pub fn set_tmux_compat(enabled: bool) {
+    *TMUX_COMPAT_OVERRIDE.lock().unwrap() = Some(enabled);
+}
+
+/// Whether pane children get tmux-compatible env vars:
+/// CLI `--tmux-compat` → `[behavior] tmux_compat`.
+pub fn tmux_compat() -> bool {
+    if let Some(v) = *TMUX_COMPAT_OVERRIDE.lock().unwrap() {
+        return v;
+    }
+    global().behavior.tmux_compat
 }
 
 /// Resolve the PSK the client should present: override → env → config.
@@ -512,5 +533,25 @@ mod tests {
         assert!(!is_uuid(""));
         assert!(!is_uuid("not-a-uuid"));
         assert!(!is_uuid("8b2f0a1e4c3d4e5f9a0b1c2d3e4f5a6b")); // no dashes
+    }
+
+    #[test]
+    fn tmux_compat_defaults_off_and_parses() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(!cfg.behavior.tmux_compat);
+        let cfg: Config = toml::from_str(
+            "[behavior]\ndefault_shell = \"\"\nscrollback_lines = 1000\nconfirm_kill = true\nrenumber_windows = true\nclipboard_cmd = \"\"\ntmux_compat = true\n",
+        )
+        .unwrap();
+        assert!(cfg.behavior.tmux_compat);
+    }
+
+    #[test]
+    fn tmux_compat_override_beats_config() {
+        // The mutex-backed override is process-global; set and restore
+        // it inside the test so parallel tests see their own default.
+        let prev = TMUX_COMPAT_OVERRIDE.lock().unwrap().replace(true);
+        assert!(tmux_compat());
+        *TMUX_COMPAT_OVERRIDE.lock().unwrap() = prev;
     }
 }

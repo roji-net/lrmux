@@ -8,6 +8,7 @@ use crate::pty::{Pty, PtySize, default_shell_argv};
 use crate::vt;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use std::ffi::CString;
+use std::path::PathBuf;
 
 /// Global pane ID counter (tmux uses %N format).
 static PANE_ID: AtomicU32 = AtomicU32::new(0);
@@ -40,15 +41,17 @@ pub struct Pane {
 
 impl Pane {
     /// Spawn a new pane with the default shell.
-    pub fn new(rows: u16, cols: u16) -> Self {
+    /// `session_id` is the owning session's id — exported to the child in
+    /// the tmux-compat `TMUX` env var.
+    pub fn new(rows: u16, cols: u16, session_id: u32) -> Self {
         let argv = default_shell_argv();
-        Self::new_with_argv(rows, cols, &argv, None)
+        Self::new_with_argv(rows, cols, &argv, None, session_id, &[])
     }
 
     /// Spawn a new pane with the default shell in a specific directory.
-    pub fn new_in_cwd(rows: u16, cols: u16, cwd: &str) -> Self {
+    pub fn new_in_cwd(rows: u16, cols: u16, cwd: &str, session_id: u32) -> Self {
         let argv = default_shell_argv();
-        Self::new_with_argv(rows, cols, &argv, Some(cwd))
+        Self::new_with_argv(rows, cols, &argv, Some(cwd), session_id, &[])
     }
 
     /// Spawn a new pane with a custom command string.
@@ -59,7 +62,14 @@ impl Pane {
     /// does not). After the command exits the shell exits, so the pane
     /// closes — no `exec` needed. Optional `cwd` sets the child's working
     /// directory (tmux `new-session -c`).
-    pub fn new_with_command(rows: u16, cols: u16, command: &str, cwd: Option<&str>) -> Self {
+    pub fn new_with_command(
+        rows: u16,
+        cols: u16,
+        command: &str,
+        cwd: Option<&str>,
+        session_id: u32,
+        env: &[(String, String)],
+    ) -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let cmd = command.trim();
         let argv = vec![
@@ -69,16 +79,29 @@ impl Pane {
             CString::new("-ci").unwrap(),
             CString::new(cmd).unwrap(),
         ];
-        Self::new_with_argv(rows, cols, &argv, cwd)
+        Self::new_with_argv(rows, cols, &argv, cwd, session_id, env)
     }
 
     /// Spawn a new pane with the given argv and optional working directory.
-    fn new_with_argv(rows: u16, cols: u16, argv: &[CString], cwd: Option<&str>) -> Self {
-        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd);
+    /// `env` carries extra variables for the child (tmux `new-window -e`).
+    fn new_with_argv(
+        rows: u16,
+        cols: u16,
+        argv: &[CString],
+        cwd: Option<&str>,
+        session_id: u32,
+        env: &[(String, String)],
+    ) -> Self {
+        // Allocate the pane id before spawn so the tmux-compat env can carry it.
+        let id = PANE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut extra_env = tmux_compat_env(session_id, id);
+        extra_env.extend(env.iter().cloned());
+        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd, &extra_env);
+
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {
-            id: PANE_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             pty,
             grid,
             vt_parser,
@@ -608,4 +631,100 @@ mod tests {
         let st = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
         assert_eq!(ansi_input_seq_len(st), Some(st.len()));
     }
+
+    #[test]
+    fn tmux_env_pairs_match_tmux_shape() {
+        let env = tmux_env_pairs("/tmp/lrmux-501/srv", 12345, 7, 3);
+        assert_eq!(env.len(), 4);
+        assert_eq!(env[0].0, "TMUX");
+        assert_eq!(env[0].1, "/tmp/lrmux-501/srv,12345,7");
+        // tmux shape: <socket path>,<server pid>,<session id>
+        let fields: Vec<&str> = env[0].1.split(',').collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(env[1], ("TMUX_PANE".into(), "%3".into()));
+        // tmux also advertises itself via TERM_PROGRAM
+        assert_eq!(env[2], ("TERM_PROGRAM".into(), "tmux".into()));
+        assert_eq!(env[3].0, "TERM_PROGRAM_VERSION");
+    }
+}
+
+/// Extra env exported to pane children in tmux-compat mode
+/// (`[behavior] tmux_compat` / `--tmux-compat`): `TMUX` carries
+/// `<socket>,<server pid>,<session id>` (same shape as tmux),
+/// `TMUX_PANE` is the `%N` pane id, and `TERM_PROGRAM`/`TERM_PROGRAM_VERSION`
+/// identify the mux as tmux — as real tmux does — so apps that detect a
+/// multiplexer env see a consistent picture.
+fn tmux_compat_env(session_id: u32, pane_id: u32) -> Vec<(String, String)> {
+    if !crate::config::tmux_compat() {
+        return Vec::new();
+    }
+    let sock = crate::ipc::socket_path(crate::server::server_name());
+    let mut env = tmux_env_pairs(
+        &sock.display().to_string(),
+        std::process::id(),
+        session_id,
+        pane_id,
+    );
+    if let Some(bin) = ensure_tmux_shim() {
+        // PATH prepend is best-effort: interactive shell init files
+        // (path_helper, user rc) may reorder it. `LRMUX_TMUX` and
+        // `TMUX_BIN` are the reliable handles — absolute paths to the
+        // shim binary that survive any shell init.
+        let shim = bin.join("tmux").display().to_string();
+        env.push(("LRMUX_TMUX".into(), shim.clone()));
+        env.push(("TMUX_BIN".into(), shim));
+        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+        if !path.split(':').any(|d| d == bin.to_string_lossy()) {
+            env.push(("PATH".into(), format!("{}:{path}", bin.display())));
+        }
+    }
+    env
+}
+
+/// Directory holding the `tmux` compatibility shim
+/// (`<socket dir>/bin`, created lazily). In tmux-compat mode it is
+/// prepended to pane children's PATH so tools that shell out to `tmux`
+// reach this binary's tmux-subset command mode (see argv[0] check in
+/// `main`). Returns None if the shim could not be installed.
+fn ensure_tmux_shim() -> Option<PathBuf> {
+    static SHIM_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SHIM_DIR
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let sock = crate::ipc::socket_path(crate::server::server_name());
+            let dir = sock.parent()?.join("bin");
+            std::fs::create_dir_all(&dir).ok()?;
+            let link = dir.join("tmux");
+            // Refresh the link if it is missing or points elsewhere
+            // (e.g. a different lrmux binary after a rebuild).
+            let stale = match std::fs::read_link(&link) {
+                Ok(target) => target != exe,
+                Err(_) => true,
+            };
+            if stale {
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(&exe, &link).ok()?;
+            }
+            Some(dir)
+        })
+        .clone()
+}
+
+fn tmux_env_pairs(
+    socket: &str,
+    server_pid: u32,
+    session_id: u32,
+    pane_id: u32,
+) -> Vec<(String, String)> {
+    vec![
+        ("TMUX".into(), format!("{socket},{server_pid},{session_id}")),
+        ("TMUX_PANE".into(), format!("%{pane_id}")),
+        // Real tmux panes also see TERM_PROGRAM=tmux; apps that detect
+        // a multiplexer key off it (or off TERM), not just $TMUX.
+        ("TERM_PROGRAM".into(), "tmux".into()),
+        (
+            "TERM_PROGRAM_VERSION".into(),
+            crate::client::tmux_shim::TMUX_VERSION.into(),
+        ),
+    ]
 }

@@ -432,7 +432,11 @@ pub fn canonical_name(name: &str) -> &str {
         "detach" => "detach-client",
         "display" | "displayp" => "display-message",
         "show" => "show-option",
+        "showenv" => "show-environment",
         "set" => "set-option",
+        "setw" | "set-window-option" => "set-window-option",
+        "neww" => "new-window",
+        "killw" => "kill-window",
         other => other,
     }
 }
@@ -480,6 +484,7 @@ GLOBAL OPTIONS:\n    \
     --tcp <host:port>    Connect over TCP (client commands: attach, ls, kill-server, …)\n    \
 --via <host:port>      Route TCP connects through that manager's relay\n    \
 --psk <secret>       Pre-shared key for this process\n    \
+--tmux-compat        Export tmux env vars (TMUX, TMUX_PANE) to pane children\n    \
 -v, --version        Print this binary's version\n    \
 -h, --help           This help, or `lrmux <command> --help` for one command\n\
 \n\

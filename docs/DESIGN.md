@@ -629,7 +629,50 @@ renumber_windows = true      # auto-renumber windows on close (start at 0)
 #   remain_on_exit = true   # always keep pane after child exits
 #   close_on_exit = true    # always close pane after child exits
 clipboard_cmd = ""          # empty = auto-detect (pbcopy/xclip/wl-copy)
+# tmux_compat = false       # true = export TMUX/TMUX_PANE to pane
+                            # children and install a `tmux` command shim
+                            # (see below); same effect as --tmux-compat
 ```
+
+#### tmux compatibility mode
+
+With `--tmux-compat` or `tmux_compat = true`, pane children get:
+
+- `TMUX=<socket>,<server pid>,<session id>` — same three-field shape as
+  real tmux, so tools that detect a multiplexer by env find lrmux.
+- `TMUX_PANE=%<pane id>`.
+- `TERM_PROGRAM=tmux` and `TERM_PROGRAM_VERSION=<shim version>` — real
+  tmux panes identify their terminal this way, and apps that switch into
+  a multiplexer-aware mode (alternate screen, mouse/scroll handling) key
+  off `TERM_PROGRAM` or `TERM`, not `$TMUX` alone. Setting only `$TMUX`
+  leaves such apps in a degraded path. `TERM` itself is left untouched:
+  it describes the emulated terminal, which lrmux does not change.
+- `LRMUX_TMUX=<socket dir>/bin/tmux` — absolute path to a `tmux` command
+  shim (a symlink to this binary). `TMUX_BIN` carries the same path for
+  tools that already honor that convention. The shim's directory is
+  also prepended to `PATH`, but interactive shell init files may
+  reorder `PATH`; tools that must reliably reach the shim should prefer
+  `$LRMUX_TMUX`/`$TMUX_BIN` over a bare `tmux` lookup.
+
+The shim translates a subset of the tmux CLI into control-mode
+commands on the server named by `$TMUX` (or `-S`/`-L`). It can also be
+invoked directly as `lrmux tmux <args>` — same code path, useful for
+testing without a symlink. `tmux -V` / `tmux -v` report
+`tmux 3.4 (lrmux <version> compat)` so version parsers still work
+while revealing the real implementation.
+
+| Command | Notes |
+|---|---|
+| `new-window [-d] -P [-F <fmt>] [-n <name>] [-e K=V]... [-t <sess>] [cmd]` | creates a window, optionally running `cmd` with extra env |
+| `kill-window -t @N` | kills the window |
+| `display-message -p [-t <target>] <fmt>` | expands `#{}` formats and `#S/#I/#W/#P` shorthands |
+| `set-window-option -t @N remain-on-exit on\|off` | keeps the pane after child exit on any code |
+| `show-environment` | the server's environment as `K=V` lines |
+| `list-sessions`, `list-windows` | existing control-mode behavior |
+
+A bad `-t` target answers `%error` (non-zero exit), like tmux's
+"can't find window". Unimplemented commands return success with empty
+output rather than failing.
 
 ---
 

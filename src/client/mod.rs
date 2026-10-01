@@ -8,6 +8,7 @@ mod mouse;
 pub mod render;
 pub mod selector;
 pub mod terminal;
+pub mod tmux_shim;
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;

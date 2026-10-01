@@ -26,8 +26,15 @@ impl Pty {
     /// Uses `forkpty` to create a pseudo-terminal and fork. The child
     /// execs the command; the parent gets the master fd.
     /// If `cwd` is provided, the child process changes to that directory
-    /// before exec.
-    pub fn spawn(argv: &[CString], size: PtySize, cwd: Option<&str>) -> Self {
+    /// before exec. `extra_env` are extra variables exported only to the
+    /// child (e.g. tmux-compat vars); the parent's values are restored
+    /// after the fork like the LRMUX_* vars.
+    pub fn spawn(
+        argv: &[CString],
+        size: PtySize,
+        cwd: Option<&str>,
+        extra_env: &[(String, String)],
+    ) -> Self {
         let winsize = Winsize {
             ws_row: size.rows,
             ws_col: size.cols,
@@ -41,9 +48,19 @@ impl Pty {
         // inherit the server's; inventing xterm-* breaks truecolor terminfo.
         // Safety: we are single-threaded here (before fork), no race possible.
         let server_name = crate::server::server_name();
+        // extra_env may shadow vars the server already has (e.g.
+        // TERM_PROGRAM in tmux-compat mode): save them to restore after
+        // the fork instead of blindly removing.
+        let saved: Vec<(String, Option<String>)> = extra_env
+            .iter()
+            .map(|(k, _)| (k.clone(), std::env::var(k).ok()))
+            .collect();
         unsafe {
             std::env::set_var("LRMUX", "1");
             std::env::set_var("LRMUX_SERVER", server_name);
+            for (k, v) in extra_env {
+                std::env::set_var(k, v);
+            }
         }
 
         let result = unsafe { forkpty(Some(&winsize), None) }.expect("forkpty failed");
@@ -66,11 +83,17 @@ impl Pty {
                 }
             }
             ForkptyResult::Parent { master, child } => {
-                // Unset in the parent so the server process doesn't have them.
+                // Restore the parent's env so the server keeps its own vars.
                 // Safety: single-threaded, no race.
                 unsafe {
                     std::env::remove_var("LRMUX");
                     std::env::remove_var("LRMUX_SERVER");
+                    for (k, old) in saved {
+                        match old {
+                            Some(v) => std::env::set_var(k, v),
+                            None => std::env::remove_var(k),
+                        }
+                    }
                     // The master must be nonblocking: the event loop drains
                     // it until EAGAIN after each POLLIN, and a blocking read
                     // would freeze the whole server once the buffer empties.

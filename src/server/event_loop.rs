@@ -704,7 +704,12 @@ pub fn run(
             // (iTerm2) is attached to this session, use tmux semantics:
             // the window closes on ANY exit code (remain-on-exit off).
             let control_attached = clients.iter().any(|c| c.is_control && c.session_idx == si);
-            if exit_code == 0 || exit_code == 130 || exit_code == -2 || control_attached {
+            // tmux remain-on-exit: `set-window-option -t @N remain-on-exit on`
+            // keeps the pane on ANY exit code, even with a control client.
+            let remain = session.windows[wi].remain_on_exit;
+            if !remain
+                && (exit_code == 0 || exit_code == 130 || exit_code == -2 || control_attached)
+            {
                 // Exit code 0: auto-close the window.
                 let wid = session.windows[wi].id_str();
                 session.windows.remove(wi);
@@ -907,11 +912,13 @@ pub fn run(
                                                         grid_cols,
                                                         default_window_name(),
                                                         dir,
+                                                        sessions[si].id,
                                                     ),
                                                     None => Window::new(
                                                         grid_rows,
                                                         grid_cols,
                                                         default_window_name(),
+                                                        sessions[si].id,
                                                     ),
                                                 };
                                                 sessions[si].windows.push(win);
@@ -1133,6 +1140,8 @@ pub fn run(
                                                     default_window_name(),
                                                     cmd,
                                                     cwd_full.as_deref(),
+                                                    sessions[new_si].id,
+                                                    &[],
                                                 );
                                                 // Replace the first window (default shell)
                                                 // with the command window.
@@ -1438,11 +1447,14 @@ pub fn run(
                                                         default_window_name(),
                                                         cmd,
                                                         None,
+                                                        sessions[si].id,
+                                                        &[],
                                                     ),
                                                     None => Window::new(
                                                         grid_rows,
                                                         grid_cols,
                                                         default_window_name(),
+                                                        sessions[si].id,
                                                     ),
                                                 };
                                                 sessions[si].windows.push(win);
@@ -1725,10 +1737,15 @@ pub fn run(
                                             default_window_name(),
                                             cmd,
                                             None,
+                                            sessions[si].id,
+                                            &[],
                                         ),
-                                        None => {
-                                            Window::new(grid_rows, grid_cols, default_window_name())
-                                        }
+                                        None => Window::new(
+                                            grid_rows,
+                                            grid_cols,
+                                            default_window_name(),
+                                            sessions[si].id,
+                                        ),
                                     };
                                     sessions[si].windows.push(win);
                                     need_status_bar_all = true;
@@ -1781,6 +1798,8 @@ pub fn run(
                                         default_window_name(),
                                         cmd,
                                         cwd_full.as_deref(),
+                                        sessions[new_si].id,
+                                        &[],
                                     );
                                     sessions[new_si].windows[0] = win;
                                 }
@@ -4147,6 +4166,75 @@ fn control_respond(client: &mut ClientConn, lines: &[&str]) {
     control_respond_flags(client, lines, 1);
 }
 
+/// Error response to a client-issued command: %begin/%error block
+/// (flags=1) carrying a single message line, like real tmux sends for
+/// "can't find window" and friends.
+fn control_respond_error(client: &mut ClientConn, msg: &str) {
+    client.control_seq += 1;
+    let ts = unix_ts();
+    let seq = client.control_seq;
+    send_control_notify(client, &format!("%begin {ts} {seq} 1"));
+    send_control_notify(client, msg);
+    send_control_notify(client, &format!("%error {ts} {seq} 1"));
+}
+
+/// Split a control-command arg string honoring shell quoting:
+/// 'literal', "escaped \" inside", and \-escapes. Args arriving via
+/// the tmux shim are already argv-split; this preserves that intent.
+fn split_args_shell(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    cur.push(c);
+                }
+            }
+            '"' => {
+                started = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                cur.push(n);
+                            }
+                        }
+                        _ => cur.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            _ => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
 /// Send initial state notifications to a control client.
 /// Mirrors what real `tmux -CC` emits right after the DCS: an empty
 /// %begin/%end block, then %window-add for each window, then
@@ -4241,6 +4329,16 @@ fn extract_format_arg(args: &str) -> Option<String> {
     None
 }
 
+/// `display-message -p <fmt>`: the format is the positional argument
+/// (shell-split tokens re-joined so quoted formats stay one string).
+fn positional_format(positional: &[String]) -> Option<String> {
+    if positional.is_empty() {
+        None
+    } else {
+        Some(positional.join(" "))
+    }
+}
+
 /// Expand a tmux -F format string for a session/window.
 /// Supports #{...} variables used by iTerm2 plus common ones, and \t / \n escapes.
 fn expand_format(
@@ -4272,6 +4370,29 @@ fn expand_format(
                 var.push(c);
             }
             out.push_str(&format_var(&var, session, window, socket_path));
+        } else if c == '#' {
+            // tmux shorthand variables: ## is a literal '#', the rest
+            // map to their #{long} form.
+            let long = match chars.next() {
+                Some('#') => {
+                    out.push('#');
+                    continue;
+                }
+                Some('S') => "session_name",
+                Some('I') => "window_index",
+                Some('W') => "window_name",
+                Some('P') => "pane_id",
+                Some(other) => {
+                    out.push('#');
+                    out.push(other);
+                    continue;
+                }
+                None => {
+                    out.push('#');
+                    continue;
+                }
+            };
+            out.push_str(&format_var(long, session, window, socket_path));
         } else {
             out.push(c);
         }
@@ -4661,6 +4782,35 @@ fn handle_single_control_command(
             //                  show-window-options pane-border-format
             respond(client, &[]);
         }
+        "set-window-option" => {
+            // tmux tools send: set-window-option -t @N remain-on-exit on
+            let args = split_args_shell(args_str);
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            if parsed.positional.len() >= 2 {
+                let key = unquote(&parsed.positional[0]).to_string();
+                let val = unquote(&parsed.positional[1]).to_string();
+                if key == "remain-on-exit"
+                    && let Some((si, wi)) = resolve_target(sessions, client, t.as_deref())
+                    && let Some(w) = sessions.get_mut(si).and_then(|s| s.windows.get_mut(wi))
+                {
+                    w.remain_on_exit = val != "off";
+                }
+            }
+            // Other window options are accepted as no-ops (lrmux has no
+            // per-window option table to store them in).
+            respond(client, &[]);
+        }
+        "show-environment" => {
+            // tmux's "server environment": the env the server started with,
+            // which new panes inherit. Format: one KEY=value per line.
+            let lines: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            respond(client, &refs);
+        }
         "list-sessions" => {
             // iTerm2 sends: list-sessions -F "<format>"
             let lines: Vec<String> = if let Some(fmt) = extract_format_arg(args_str) {
@@ -4859,47 +5009,39 @@ fn handle_single_control_command(
         "display-message" => {
             // iTerm2 sends: display-message -p "#{version}", "#{pid}", and
             //   display -p -F "<window TSV>" -t @N  (window opener query)
-            // Resolve -t so the format expands for the requested window.
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            // tmux tools send: display-message -t @N -p "#W"
+            // Resolve -t so the format expands for the requested window;
+            // an explicitly bad -t is an error like real tmux.
+            let args = split_args_shell(args_str);
             let parsed = crate::cmd::parse_flags(&args);
             let t = parsed
                 .get("t")
                 .or_else(|| parsed.get("target"))
                 .map(|s| s.to_string());
-            let (session, window) = match resolve_target(sessions, client, t.as_deref()) {
-                Some((si, wi)) => (
-                    sessions.get(si),
-                    sessions.get(si).and_then(|s| s.windows.get(wi)),
-                ),
-                None => (
-                    sessions.get(client.session_idx),
-                    sessions
-                        .get(client.session_idx)
-                        .and_then(|s| s.windows.get(client.active_window)),
-                ),
-            };
-            if let Some(fmt) = extract_format_arg(args_str) {
+            let loc = resolve_target(sessions, client, t.as_deref());
+            if t.is_some() && loc.is_none() {
+                control_respond_error(
+                    client,
+                    &format!("can't find window: {}", unquote(t.as_deref().unwrap_or(""))),
+                );
+                return false;
+            }
+            let (si, wi) = loc.unwrap_or((client.session_idx, client.active_window));
+            let (session, window) = (
+                sessions.get(si),
+                sessions.get(si).and_then(|s| s.windows.get(wi)),
+            );
+            // Format comes from -F "<fmt>" or, with -p, the positional arg.
+            let fmt = extract_format_arg(args_str).or_else(|| {
+                if parsed.get("p").is_some() {
+                    positional_format(&parsed.positional)
+                } else {
+                    None
+                }
+            });
+            if let Some(fmt) = fmt {
                 let text = expand_format(&fmt, session, window, socket_path);
                 respond(client, &[&text]);
-            } else if args_str.contains("#{") {
-                // -p "<format>" without -F
-                if let Some(start) = args_str.find('"') {
-                    if let Some(end) = args_str.rfind('"') {
-                        if end > start {
-                            let fmt = &args_str[start + 1..end];
-                            let session = sessions.get(client.session_idx);
-                            let window = session.and_then(|s| s.windows.get(client.active_window));
-                            let text = expand_format(fmt, session, window, socket_path);
-                            respond(client, &[&text]);
-                        } else {
-                            respond(client, &[]);
-                        }
-                    } else {
-                        respond(client, &[]);
-                    }
-                } else {
-                    respond(client, &[]);
-                }
             } else {
                 respond(client, &[]);
             }
@@ -4983,23 +5125,65 @@ fn handle_single_control_command(
         }
         "new-window" => {
             // iTerm2 sends: new-window -PF '#{window_id}' -c '#{pane_current_path}'
-            // -P means "print": the response must contain the new window id
-            // (@N), which iTerm2 registers in _pendingWindows to open the tab.
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
-            let parsed = crate::cmd::parse_flags(&args);
-            let print = parsed.get("P").is_some()
-                || args.iter().any(|a| a.contains('P') && a.starts_with('-'));
+            // tmux tools send:  new-window -d -P -F '#{window_id}' -n <name>
+            //                   [-e K=V]... [shell-command]
+            // -P means "print": the response expands -F (default
+            // #{window_id}) so callers can register the @N id.
+            let args = split_args_shell(args_str);
+            let mut name: Option<String> = None;
+            let mut target: Option<String> = None;
+            let mut cwd: Option<String> = None;
+            let mut fmt: Option<String> = None;
+            let mut print = false;
+            let mut env: Vec<(String, String)> = Vec::new();
+            let mut positional: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a.starts_with('-') && a.len() > 1 && a != "-" {
+                    // Combined short flags: -dP, -PF — boolean flags consume
+                    // a char, value flags take the rest or the next arg.
+                    let mut chars = a[1..].chars().peekable();
+                    while let Some(f) = chars.next() {
+                        match f {
+                            'd' | 'a' | 'k' => {}
+                            'P' => print = true,
+                            'n' | 't' | 'c' | 'F' | 'e' => {
+                                let rest: String = chars.collect();
+                                let v = if !rest.is_empty() {
+                                    rest
+                                } else {
+                                    i += 1;
+                                    args.get(i).cloned().unwrap_or_default()
+                                };
+                                match f {
+                                    'n' => name = Some(v),
+                                    't' => target = Some(v),
+                                    'c' => cwd = Some(v),
+                                    'F' => fmt = Some(v),
+                                    'e' => {
+                                        if let Some((k, val)) = v.split_once('=') {
+                                            env.push((k.to_string(), val.to_string()));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    positional.push(a.clone());
+                }
+                i += 1;
+            }
 
-            // Create a new window in the -t session ("$N" or "$N:+"), else
+            // Create the window in the -t session ("$N" or "$N:+"), else
             // the client's session.
-            let si = parsed
-                .get("t")
-                .or_else(|| parsed.get("target"))
-                .map(|t| {
-                    let t = unquote(t);
-                    let t = t.split(':').next().unwrap_or(t);
-                    t.to_string()
-                })
+            let si = target
+                .as_deref()
+                .map(|t| t.split(':').next().unwrap_or(t).to_string())
                 .and_then(|t| resolve_session_target(sessions, client, Some(&t)))
                 .unwrap_or(client.session_idx);
             let mut wid_str = String::new();
@@ -5010,7 +5194,30 @@ fn handle_single_control_command(
                     .first()
                     .map(|w| (w.pane.rows, w.pane.cols))
                     .unwrap_or((24, 80));
-                let win = Window::new(rows, cols, "shell".to_string());
+                let command = positional.join(" ");
+                let wname = name.unwrap_or_else(|| {
+                    if command.is_empty() {
+                        "shell".to_string()
+                    } else {
+                        crate::server::session::default_window_name_for_command(&command)
+                    }
+                });
+                let win = if command.is_empty() {
+                    match cwd.as_deref() {
+                        Some(c) => Window::new_in_cwd(rows, cols, wname, c, session.id),
+                        None => Window::new(rows, cols, wname, session.id),
+                    }
+                } else {
+                    Window::new_with_command(
+                        rows,
+                        cols,
+                        wname,
+                        &command,
+                        cwd.as_deref(),
+                        session.id,
+                        &env,
+                    )
+                };
                 wid_str = win.id_str();
                 let wname = win.name.clone();
                 let layout = window_layout_str(&win);
@@ -5020,19 +5227,36 @@ fn handle_single_control_command(
                 send_control_notify(client, &format!("%layout-change {} {}", wid_str, layout));
             }
             if print && !wid_str.is_empty() {
-                respond(client, &[wid_str.as_str()]);
+                let fmt = fmt.unwrap_or_else(|| "#{window_id}".to_string());
+                let text = expand_format(
+                    &fmt,
+                    sessions.get(si),
+                    sessions
+                        .get(si)
+                        .and_then(|s| s.windows.iter().find(|w| w.id_str() == wid_str)),
+                    socket_path,
+                );
+                respond(client, &[text.as_str()]);
             } else {
                 respond(client, &[]);
             }
         }
         "kill-window" | "kill-pane" => {
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let args = split_args_shell(args_str);
             let parsed = crate::cmd::parse_flags(&args);
             let t = parsed
                 .get("t")
                 .or_else(|| parsed.get("target"))
                 .map(|s| s.to_string());
-            if let Some((si, wi)) = resolve_target(sessions, client, t.as_deref())
+            let loc = resolve_target(sessions, client, t.as_deref());
+            if t.is_some() && loc.is_none() {
+                control_respond_error(
+                    client,
+                    &format!("can't find window: {}", unquote(t.as_deref().unwrap_or(""))),
+                );
+                return false;
+            }
+            if let Some((si, wi)) = loc
                 && si < sessions.len()
                 && wi < sessions[si].windows.len()
             {
@@ -5316,7 +5540,7 @@ fn resolve_target(
 
 #[cfg(test)]
 mod escape_output_tests {
-    use super::escape_output;
+    use super::{escape_output, split_args_shell};
 
     #[test]
     fn preserves_box_drawing() {
@@ -5365,6 +5589,28 @@ mod escape_output_tests {
     #[test]
     fn escapes_controls_and_backslash() {
         assert_eq!(escape_output(b"a\nb\\c"), "a\\012b\\134c");
+    }
+
+    #[test]
+    fn split_args_shell_quotes() {
+        assert_eq!(
+            split_args_shell("-d -P -F '#{window_id}' -n 'my name' run --all"),
+            vec![
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-n",
+                "my name",
+                "run",
+                "--all"
+            ]
+        );
+        assert_eq!(
+            split_args_shell("-e A=1 -e 'B=x y' \"cmd \\\"q\\\"\""),
+            vec!["-e", "A=1", "-e", "B=x y", "cmd \"q\""]
+        );
+        assert_eq!(split_args_shell(""), Vec::<String>::new());
     }
 }
 

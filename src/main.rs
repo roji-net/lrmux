@@ -54,6 +54,16 @@ fn connect_to_server(server: &str) -> io::Result<crate::ipc::ConnStream> {
 }
 
 fn main() {
+    // tmux-compat shim: a server with tmux_compat enabled installs a
+    // `tmux` symlink to this binary; invoked under that name, speak the
+    // tmux command subset over control mode instead of the lrmux CLI.
+    let invoked_as = std::env::args()
+        .next()
+        .and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_owned()));
+    if invoked_as.is_some_and(|n| n == "tmux") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(client::tmux_shim::run(&args));
+    }
     if let Err(e) = run() {
         eprintln!("lrmux: {e}");
         std::process::exit(1);
@@ -68,6 +78,8 @@ enum CliAction {
     ControlMode { target: Option<String> },
     /// `lrmux -- <cmd>`: create a new window running <cmd> (non-interactive when nested).
     RunCommand(String),
+    /// `lrmux tmux <args>`: tmux-compat command shim (same as argv[0]==tmux).
+    TmuxShim(Vec<String>),
     /// `session-selector` / `ss`: force the interactive selector (no auto-join).
     SessionSelector,
     /// `new-session -s <name> -c <cwd> [-- <cmd>]`
@@ -210,6 +222,9 @@ fn parse_args() -> CliAction {
         } else if args[i] == "--via" && i + 1 < args.len() {
             crate::ipc::set_via_addr(Some(args[i + 1].clone()));
             i += 2;
+        } else if args[i] == "--tmux-compat" {
+            crate::config::set_tmux_compat(true);
+            i += 1;
         } else {
             filtered.push(args[i].clone());
             i += 1;
@@ -222,7 +237,14 @@ fn parse_args() -> CliAction {
     }
 
     let subcmd = args.get(1).map(|s| s.as_str());
-    let subcmd_args = if args.len() > 2 { &args[2..] } else { &[] };
+    let subcmd_args: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
+
+    // `lrmux tmux <args>`: run the tmux-compat command shim explicitly
+    // (same code path as when the binary is invoked through a `tmux`
+    // symlink) — handy for testing without touching PATH.
+    if subcmd == Some("tmux") {
+        return CliAction::TmuxShim(subcmd_args.to_vec());
+    }
 
     // `-h`/`--help` after a subcommand shows that command's help
     // (except after `--`, where args belong to the wrapped command).
@@ -941,12 +963,12 @@ fn run() -> io::Result<()> {
 
     match action {
         CliAction::Help(topic) => print_help(topic.as_deref()),
+        CliAction::TmuxShim(args) => {
+            std::process::exit(client::tmux_shim::run(&args));
+        }
         CliAction::Unknown(cmd) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "unknown command '{cmd}'. Try `lrmux --help`.\n\
-                 (Inside a pane, bare `lrmux` opens a new window; typos do not.)"
-            ),
+            format!("unknown command '{cmd}'. Try `lrmux --help`."),
         )),
         CliAction::Versions => {
             print_versions();

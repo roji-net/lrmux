@@ -35,10 +35,13 @@ pub struct Session {
 
 impl Session {
     pub fn new(name: String, grid_rows: u16, grid_cols: u16) -> Self {
-        let window = Window::new(grid_rows, grid_cols, "shell".to_string());
+        // Allocate the session id first: it is exported to pane children
+        // in the tmux-compat TMUX env var.
+        let id = SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let window = Window::new(grid_rows, grid_cols, "shell".to_string(), id);
         let now = unix_now();
         Self {
-            id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             name,
             windows: vec![window],
             options: HashMap::new(),
@@ -48,10 +51,11 @@ impl Session {
     }
 
     pub fn new_in_cwd(name: String, grid_rows: u16, grid_cols: u16, cwd: &str) -> Self {
-        let window = Window::new_in_cwd(grid_rows, grid_cols, "shell".to_string(), cwd);
+        let id = SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let window = Window::new_in_cwd(grid_rows, grid_cols, "shell".to_string(), cwd, id);
         let now = unix_now();
         Self {
-            id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             name,
             windows: vec![window],
             options: HashMap::new(),
@@ -69,16 +73,19 @@ impl Session {
         command: &str,
         cwd: Option<&str>,
     ) -> Self {
+        let id = SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let window = Window::new_with_command(
             grid_rows,
             grid_cols,
             default_window_name_for_command(command),
             command,
             cwd,
+            id,
+            &[],
         );
         let now = unix_now();
         Self {
-            id: SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             name,
             windows: vec![window],
             options: HashMap::new(),
@@ -112,7 +119,7 @@ impl Session {
     }
 }
 
-fn default_window_name_for_command(command: &str) -> String {
+pub(crate) fn default_window_name_for_command(command: &str) -> String {
     command
         .split_whitespace()
         .next()
