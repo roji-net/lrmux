@@ -137,8 +137,11 @@ All elements are configurable and the status bar can be disabled entirely.
 ### 2.10 Mouse support
 
 - **Mouse events are never consumed by lrmux.** When the child enables mouse tracking (DECSET 1000/1002/1003), the client enables reporting on the outer terminal and forwards each event to the pane, re-encoded in the format the child requested: legacy X10, UTF-8 extended (1005) or SGR (1006). The server-side VT parser tracks the requested modes and ships them to the client in `GridSnapshot`/`GridUpdate` (`mouse_flags` byte); the client decodes terminal reports (SGR is requested, X10 tolerated) and re-encodes — preserving the passthrough invariant.
-- Alternate scroll (DECSET 1007): when a child sets it without a tracking mode, wheel ticks are translated into three arrow-key presses (app-cursor-keys aware) — the standard xterm behavior.
-- **Local selection**: the client always keeps the outer terminal in button-event reporting (1002+1006) while attached. When the child requests no mouse handling, a left-drag selects text against the client-side grid — never including pane borders, filler, or the status bar — and releasing copies it (clipboard + internal paste buffer), exiting copy mode. A plain click without drag does nothing. The wheel scrolls copy-mode scrollback (enters on wheel-up, exits at the bottom). Local handling also takes over whenever copy mode is active, even if the child tracks the mouse.
+- **Conditional reporting**: the client enables mouse reporting on the outer terminal only while something can use the reports — the child's tracking mask, alternate scroll, or an active copy mode. With none of those, reporting stays off: the wheel and drag-selection belong to the terminal's native scrollback/selection, and lrmux never interprets them.
+- Alternate scroll (DECSET 1007): when a child sets it without a tracking mode, button-event reporting is enabled just for this and wheel ticks are translated into three arrow-key presses (app-cursor-keys aware) — the standard xterm behavior.
+- **Local selection**: while reporting is on and a left-drag lands outside the status bar, the drag selects text against the client-side grid — never including pane borders or filler — and releasing copies it (clipboard + internal paste buffer), exiting copy mode. A plain click without drag does nothing. Local handling also takes over whenever copy mode is active, even if the child tracks the mouse. When reporting is off, the terminal's own selection applies instead.
+- Inside copy mode the wheel scrolls the copy-mode view and exits it at the bottom.
+- **Status bar interaction**: clicks on the status bar row never reach the pane (the row is outside the pane's coordinate space and is dropped either way), so lrmux uses them itself without weakening the passthrough invariant: a left press on a window entry switches to that window, and the wheel on the bar cycles prev/next window — tmux's `mouse`-on behavior. Caveat: without reporting, the terminal consumes clicks itself, so status-bar interaction only exists while a pane tracks the mouse or copy mode is active.
 - Reporting is disabled again when the child turns tracking off, and always restored on client exit.
 
 ### 2.11 Window numbering
@@ -191,9 +194,11 @@ Running `lrmux` with no arguments:
 
 The interactive selector:
 
-- A **flat list** of `server / session` entries across all running servers (e.g. `default / lrmux`, `default / home`, `work / api`).
-- **Fuzzy filter**: typing filters the list by fuzzy match on the `server / session` string (fzf-style).
+- A **flat list** of `server / session` entries across all running servers (e.g. `default / lrmux`, `default / home`, `work / api`), with an `Address` column (`host:port`) shown when any listed server has TCP enabled.
+- **Fuzzy filter behind `/`**: pressing `/` enters filter mode; typed characters narrow the list by fuzzy match on the `server / session` string, `Enter` joins the selection, `Esc` clears the filter and exits the mode. Bindings are inert while filtering, so letters like `n` cannot fire actions mid-typing.
 - `j`/`k` or arrow keys to navigate, `Enter` to join the selected session.
+- `C` captures the highlighted pane to a file: prompts for a filename (prefilled `server-session.ansi`, first keystroke replaces the whole suggestion) and picks the capture format from the extension (`.ansi` → SGR, `.html` → HTML, `.md` → Markdown, anything else → plain text).
+- `V` previews the highlighted pane's live contents (ANSI capture) in a scrollable popup (`j`/`k`/arrows, `d`/`u` half-page, `g`/`G`, `q`/`Esc` to close) without attaching.
 - `n` creates a new session: prompts for a name with a **default derived from CWD** (per §2.13) pre-filled; user can accept or edit it. Session is created on the currently highlighted server (or `default` if none highlighted).
 - `N` creates a new server + session: prompts for a server name (default: `default` or `default-2` etc. on collision) and a session name (default: CWD-derived), then spawns both.
 - If no servers are running, the selector shows a single "create new server + session" prompt with defaults pre-filled.
@@ -629,7 +634,115 @@ renumber_windows = true      # auto-renumber windows on close (start at 0)
 #   remain_on_exit = true   # always keep pane after child exits
 #   close_on_exit = true    # always close pane after child exits
 clipboard_cmd = ""          # empty = auto-detect (pbcopy/xclip/wl-copy)
+# tmux_compat = false       # true = export TMUX/TMUX_PANE to pane
+                            # children and install a `tmux` command shim
+                            # (see below); same effect as --tmux-compat
 ```
+
+#### tmux compatibility mode
+
+With `--tmux-compat` or `tmux_compat = true`, pane children get:
+
+- `TMUX=<socket>,<server pid>,<session id>` — same three-field shape as
+  real tmux, so tools that detect a multiplexer by env find lrmux.
+- `TMUX_PANE=%<pane id>`.
+- `TERM_PROGRAM=tmux` and `TERM_PROGRAM_VERSION=<shim version>` — real
+  tmux panes identify their terminal this way, and apps that switch into
+  a multiplexer-aware mode (alternate screen, mouse/scroll handling) key
+  off `TERM_PROGRAM` or `TERM`, not `$TMUX` alone. Setting only `$TMUX`
+  leaves such apps in a degraded path. `TERM` itself is left untouched:
+  it describes the emulated terminal, which lrmux does not change.
+- `LRMUX_TMUX=<socket dir>/bin/tmux` — absolute path to a `tmux` command
+  shim (a symlink to this binary). `TMUX_BIN` carries the same path for
+  tools that already honor that convention. The shim's directory is
+  also prepended to `PATH`, but interactive shell init files may
+  reorder `PATH`; tools that must reliably reach the shim should prefer
+  `$LRMUX_TMUX`/`$TMUX_BIN` over a bare `tmux` lookup.
+
+The shim translates a subset of the tmux CLI into control-mode
+commands on the server named by `$TMUX` (or `-S`/`-L`). It can also be
+invoked directly as `lrmux tmux <args>` — same code path, useful for
+testing without a symlink. `tmux -V` / `tmux -v` report
+`tmux 3.4 (lrmux <version> compat)` so version parsers still work
+while revealing the real implementation.
+
+| Command | Notes |
+|---|---|
+| `new-window [-d] -P [-F <fmt>] [-n <name>] [-e K=V]... [-t <sess>] [cmd]` | creates a window, optionally running `cmd` with extra env |
+| `kill-window -t @N` | kills the window |
+| `display-message -p [-t <target>] <fmt>` | expands `#{}` formats and `#S/#I/#W/#P` shorthands |
+| `set-window-option -t @N remain-on-exit on\|off` | keeps the pane after child exit on any code |
+| `show-environment` | the server's environment as `K=V` lines |
+| `set-environment [-u] <name> [value]`, `unset-environment <name>` | edits the server env that future panes inherit |
+| `list-sessions`, `list-windows` | existing control-mode behavior |
+
+A bad `-t` target answers `%error` (non-zero exit), like tmux's
+"can't find window". Unimplemented commands return success with empty
+output rather than failing.
+
+#### Server environment refresh (tmux `update-environment`)
+
+Panes inherit the **server's** environment, captured when the server
+process was spawned — a server started under a stale or minimal env
+(e.g. no `COLORTERM`) produces color-limited panes forever. To fix
+this, an interactive attach sends an allowlist of terminal-identity
+vars (`COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`,
+`LC_TERMINAL`, `TERMINAL_EMULATOR`, `WEZTERM_EXECUTABLE`,
+`KITTY_WINDOW_ID`) in `Identify`, and the server applies them to its
+own env. `TERM` is deliberately not refreshed — a pane's `TERM`
+describes lrmux's own emulation, not the outer terminal's. This is not
+gated on `tmux_compat`; it benefits all panes. `set-environment`
+/`unset-environment` edit the same env manually.
+
+#### `capture-pane` targeting
+
+`lrmux capture-pane` accepts `-s <server|host:port>` to pick the server
+(local Unix-socket name or a TCP address) and `-t <target>` with these
+forms:
+
+- `sess` — session on the chosen server (`-s` or `default`).
+- `sess:N` — tmux-style session:window-index (`@N` also accepted).
+- `srv` — a bare running-server name captures its first session.
+- `srv:sess` — when `srv` names a running local server and the second
+  part is not a bare index, the first part is read as the server.
+- `srv:sess:N` — explicit three-part form.
+
+Lookups that miss return an error instead of an empty capture: the
+server replies with the available session/window names and a "did you
+mean …" suggestion for near matches (edit distance or prefix). If the
+missed session name is also a running server, the CLI hints at `-s`.
+
+#### Diagnostics and byte tracing
+
+Logging (`/tmp/lrmux-<uid>/logs/<server>.log`, `Ctrl-A \` ring view,
+`LRMUX_LOG_LEVEL=debug|info|warn|error`, `LRMUX_SYSLOG=host:port`)
+records events; sometimes a bug needs the exact byte stream instead.
+`LRMUX_TRACE` enables per-process byte traces:
+
+- **Panes** — `pane-<server>-%<id>.trace` (namespaced by server name so
+  concurrent servers don't overwrite each other's pane traces):
+  `IN` client keystrokes written to the
+  PTY, `OUT` raw bytes read from the PTY (child output before VT
+  parsing), `RPL` replies we generate to the child's terminal queries
+  (CPR/DSR/DA and OSC color answers, local or proxied), `EVT` pane
+  events (resize,
+  child exit).
+- **Attached clients** — `client-<pid>.trace`: `KEY` raw bytes read
+  from stdin (including bytes consumed by palette probes), `IN` bytes
+  that survived the input filter toward the pane, `QRY` queries we send
+  to the outer terminal, `OUT` everything written to the outer
+  terminal, `EVT` client events (snapshot, render cursor, SIGWINCH).
+
+`LRMUX_TRACE=<dir>` places the files there; any other non-empty value
+defaults to `/tmp/lrmux-<uid>/logs`. Lines are
+`[+mmmmm.mmmms] TAG len=N | bytes`, relative to the trace's first
+event; printable UTF-8 is kept, control bytes appear as
+`\e`/`\r`/`\n`/`\a`/`\xNN`. `LRMUX_VT_DUMP=<file>` remains as a raw
+(byte-exact, unannotated) dump of PTY output for replay through a
+parser.
+
+Traces may contain everything typed or displayed — commands, prompts,
+secrets. Share or retain them accordingly.
 
 ---
 

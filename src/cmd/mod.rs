@@ -319,9 +319,11 @@ Anything else is sent as literal text.",
         aliases: &["capturep", "capture-window"],
         summary: "Print a pane's contents",
         usage: "    \
-lrmux capture-pane -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|markdown] [--clipboard] [--file <path>]",
+lrmux capture-pane [-s <server|host:port>] -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|markdown] [--clipboard] [--file <path>]",
         body: "\
--t, --target <target>          Pane to capture\n\
+-s, --server <server|host:port>  Server to query (name or TCP address)\n\
+-t, --target <target>          Target pane: session, session:N,\n\
+                               server:session or server:session:N\n\
 -p, --print                    Print to stdout\n\
 -c, --colors                   Include cell styles\n\
 --format <ascii|ansi|html|markdown>\n\
@@ -432,7 +434,12 @@ pub fn canonical_name(name: &str) -> &str {
         "detach" => "detach-client",
         "display" | "displayp" => "display-message",
         "show" => "show-option",
+        "showenv" => "show-environment",
+        "setenv" => "set-environment",
         "set" => "set-option",
+        "setw" | "set-window-option" => "set-window-option",
+        "neww" => "new-window",
+        "killw" => "kill-window",
         other => other,
     }
 }
@@ -480,6 +487,7 @@ GLOBAL OPTIONS:\n    \
     --tcp <host:port>    Connect over TCP (client commands: attach, ls, kill-server, …)\n    \
 --via <host:port>      Route TCP connects through that manager's relay\n    \
 --psk <secret>       Pre-shared key for this process\n    \
+--tmux-compat        Export tmux env vars (TMUX, TMUX_PANE) to pane children\n    \
 -v, --version        Print this binary's version\n    \
 -h, --help           This help, or `lrmux <command> --help` for one command\n\
 \n\
@@ -503,6 +511,7 @@ LRMUX_SYSLOG=host:port   Send logs to remote syslog (UDP RFC 3164)\n    \
 LRMUX_LOG_LEVEL=debug|info|warn|error   Log level (default: info)\n    \
 LRMUX=1                  Set automatically inside lrmux panes\n    \
 LRMUX_SERVER=name        Server name (set automatically inside lrmux panes)\n    \
+LRMUX_SESSION=$id        Session id (set automatically inside lrmux panes)\n    \
 LRMUX_PSK=<secret>       TCP pre-shared key override\n\
 \n\
 PREFIX KEY: Ctrl-A (default)\n\

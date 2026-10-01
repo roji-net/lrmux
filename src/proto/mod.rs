@@ -54,6 +54,11 @@ pub enum ClientMsg {
         cols: u16,
         attach: bool,
         auth_token: String,
+        /// Terminal-identity vars from the attaching client's env
+        /// (COLORTERM, TERM_PROGRAM, …). The server applies them so
+        /// panes spawned later inherit the freshest terminal identity —
+        /// tmux's `update-environment` equivalent. Empty for probes.
+        env: Vec<(String, String)>,
     },
     /// Raw keystrokes from the client's stdin → forward to PTY.
     PaneInput { data: Vec<u8> },
@@ -252,6 +257,10 @@ pub enum ServerMsg {
     /// Acknowledge RelayOpen. On `ok` the connection becomes a raw byte
     /// pipe to the requested address — no more framed messages.
     RelayAck { ok: bool, reason: String },
+    /// Acknowledge SendKeys — `ok=false` when the target session/window
+    /// did not resolve or the PTY write failed (`reason` explains).
+    /// Missing from older servers; clients should bound the wait.
+    SendKeysAck { ok: bool, reason: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -303,6 +312,7 @@ const S_PSK_UPDATED: u8 = 0x1c;
 const S_PEER_LIST: u8 = 0x1d;
 const S_REGISTER_ACK: u8 = 0x1e;
 const S_RELAY_ACK: u8 = 0x1f;
+const S_SEND_KEYS_ACK: u8 = 0x20;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -315,6 +325,7 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             cols,
             attach,
             auth_token,
+            env,
         } => {
             payload.push(C_IDENTIFY);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -322,6 +333,13 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.push(if *attach { 1 } else { 0 });
             payload.extend_from_slice(&(auth_token.len() as u32).to_le_bytes());
             payload.extend_from_slice(auth_token.as_bytes());
+            payload.extend_from_slice(&(env.len() as u32).to_le_bytes());
+            for (k, v) in env {
+                payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                payload.extend_from_slice(k.as_bytes());
+                payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                payload.extend_from_slice(v.as_bytes());
+            }
         }
         ClientMsg::PaneInput { data } => {
             payload.push(C_PANE_INPUT);
@@ -758,6 +776,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             payload.extend_from_slice(reason.as_bytes());
         }
+        ServerMsg::SendKeysAck { ok, reason } => {
+            payload.push(S_SEND_KEYS_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
+        }
     }
     frame(payload)
 }
@@ -843,11 +867,22 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
                 r = &r[1..];
             }
             let auth_token = read_optional_string(&mut r)?;
+            // Trailing env pairs (newer clients; absent on old ones).
+            let mut env: Vec<(String, String)> = Vec::new();
+            if r.len() >= 4 {
+                let count = read_u32(&mut r)? as usize;
+                for _ in 0..count.min(64) {
+                    let k = read_optional_string(&mut r)?;
+                    let v = read_optional_string(&mut r)?;
+                    env.push((k, v));
+                }
+            }
             Ok(ClientMsg::Identify {
                 rows,
                 cols,
                 attach,
                 auth_token,
+                env,
             })
         }
         C_PANE_INPUT => Ok(ClientMsg::PaneInput { data: r.to_vec() }),
@@ -1379,6 +1414,11 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let reason = read_len_string(&mut r)?;
             Ok(ServerMsg::RelayAck { ok, reason })
         }
+        S_SEND_KEYS_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::SendKeysAck { ok, reason })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -1655,6 +1695,26 @@ mod tests {
             });
             match decode_server(&mut &ack[..]).unwrap() {
                 ServerMsg::RelayAck { ok: got, reason: r } => {
+                    assert_eq!(got, ok);
+                    assert_eq!(r, reason);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn send_keys_ack_roundtrip() {
+        for (ok, reason) in [
+            (true, "wrote 5 bytes to session 'main' window 0"),
+            (false, "no session 'nope' on server 'default'"),
+        ] {
+            let bytes = encode_server(&ServerMsg::SendKeysAck {
+                ok,
+                reason: reason.into(),
+            });
+            match decode_server(&mut &bytes[..]).unwrap() {
+                ServerMsg::SendKeysAck { ok: got, reason: r } => {
                     assert_eq!(got, ok);
                     assert_eq!(r, reason);
                 }

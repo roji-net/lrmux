@@ -316,6 +316,7 @@ pub fn poll_peer(addr: &str) -> io::Result<(Vec<String>, bool)> {
         cols: 0,
         attach: false,
         auth_token: psk.clone(),
+        env: Vec::new(),
     });
     crate::proto::send(&mut stream, &ident)?;
     let ack = crate::ipc::stream::decode_with_deadline(&mut stream, POLL_TIMEOUT, |r| {
@@ -364,6 +365,7 @@ pub fn register(addr: &str, tcp_port: u16, tls: bool) -> io::Result<()> {
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk().to_string(),
+        env: Vec::new(),
     });
     crate::proto::send(&mut stream, &ident)?;
     let ack = crate::ipc::stream::decode_with_deadline(&mut stream, POLL_TIMEOUT, |r| {

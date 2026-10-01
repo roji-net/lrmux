@@ -159,6 +159,29 @@ fn pump_relay_peer(client: &mut ClientConn) -> bool {
     }
 }
 
+/// Terminal-identity vars an attached client may refresh in the
+/// server's environment. Server-side allowlist: clients only send
+/// these anyway, but a hand-rolled TCP client must not be able to
+/// rewrite arbitrary server env (PATH, HOME, …) for future panes.
+const CLIENT_ENV_KEYS: &[&str] = &[
+    "COLORTERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "LC_TERMINAL",
+    "TERMINAL_EMULATOR",
+    "WEZTERM_EXECUTABLE",
+    "KITTY_WINDOW_ID",
+];
+
+fn apply_client_env(env: &[(String, String)]) {
+    for (k, v) in env {
+        if CLIENT_ENV_KEYS.contains(&k.as_str()) {
+            // Safety: the event loop is single-threaded.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
+}
+
 /// TCP clients must present a matching auth_token when the server has one.
 fn check_tcp_auth(client: &ClientConn, token: &str) -> bool {
     tcp_auth_ok(client.is_tcp, token)
@@ -624,9 +647,16 @@ pub fn run(
                         if !cc_bytes.is_empty() {
                             forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
                         }
-                        // Proxy OSC 10/11 color queries to a real attached TTY.
+                        // OSC 10/11 color queries: answer from the pane's
+                        // cached palette when known — a real-TTY roundtrip
+                        // takes ~10-20ms and lands in the child's input queue
+                        // after apps with a short read window already moved
+                        // on (the reply then echoes as typed garbage). Proxy
+                        // only when we have nothing truthful to say.
                         for q in osc_queries {
-                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            if !answer_osc_color_query(pane, &q, &clients) {
+                                proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            }
                         }
                         pty_activity.push((si, wi));
                     }
@@ -640,9 +670,12 @@ pub fn run(
                             forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
                         }
                         for q in osc_queries {
-                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            if !answer_osc_color_query(pane, &q, &clients) {
+                                proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            }
                         }
                         let exit_code = pane.reap_child().unwrap_or(0);
+                        pane.trace_event(&format!("child exited, code {exit_code}"));
                         pty_exits.push((si, wi, exit_code));
                     }
                     Err(e) => {
@@ -704,7 +737,12 @@ pub fn run(
             // (iTerm2) is attached to this session, use tmux semantics:
             // the window closes on ANY exit code (remain-on-exit off).
             let control_attached = clients.iter().any(|c| c.is_control && c.session_idx == si);
-            if exit_code == 0 || exit_code == 130 || exit_code == -2 || control_attached {
+            // tmux remain-on-exit: `set-window-option -t @N remain-on-exit on`
+            // keeps the pane on ANY exit code, even with a control client.
+            let remain = session.windows[wi].remain_on_exit;
+            if !remain
+                && (exit_code == 0 || exit_code == 130 || exit_code == -2 || control_attached)
+            {
                 // Exit code 0: auto-close the window.
                 let wid = session.windows[wi].id_str();
                 session.windows.remove(wi);
@@ -825,6 +863,10 @@ pub fn run(
                                             if si < sessions.len() {
                                                 for w in &mut sessions[si].windows {
                                                     w.pane.resize(new_grid_rows, new_grid_cols);
+                                                    w.pane.trace_event(&format!(
+                                                        "resize {}x{new_grid_rows}",
+                                                        new_grid_cols
+                                                    ));
                                                 }
                                             }
                                             // Update global grid size if the first session was resized
@@ -867,7 +909,7 @@ pub fn run(
                                                     .note_osc_color_reply(&data);
                                                 let _ = sessions[si].windows[wi]
                                                     .pane
-                                                    .write_input(&data);
+                                                    .write_input_tagged("RPL", &data);
                                             }
                                         }
                                         ClientMsg::TermPalette { fg, bg } => {
@@ -907,11 +949,13 @@ pub fn run(
                                                         grid_cols,
                                                         default_window_name(),
                                                         dir,
+                                                        sessions[si].id,
                                                     ),
                                                     None => Window::new(
                                                         grid_rows,
                                                         grid_cols,
                                                         default_window_name(),
+                                                        sessions[si].id,
                                                     ),
                                                 };
                                                 sessions[si].windows.push(win);
@@ -1133,6 +1177,8 @@ pub fn run(
                                                     default_window_name(),
                                                     cmd,
                                                     cwd_full.as_deref(),
+                                                    sessions[new_si].id,
+                                                    &[],
                                                 );
                                                 // Replace the first window (default shell)
                                                 // with the command window.
@@ -1417,17 +1463,17 @@ pub fn run(
                                             return Ok(());
                                         }
                                         ClientMsg::NewWindowIn { session, command } => {
-                                            // Find the target session by name, or use the first.
+                                            // "$N" = session id (what
+                                            // LRMUX_SESSION exports), else
+                                            // name. None = the requesting
+                                            // client's session.
                                             let si = match session {
-                                                Some(ref name) => {
-                                                    sessions.iter().position(|s| &s.name == name)
+                                                Some(ref spec) => {
+                                                    resolve_newwin_session(&sessions, spec)
                                                 }
                                                 None => {
-                                                    if sessions.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(0)
-                                                    }
+                                                    let si = clients[client_idx].session_idx;
+                                                    (si < sessions.len()).then_some(si)
                                                 }
                                             };
                                             if let Some(si) = si {
@@ -1438,11 +1484,14 @@ pub fn run(
                                                         default_window_name(),
                                                         cmd,
                                                         None,
+                                                        sessions[si].id,
+                                                        &[],
                                                     ),
                                                     None => Window::new(
                                                         grid_rows,
                                                         grid_cols,
                                                         default_window_name(),
+                                                        sessions[si].id,
                                                     ),
                                                 };
                                                 sessions[si].windows.push(win);
@@ -1472,35 +1521,52 @@ pub fn run(
                                             };
                                             let fmt =
                                                 super::capture::CaptureFormat::from_u8(format);
-                                            let content = if let Some(si) = si {
+                                            let reply: Result<String, String> = if let Some(si) = si
+                                            {
                                                 let wi = match window {
                                                     Some(w) => Some(w as usize),
-                                                    None => Some(clients[client_idx].active_window),
+                                                    None => Some(
+                                                        clients[client_idx].active_window.min(
+                                                            sessions[si]
+                                                                .windows
+                                                                .len()
+                                                                .saturating_sub(1),
+                                                        ),
+                                                    ),
                                                 };
-                                                if let Some(wi) = wi
-                                                    && wi < sessions[si].windows.len()
-                                                {
-                                                    let palette = resolve_capture_palette(
-                                                        &sessions, &clients, si, wi, term_fg,
-                                                        term_bg,
-                                                    );
-                                                    Some(super::capture::render_pane(
-                                                        &sessions[si].windows[wi].pane,
-                                                        fmt,
-                                                        colors,
-                                                        false,
-                                                        palette,
-                                                    ))
-                                                } else {
-                                                    None
+                                                match wi {
+                                                    Some(wi) if wi < sessions[si].windows.len() => {
+                                                        let palette = resolve_capture_palette(
+                                                            &sessions, &clients, si, wi, term_fg,
+                                                            term_bg,
+                                                        );
+                                                        Ok(super::capture::render_pane(
+                                                            &sessions[si].windows[wi].pane,
+                                                            fmt,
+                                                            colors,
+                                                            false,
+                                                            palette,
+                                                        ))
+                                                    }
+                                                    _ => Err(format!(
+                                                        "session '{}' has no window {}; \
+                                                         windows: {}",
+                                                        sessions[si].name,
+                                                        wi.unwrap_or(0),
+                                                        session_window_names(&sessions[si])
+                                                    )),
                                                 }
                                             } else {
-                                                None
+                                                Err(no_session_error(&session, &sessions))
                                             };
-                                            let msg =
-                                                proto::encode_server(&ServerMsg::WindowCapture {
-                                                    content: content.unwrap_or_default(),
-                                                });
+                                            let msg = match reply {
+                                                Ok(content) => proto::encode_server(
+                                                    &ServerMsg::WindowCapture { content },
+                                                ),
+                                                Err(msg) => {
+                                                    proto::encode_server(&ServerMsg::Error { msg })
+                                                }
+                                            };
                                             let _ = client_send(&mut clients[client_idx], &msg);
                                         }
                                         ClientMsg::SendKeys {
@@ -1508,63 +1574,23 @@ pub fn run(
                                             window,
                                             keys,
                                         } => {
-                                            crate::log::info(&format!(
-                                                "SendKeys: session={:?} window={:?} keys_len={}",
-                                                session,
+                                            let (ok, reason) = handle_send_keys(
+                                                &mut sessions,
+                                                clients[client_idx].active_window,
+                                                &session,
                                                 window,
+                                                &keys,
+                                            );
+                                            crate::log::info(&format!(
+                                                "SendKeys: session={session:?} window={window:?} keys_len={} ok={ok} {reason}",
                                                 keys.len()
                                             ));
-                                            // Find the target session by name, or use the first.
-                                            let si = match session {
-                                                Some(ref name) => {
-                                                    sessions.iter().position(|s| &s.name == name)
-                                                }
-                                                None => {
-                                                    if sessions.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(0)
-                                                    }
-                                                }
-                                            };
-                                            if let Some(si) = si {
-                                                let wi = match window {
-                                                    Some(w) => Some(w as usize),
-                                                    None => Some(clients[client_idx].active_window),
-                                                };
-                                                if let Some(wi) = wi
-                                                    && wi < sessions[si].windows.len()
-                                                {
-                                                    crate::log::info(&format!(
-                                                        "SendKeys: writing {} bytes to session '{}' window {}",
-                                                        keys.len(),
-                                                        sessions[si].name,
-                                                        wi
-                                                    ));
-                                                    let translated = translate_cursor_keys(
-                                                        &keys,
-                                                        sessions[si].windows[wi]
-                                                            .pane
-                                                            .grid
-                                                            .app_cursor_keys,
-                                                    );
-                                                    let _ = sessions[si].windows[wi]
-                                                        .pane
-                                                        .write_input(&translated);
-                                                } else {
-                                                    crate::log::warn(&format!(
-                                                        "SendKeys: window index {} out of range (session '{}' has {} windows)",
-                                                        wi.unwrap_or(0),
-                                                        sessions[si].name,
-                                                        sessions[si].windows.len()
-                                                    ));
-                                                }
-                                            } else {
-                                                crate::log::warn(&format!(
-                                                    "SendKeys: session {:?} not found",
-                                                    session
-                                                ));
-                                            }
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::SendKeysAck {
+                                                    ok,
+                                                    reason,
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
                                         }
                                         ClientMsg::GetLog => {
                                             let lines = crate::log::get_ring_log();
@@ -1708,13 +1734,10 @@ pub fn run(
                         match msg {
                             ClientMsg::NewWindowIn { session, command } => {
                                 let si = match session {
-                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
+                                    Some(ref spec) => resolve_newwin_session(&sessions, spec),
                                     None => {
-                                        if sessions.is_empty() {
-                                            None
-                                        } else {
-                                            Some(0)
-                                        }
+                                        let si = clients[client_idx].session_idx;
+                                        (si < sessions.len()).then_some(si)
                                     }
                                 };
                                 if let Some(si) = si {
@@ -1725,10 +1748,15 @@ pub fn run(
                                             default_window_name(),
                                             cmd,
                                             None,
+                                            sessions[si].id,
+                                            &[],
                                         ),
-                                        None => {
-                                            Window::new(grid_rows, grid_cols, default_window_name())
-                                        }
+                                        None => Window::new(
+                                            grid_rows,
+                                            grid_cols,
+                                            default_window_name(),
+                                            sessions[si].id,
+                                        ),
                                     };
                                     sessions[si].windows.push(win);
                                     need_status_bar_all = true;
@@ -1781,6 +1809,8 @@ pub fn run(
                                         default_window_name(),
                                         cmd,
                                         cwd_full.as_deref(),
+                                        sessions[new_si].id,
+                                        &[],
                                     );
                                     sessions[new_si].windows[0] = win;
                                 }
@@ -1803,39 +1833,20 @@ pub fn run(
                                 window,
                                 keys,
                             } => {
-                                crate::log::info(&format!(
-                                    "SendKeys: session={:?} window={:?} keys_len={} (from POLLHUP)",
-                                    session,
+                                let (ok, reason) = handle_send_keys(
+                                    &mut sessions,
+                                    clients[client_idx].active_window,
+                                    &session,
                                     window,
+                                    &keys,
+                                );
+                                crate::log::info(&format!(
+                                    "SendKeys: session={session:?} window={window:?} keys_len={} ok={ok} (from POLLHUP) {reason}",
                                     keys.len()
                                 ));
-                                let si = match session {
-                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
-                                    None => Some(0),
-                                };
-                                if let Some(si) = si
-                                    && let Some(session) = sessions.get_mut(si)
-                                {
-                                    let wi = match window {
-                                        Some(w) => Some(w as usize),
-                                        None => Some(clients[client_idx].active_window),
-                                    };
-                                    if let Some(wi) = wi
-                                        && let Some(window) = session.windows.get_mut(wi)
-                                    {
-                                        let translated = translate_cursor_keys(
-                                            &keys,
-                                            window.pane.grid.app_cursor_keys,
-                                        );
-                                        let _ = window.pane.write_input(&translated);
-                                        crate::log::info(&format!(
-                                            "SendKeys: writing {} bytes to session '{}' window {}",
-                                            translated.len(),
-                                            session.name,
-                                            wi
-                                        ));
-                                    }
-                                }
+                                let msg =
+                                    proto::encode_server(&ServerMsg::SendKeysAck { ok, reason });
+                                let _ = client_send(&mut clients[client_idx], &msg);
                             }
                             ClientMsg::SelectSession { name } => {
                                 if let Some(idx) = sessions.iter().position(|s| s.name == name) {
@@ -2883,8 +2894,19 @@ fn accept_new_client(
                 Ok(ClientMsg::Identify {
                     attach: a,
                     auth_token,
+                    env,
                     ..
-                }) => (a, false, auth_token),
+                }) => {
+                    // tmux `update-environment`: an interactive attach
+                    // refreshes terminal-identity vars in the server's
+                    // env, so panes spawned later inherit the freshest
+                    // capabilities (e.g. a server started under an old
+                    // terminal gains COLORTERM on the next attach).
+                    if a {
+                        apply_client_env(&env);
+                    }
+                    (a, false, auth_token)
+                }
                 Ok(ClientMsg::IdentifyControl { auth_token, .. }) => (false, true, auth_token),
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
@@ -2946,36 +2968,6 @@ fn accept_new_client(
             {
                 let _ = clear_window_activity(&mut sessions[session_idx], active);
             }
-            // Only send snapshot + status bar to interactive clients (attach=true).
-            // CLI commands (attach=false) only need the IdentifyAck.
-            if attach {
-                if let Some(session) = sessions.get(session_idx)
-                    && let Some(window) = session.windows.get(active)
-                {
-                    let pane = &window.pane;
-                    let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-                    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-                        rows: pane.rows,
-                        cols: pane.cols,
-                        cells: pane.snapshot(),
-                        cursor_row,
-                        cursor_col,
-                        cursor_visible,
-                        mouse_flags: pane.grid.mouse_flags(),
-                    });
-                    if proto::send(&mut stream, &snapshot).is_err() {
-                        return Ok(());
-                    }
-                }
-
-                // Send status bar.
-                if let Some(session) = sessions.get(session_idx) {
-                    let status =
-                        encode_status_bar(session, active as u16, sessions.len() as u16, false);
-                    let _ = proto::send(&mut stream, &status);
-                }
-            }
-
             let mut conn = ClientConn::new(stream, attach);
             conn.session_idx = session_idx;
             conn.active_window = active;
@@ -2988,6 +2980,19 @@ fn accept_new_client(
             // outbuf so a stalled client can't freeze the event loop.
             let _ = conn.stream.set_nonblocking(true);
             clients.push(conn);
+            let ci = clients.len() - 1;
+            // Only send snapshot + status bar to interactive clients
+            // (attach=true). CLI commands (attach=false) only need the
+            // IdentifyAck. send_snapshot_to_client is the same path window
+            // switches use — it also replays pane scrollback so a fresh
+            // attach has history for copy mode.
+            if attach {
+                if send_snapshot_to_client(&mut clients[ci], sessions).is_err() {
+                    clients.remove(ci);
+                    return Ok(());
+                }
+                send_status_bar_to_client(&mut clients[ci], sessions);
+            }
             // Like real tmux -CC, emit the initial state right away —
             // silence after the DCS makes iTerm2 think tmux is hung.
             if is_control {
@@ -3038,6 +3043,132 @@ fn seed_client_focus_palette(sessions: &mut [Session], clients: &[ClientConn], c
     seed_pane_palette(sessions, c.session_idx, c.active_window, c.palette);
 }
 
+/// Error text for a CaptureWindow session lookup miss, listing the
+/// sessions that do exist and suggesting a close name when one matches.
+fn no_session_error(session: &Option<String>, sessions: &[Session]) -> String {
+    let avail = session_names(sessions);
+    let mut msg = match session {
+        Some(name) => format!(
+            "no session '{name}' on server '{}' (sessions: {avail})",
+            crate::server::server_name()
+        ),
+        None => format!("server '{}' has no sessions", crate::server::server_name()),
+    };
+    if let Some(name) = session
+        && let Some(guess) = closest_name(name, sessions.iter().map(|s| s.name.as_str()))
+    {
+        msg.push_str(&format!(" — did you mean '{guess}'?"));
+    }
+    msg
+}
+
+fn session_names(sessions: &[Session]) -> String {
+    if sessions.is_empty() {
+        return "none".to_string();
+    }
+    sessions
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn session_window_names(session: &Session) -> String {
+    session
+        .windows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| format!("{i}:{}", w.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve a SendKeys target and write the keys (translated for the
+/// pane's cursor-key mode) to the pane's PTY. Returns `(ok, reason)`
+/// for the `SendKeysAck` reply — `ok=false` covers unknown session,
+/// window index out of range, and PTY write failure.
+fn handle_send_keys(
+    sessions: &mut [Session],
+    active_window: usize,
+    session: &Option<String>,
+    window: Option<u8>,
+    keys: &[u8],
+) -> (bool, String) {
+    let si = match session {
+        Some(name) => match sessions.iter().position(|s| &s.name == name) {
+            Some(i) => i,
+            None => return (false, no_session_error(session, sessions)),
+        },
+        None => {
+            if sessions.is_empty() {
+                return (false, "no sessions".into());
+            }
+            0
+        }
+    };
+    let wi = match window {
+        Some(w) => w as usize,
+        None => active_window,
+    };
+    let sess = &mut sessions[si];
+    if wi >= sess.windows.len() {
+        return (
+            false,
+            format!(
+                "session '{}' has no window {}; windows: {}",
+                sess.name,
+                wi,
+                session_window_names(sess)
+            ),
+        );
+    }
+    let translated = translate_cursor_keys(keys, sess.windows[wi].pane.grid.app_cursor_keys);
+    let n = translated.len();
+    match sess.windows[wi].pane.write_input(&translated) {
+        Ok(()) => (
+            true,
+            format!("wrote {n} bytes to session '{}' window {wi}", sess.name),
+        ),
+        Err(e) => (false, format!("pty write failed: {e}")),
+    }
+}
+
+/// Closest candidate by edit distance; also accepts a prefix match so
+/// e.g. `web` suggests `web-server`.
+fn closest_name<'a>(want: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut best: Option<(&'a str, usize)> = None;
+    for c in candidates {
+        let prefix = want.len() >= 3 && (c.starts_with(want) || want.starts_with(c));
+        let d = if prefix {
+            want.len().abs_diff(c.len())
+        } else {
+            edit_distance(want, c)
+        };
+        let acceptable = d <= 3 || prefix;
+        if acceptable && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((c, d));
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push(
+                (prev[j] + usize::from(ca != *cb))
+                    .min(prev[j + 1] + 1)
+                    .min(cur[j] + 1),
+            );
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 /// Palette for HTML capture: pane cache, then viewers of that window, then
 /// any attached client, then an explicit override from the request.
 fn resolve_capture_palette(
@@ -3071,6 +3202,43 @@ fn resolve_capture_palette(
         fg: term_fg,
         bg: term_bg,
     })
+}
+
+/// Answer a child's OSC 10/11 color query directly from the pane's cached
+/// palette — seeded by the attaching client's probe and by earlier proxied
+/// replies — falling back to any attached client's probed palette (the
+/// same outer-terminal colors are a valid answer for every pane). Returns
+/// false when nothing is known — the caller then proxies to a real client
+/// TTY instead of inventing a color.
+fn answer_osc_color_query(
+    pane: &mut crate::server::pane::Pane,
+    query: &crate::vt::OscColorQuery,
+    clients: &[ClientConn],
+) -> bool {
+    let rgb = match query.code {
+        10 => pane
+            .default_fg
+            .or_else(|| clients.iter().find_map(|c| c.palette.fg)),
+        11 => pane
+            .default_bg
+            .or_else(|| clients.iter().find_map(|c| c.palette.bg)),
+        _ => None,
+    };
+    let Some((r, g, b)) = rgb else { return false };
+    let reply = format_osc_color_reply(query.code, (r, g, b), query.bell_terminated);
+    pane.write_input_tagged("RPL", reply.as_bytes()).is_ok()
+}
+
+/// xterm-style OSC color reply: 16-bit channels (8-bit value replicated),
+/// terminated the same way the child's query was.
+fn format_osc_color_reply(code: u8, (r, g, b): (u8, u8, u8), bell: bool) -> String {
+    format!(
+        "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}{}",
+        r as u16 * 257,
+        g as u16 * 257,
+        b as u16 * 257,
+        if bell { "\x07" } else { "\x1b\\" },
+    )
 }
 
 /// Ask an attached client to query its real TTY for OSC 10/11.
@@ -3264,11 +3432,47 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             } else {
                 String::new()
             };
+            // Optional trailing env pairs (newer clients).
+            let mut env: Vec<(String, String)> = Vec::new();
+            let tok_end = 9 + auth_token.len();
+            if data.len() >= tok_end + 4 {
+                let mut r = &data[tok_end + 4..];
+                let count = u32::from_le_bytes([
+                    data[tok_end],
+                    data[tok_end + 1],
+                    data[tok_end + 2],
+                    data[tok_end + 3],
+                ]) as usize;
+                for _ in 0..count.min(64) {
+                    if r.len() < 4 {
+                        break;
+                    }
+                    let kl = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+                    r = &r[4..];
+                    if r.len() < kl {
+                        break;
+                    }
+                    let k = String::from_utf8_lossy(&r[..kl]).into_owned();
+                    r = &r[kl..];
+                    if r.len() < 4 {
+                        break;
+                    }
+                    let vl = u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as usize;
+                    r = &r[4..];
+                    if r.len() < vl {
+                        break;
+                    }
+                    let v = String::from_utf8_lossy(&r[..vl]).into_owned();
+                    r = &r[vl..];
+                    env.push((k, v));
+                }
+            }
             ClientMsg::Identify {
                 rows,
                 cols,
                 attach,
                 auth_token,
+                env,
             }
         }
         0x02 => ClientMsg::PaneInput {
@@ -4147,6 +4351,75 @@ fn control_respond(client: &mut ClientConn, lines: &[&str]) {
     control_respond_flags(client, lines, 1);
 }
 
+/// Error response to a client-issued command: %begin/%error block
+/// (flags=1) carrying a single message line, like real tmux sends for
+/// "can't find window" and friends.
+fn control_respond_error(client: &mut ClientConn, msg: &str) {
+    client.control_seq += 1;
+    let ts = unix_ts();
+    let seq = client.control_seq;
+    send_control_notify(client, &format!("%begin {ts} {seq} 1"));
+    send_control_notify(client, msg);
+    send_control_notify(client, &format!("%error {ts} {seq} 1"));
+}
+
+/// Split a control-command arg string honoring shell quoting:
+/// 'literal', "escaped \" inside", and \-escapes. Args arriving via
+/// the tmux shim are already argv-split; this preserves that intent.
+fn split_args_shell(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    cur.push(c);
+                }
+            }
+            '"' => {
+                started = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                cur.push(n);
+                            }
+                        }
+                        _ => cur.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            _ => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
 /// Send initial state notifications to a control client.
 /// Mirrors what real `tmux -CC` emits right after the DCS: an empty
 /// %begin/%end block, then %window-add for each window, then
@@ -4241,6 +4514,16 @@ fn extract_format_arg(args: &str) -> Option<String> {
     None
 }
 
+/// `display-message -p <fmt>`: the format is the positional argument
+/// (shell-split tokens re-joined so quoted formats stay one string).
+fn positional_format(positional: &[String]) -> Option<String> {
+    if positional.is_empty() {
+        None
+    } else {
+        Some(positional.join(" "))
+    }
+}
+
 /// Expand a tmux -F format string for a session/window.
 /// Supports #{...} variables used by iTerm2 plus common ones, and \t / \n escapes.
 fn expand_format(
@@ -4272,6 +4555,29 @@ fn expand_format(
                 var.push(c);
             }
             out.push_str(&format_var(&var, session, window, socket_path));
+        } else if c == '#' {
+            // tmux shorthand variables: ## is a literal '#', the rest
+            // map to their #{long} form.
+            let long = match chars.next() {
+                Some('#') => {
+                    out.push('#');
+                    continue;
+                }
+                Some('S') => "session_name",
+                Some('I') => "window_index",
+                Some('W') => "window_name",
+                Some('P') => "pane_id",
+                Some(other) => {
+                    out.push('#');
+                    out.push(other);
+                    continue;
+                }
+                None => {
+                    out.push('#');
+                    continue;
+                }
+            };
+            out.push_str(&format_var(long, session, window, socket_path));
         } else {
             out.push(c);
         }
@@ -4567,6 +4873,7 @@ fn handle_single_control_command(
                             && (window.pane.cols != cols || window.pane.rows != rows)
                         {
                             window.pane.resize(rows, cols);
+                            window.pane.trace_event(&format!("resize {cols}x{rows}"));
                             send_control_notify(
                                 client,
                                 &format!(
@@ -4660,6 +4967,69 @@ fn handle_single_control_command(
             // iTerm2 queries: show-window-options -g aggressive-resize
             //                  show-window-options pane-border-format
             respond(client, &[]);
+        }
+        "set-window-option" => {
+            // tmux tools send: set-window-option -t @N remain-on-exit on
+            let args = split_args_shell(args_str);
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            if parsed.positional.len() >= 2 {
+                let key = unquote(&parsed.positional[0]).to_string();
+                let val = unquote(&parsed.positional[1]).to_string();
+                if key == "remain-on-exit"
+                    && let Some((si, wi)) = resolve_target(sessions, client, t.as_deref())
+                    && let Some(w) = sessions.get_mut(si).and_then(|s| s.windows.get_mut(wi))
+                {
+                    w.remain_on_exit = val != "off";
+                }
+            }
+            // Other window options are accepted as no-ops (lrmux has no
+            // per-window option table to store them in).
+            respond(client, &[]);
+        }
+        "set-environment" => {
+            // tmux: set-environment [-g] [-u] <name> [value]
+            // lrmux applies to the server's process env directly, so
+            // `show-environment` and future pane spawns both see it.
+            let args = split_args_shell(args_str);
+            let mut positional: Vec<String> = Vec::new();
+            let mut unset = false;
+            for a in &args {
+                if a == "-u" {
+                    unset = true;
+                } else if !a.starts_with('-') {
+                    positional.push(a.clone());
+                }
+            }
+            if let Some(name) = positional.first() {
+                // Safety: the event loop is single-threaded.
+                unsafe {
+                    if unset {
+                        std::env::remove_var(name);
+                    } else if let Some(val) = positional.get(1) {
+                        std::env::set_var(name, val);
+                    }
+                }
+            }
+            respond(client, &[]);
+        }
+        "unset-environment" => {
+            let args = split_args_shell(args_str);
+            if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
+                // Safety: the event loop is single-threaded.
+                unsafe { std::env::remove_var(name) };
+            }
+            respond(client, &[]);
+        }
+        "show-environment" => {
+            // tmux's "server environment": the env the server started with,
+            // which new panes inherit. Format: one KEY=value per line.
+            let lines: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            respond(client, &refs);
         }
         "list-sessions" => {
             // iTerm2 sends: list-sessions -F "<format>"
@@ -4859,47 +5229,39 @@ fn handle_single_control_command(
         "display-message" => {
             // iTerm2 sends: display-message -p "#{version}", "#{pid}", and
             //   display -p -F "<window TSV>" -t @N  (window opener query)
-            // Resolve -t so the format expands for the requested window.
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            // tmux tools send: display-message -t @N -p "#W"
+            // Resolve -t so the format expands for the requested window;
+            // an explicitly bad -t is an error like real tmux.
+            let args = split_args_shell(args_str);
             let parsed = crate::cmd::parse_flags(&args);
             let t = parsed
                 .get("t")
                 .or_else(|| parsed.get("target"))
                 .map(|s| s.to_string());
-            let (session, window) = match resolve_target(sessions, client, t.as_deref()) {
-                Some((si, wi)) => (
-                    sessions.get(si),
-                    sessions.get(si).and_then(|s| s.windows.get(wi)),
-                ),
-                None => (
-                    sessions.get(client.session_idx),
-                    sessions
-                        .get(client.session_idx)
-                        .and_then(|s| s.windows.get(client.active_window)),
-                ),
-            };
-            if let Some(fmt) = extract_format_arg(args_str) {
+            let loc = resolve_target(sessions, client, t.as_deref());
+            if t.is_some() && loc.is_none() {
+                control_respond_error(
+                    client,
+                    &format!("can't find window: {}", unquote(t.as_deref().unwrap_or(""))),
+                );
+                return false;
+            }
+            let (si, wi) = loc.unwrap_or((client.session_idx, client.active_window));
+            let (session, window) = (
+                sessions.get(si),
+                sessions.get(si).and_then(|s| s.windows.get(wi)),
+            );
+            // Format comes from -F "<fmt>" or, with -p, the positional arg.
+            let fmt = extract_format_arg(args_str).or_else(|| {
+                if parsed.get("p").is_some() {
+                    positional_format(&parsed.positional)
+                } else {
+                    None
+                }
+            });
+            if let Some(fmt) = fmt {
                 let text = expand_format(&fmt, session, window, socket_path);
                 respond(client, &[&text]);
-            } else if args_str.contains("#{") {
-                // -p "<format>" without -F
-                if let Some(start) = args_str.find('"') {
-                    if let Some(end) = args_str.rfind('"') {
-                        if end > start {
-                            let fmt = &args_str[start + 1..end];
-                            let session = sessions.get(client.session_idx);
-                            let window = session.and_then(|s| s.windows.get(client.active_window));
-                            let text = expand_format(fmt, session, window, socket_path);
-                            respond(client, &[&text]);
-                        } else {
-                            respond(client, &[]);
-                        }
-                    } else {
-                        respond(client, &[]);
-                    }
-                } else {
-                    respond(client, &[]);
-                }
             } else {
                 respond(client, &[]);
             }
@@ -4983,23 +5345,65 @@ fn handle_single_control_command(
         }
         "new-window" => {
             // iTerm2 sends: new-window -PF '#{window_id}' -c '#{pane_current_path}'
-            // -P means "print": the response must contain the new window id
-            // (@N), which iTerm2 registers in _pendingWindows to open the tab.
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
-            let parsed = crate::cmd::parse_flags(&args);
-            let print = parsed.get("P").is_some()
-                || args.iter().any(|a| a.contains('P') && a.starts_with('-'));
+            // tmux tools send:  new-window -d -P -F '#{window_id}' -n <name>
+            //                   [-e K=V]... [shell-command]
+            // -P means "print": the response expands -F (default
+            // #{window_id}) so callers can register the @N id.
+            let args = split_args_shell(args_str);
+            let mut name: Option<String> = None;
+            let mut target: Option<String> = None;
+            let mut cwd: Option<String> = None;
+            let mut fmt: Option<String> = None;
+            let mut print = false;
+            let mut env: Vec<(String, String)> = Vec::new();
+            let mut positional: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a.starts_with('-') && a.len() > 1 && a != "-" {
+                    // Combined short flags: -dP, -PF — boolean flags consume
+                    // a char, value flags take the rest or the next arg.
+                    let mut chars = a[1..].chars().peekable();
+                    while let Some(f) = chars.next() {
+                        match f {
+                            'd' | 'a' | 'k' => {}
+                            'P' => print = true,
+                            'n' | 't' | 'c' | 'F' | 'e' => {
+                                let rest: String = chars.collect();
+                                let v = if !rest.is_empty() {
+                                    rest
+                                } else {
+                                    i += 1;
+                                    args.get(i).cloned().unwrap_or_default()
+                                };
+                                match f {
+                                    'n' => name = Some(v),
+                                    't' => target = Some(v),
+                                    'c' => cwd = Some(v),
+                                    'F' => fmt = Some(v),
+                                    'e' => {
+                                        if let Some((k, val)) = v.split_once('=') {
+                                            env.push((k.to_string(), val.to_string()));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    positional.push(a.clone());
+                }
+                i += 1;
+            }
 
-            // Create a new window in the -t session ("$N" or "$N:+"), else
+            // Create the window in the -t session ("$N" or "$N:+"), else
             // the client's session.
-            let si = parsed
-                .get("t")
-                .or_else(|| parsed.get("target"))
-                .map(|t| {
-                    let t = unquote(t);
-                    let t = t.split(':').next().unwrap_or(t);
-                    t.to_string()
-                })
+            let si = target
+                .as_deref()
+                .map(|t| t.split(':').next().unwrap_or(t).to_string())
                 .and_then(|t| resolve_session_target(sessions, client, Some(&t)))
                 .unwrap_or(client.session_idx);
             let mut wid_str = String::new();
@@ -5010,7 +5414,30 @@ fn handle_single_control_command(
                     .first()
                     .map(|w| (w.pane.rows, w.pane.cols))
                     .unwrap_or((24, 80));
-                let win = Window::new(rows, cols, "shell".to_string());
+                let command = positional.join(" ");
+                let wname = name.unwrap_or_else(|| {
+                    if command.is_empty() {
+                        "shell".to_string()
+                    } else {
+                        crate::server::session::default_window_name_for_command(&command)
+                    }
+                });
+                let win = if command.is_empty() {
+                    match cwd.as_deref() {
+                        Some(c) => Window::new_in_cwd(rows, cols, wname, c, session.id),
+                        None => Window::new(rows, cols, wname, session.id),
+                    }
+                } else {
+                    Window::new_with_command(
+                        rows,
+                        cols,
+                        wname,
+                        &command,
+                        cwd.as_deref(),
+                        session.id,
+                        &env,
+                    )
+                };
                 wid_str = win.id_str();
                 let wname = win.name.clone();
                 let layout = window_layout_str(&win);
@@ -5020,19 +5447,36 @@ fn handle_single_control_command(
                 send_control_notify(client, &format!("%layout-change {} {}", wid_str, layout));
             }
             if print && !wid_str.is_empty() {
-                respond(client, &[wid_str.as_str()]);
+                let fmt = fmt.unwrap_or_else(|| "#{window_id}".to_string());
+                let text = expand_format(
+                    &fmt,
+                    sessions.get(si),
+                    sessions
+                        .get(si)
+                        .and_then(|s| s.windows.iter().find(|w| w.id_str() == wid_str)),
+                    socket_path,
+                );
+                respond(client, &[text.as_str()]);
             } else {
                 respond(client, &[]);
             }
         }
         "kill-window" | "kill-pane" => {
-            let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let args = split_args_shell(args_str);
             let parsed = crate::cmd::parse_flags(&args);
             let t = parsed
                 .get("t")
                 .or_else(|| parsed.get("target"))
                 .map(|s| s.to_string());
-            if let Some((si, wi)) = resolve_target(sessions, client, t.as_deref())
+            let loc = resolve_target(sessions, client, t.as_deref());
+            if t.is_some() && loc.is_none() {
+                control_respond_error(
+                    client,
+                    &format!("can't find window: {}", unquote(t.as_deref().unwrap_or(""))),
+                );
+                return false;
+            }
+            if let Some((si, wi)) = loc
                 && si < sessions.len()
                 && wi < sessions[si].windows.len()
             {
@@ -5228,6 +5672,13 @@ fn find_session(sessions: &[Session], name: &Option<String>) -> Option<usize> {
     }
 }
 
+/// Resolve a NewWindowIn session spec: session name or "$id" (the form
+/// `LRMUX_SESSION` exports to panes so nested `lrmux` commands target
+/// the pane's own session).
+fn resolve_newwin_session(sessions: &[Session], spec: &str) -> Option<usize> {
+    find_session(sessions, &Some(spec.to_string()))
+}
+
 /// Find a window by index (or return the first if index is None).
 fn find_window(session: &Session, index: &Option<String>) -> Option<usize> {
     match index {
@@ -5316,7 +5767,7 @@ fn resolve_target(
 
 #[cfg(test)]
 mod escape_output_tests {
-    use super::escape_output;
+    use super::{escape_output, split_args_shell};
 
     #[test]
     fn preserves_box_drawing() {
@@ -5366,6 +5817,28 @@ mod escape_output_tests {
     fn escapes_controls_and_backslash() {
         assert_eq!(escape_output(b"a\nb\\c"), "a\\012b\\134c");
     }
+
+    #[test]
+    fn split_args_shell_quotes() {
+        assert_eq!(
+            split_args_shell("-d -P -F '#{window_id}' -n 'my name' run --all"),
+            vec![
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-n",
+                "my name",
+                "run",
+                "--all"
+            ]
+        );
+        assert_eq!(
+            split_args_shell("-e A=1 -e 'B=x y' \"cmd \\\"q\\\"\""),
+            vec!["-e", "A=1", "-e", "B=x y", "cmd \"q\""]
+        );
+        assert_eq!(split_args_shell(""), Vec::<String>::new());
+    }
 }
 
 /// Resolve a session target: "$N" = session id, "name" = session name,
@@ -5382,5 +5855,26 @@ fn resolve_session_target(
             sessions.iter().position(|s| s.id == id)
         }
         t => find_session(sessions, &Some(t.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod osc_color_reply_tests {
+    use super::format_osc_color_reply;
+
+    #[test]
+    fn preserves_code_and_bell_terminator() {
+        assert_eq!(
+            format_osc_color_reply(10, (0xc7, 0xf1, 0xc7), true),
+            "\x1b]10;rgb:c7c7/f1f1/c7c7\x07"
+        );
+    }
+
+    #[test]
+    fn preserves_st_terminator() {
+        assert_eq!(
+            format_osc_color_reply(11, (0, 0, 0), false),
+            "\x1b]11;rgb:0000/0000/0000\x1b\\"
+        );
     }
 }

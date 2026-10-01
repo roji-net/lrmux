@@ -129,6 +129,90 @@ pub fn error(msg: &str) {
     log_raw(Level::Error, msg);
 }
 
+/// Directory for `LRMUX_TRACE` byte-trace files: the env value itself
+/// when it names a directory, else the per-UID logs dir. None when the
+/// variable is unset or empty.
+pub fn trace_dir() -> Option<PathBuf> {
+    let val = std::env::var("LRMUX_TRACE").ok()?;
+    if val.is_empty() {
+        return None;
+    }
+    let dir = if std::path::Path::new(&val).is_dir() {
+        PathBuf::from(val)
+    } else {
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/lrmux-{uid}/logs"))
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Open `<trace_dir>/<name>` (truncating) when `LRMUX_TRACE` is enabled.
+/// Traced bytes include keystrokes and terminal-query replies — treat
+/// trace files as sensitive.
+pub fn open_trace(name: &str) -> Option<std::fs::File> {
+    std::fs::File::create(trace_dir()?.join(name)).ok()
+}
+
+/// Render raw bytes for a trace line: printable text kept verbatim
+/// (including UTF-8), control bytes escaped (`\e`, `\r`, `\n`, `\a`,
+/// `\xNN`, `\u{NNNN}` for C1 controls).
+pub fn vis_bytes(data: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(data.len() + 16);
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b < 0x80 {
+            match b {
+                0x1b => out.push_str("\\e"),
+                0x07 => out.push_str("\\a"),
+                b'\r' => out.push_str("\\r"),
+                b'\n' => out.push_str("\\n"),
+                b'\t' => out.push_str("\\t"),
+                0x20..=0x7e => out.push(b as char),
+                _ => write!(out, "\\x{b:02x}").unwrap(),
+            }
+            i += 1;
+        } else {
+            let push_str = |out: &mut String, s: &str| {
+                for c in s.chars() {
+                    // Keep the same escapes as the ASCII branch for
+                    // control chars inside a valid UTF-8 run.
+                    match c {
+                        '\u{1b}' => out.push_str("\\e"),
+                        '\u{7}' => out.push_str("\\a"),
+                        '\r' => out.push_str("\\r"),
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        _ if c.is_control() => {
+                            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+                        }
+                        _ => out.push(c),
+                    }
+                }
+            };
+            match std::str::from_utf8(&data[i..]) {
+                Ok(s) => {
+                    push_str(&mut out, s);
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        push_str(&mut out, std::str::from_utf8(&data[i..i + valid]).unwrap());
+                        i += valid;
+                    } else {
+                        let _ = write!(out, "\\x{b:02x}");
+                        i += e.error_len().unwrap_or(1);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Get a copy of the in-memory ring log (newest last).
 /// Returns an empty vector if logging is not initialized.
 pub fn get_ring_log() -> Vec<String> {

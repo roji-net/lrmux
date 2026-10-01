@@ -8,6 +8,7 @@ mod mouse;
 pub mod render;
 pub mod selector;
 pub mod terminal;
+pub mod tmux_shim;
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -91,6 +92,99 @@ pub struct SelectHint {
     pub session: Option<String>,
 }
 
+/// Terminal-identity vars sent in Identify on interactive attach.
+/// The server refreshes its spawn env with them (tmux
+/// `update-environment`-style), so panes created later inherit the
+/// freshest attaching terminal's capabilities instead of whatever env
+/// the server happened to start with. `TERM` is deliberately absent:
+/// the pane's TERM describes lrmux's own emulation, not the outer
+/// terminal's terminfo name.
+pub fn terminal_env_overlay() -> Vec<(String, String)> {
+    const KEYS: &[&str] = &[
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "LC_TERMINAL",
+        "TERMINAL_EMULATOR",
+        "WEZTERM_EXECUTABLE",
+        "KITTY_WINDOW_ID",
+    ];
+    KEYS.iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect()
+}
+
+/// Capture a pane's contents from a server. `tcp` overrides the local
+/// Unix socket lookup of `server`. `window: None` captures the client's
+/// active window (index 0 for this transient connection).
+pub fn capture_pane(
+    server: &str,
+    tcp: Option<&str>,
+    session: Option<String>,
+    window: Option<u8>,
+    format: u8,
+    colors: bool,
+) -> io::Result<String> {
+    let mut stream = match tcp {
+        Some(addr) => ipc::connect_tcp(addr)?,
+        None => {
+            let sock = ipc::socket_path(server);
+            if !ipc::server_exists(&sock) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("server '{server}' is not running"),
+                ));
+            }
+            ipc::ConnStream::Unix(ipc::connect(&sock)?)
+        }
+    };
+    proto::send(
+        &mut stream,
+        &proto::encode_client(&ClientMsg::Identify {
+            rows: 24,
+            cols: 80,
+            attach: false,
+            auth_token: crate::config::effective_psk(),
+            env: Vec::new(),
+        }),
+    )?;
+    loop {
+        match ipc::stream::decode_with_deadline(
+            &mut stream,
+            std::time::Duration::from_secs(5),
+            |r| proto::decode_server(r),
+        )? {
+            ServerMsg::IdentifyAck { .. } => break,
+            ServerMsg::Error { msg } => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+            }
+            _ => {}
+        }
+    }
+    proto::send(
+        &mut stream,
+        &proto::encode_client(&ClientMsg::CaptureWindow {
+            session,
+            window,
+            format,
+            colors,
+            term_fg: None,
+            term_bg: None,
+        }),
+    )?;
+    loop {
+        match ipc::stream::decode_with_deadline(
+            &mut stream,
+            std::time::Duration::from_secs(5),
+            |r| proto::decode_server(r),
+        )? {
+            ServerMsg::WindowCapture { content } => return Ok(content),
+            ServerMsg::Error { msg } => return Err(io::Error::other(msg)),
+            _ => {}
+        }
+    }
+}
+
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
 /// If `select_session` is provided, a SelectSession command is sent to switch to that session.
@@ -114,7 +208,7 @@ pub fn run(
     // scrolls only the content area, pushing lines into the terminal's
     // scrollback buffer.
     {
-        let mut stdout = io::stdout();
+        let mut stdout = client_stdout();
         // Clear screen, hide cursor, set scroll region to exclude status bar.
         let view_rows = terminal::get_size().0.saturating_sub(1);
         write!(stdout, "\x1b[2J\x1b[H\x1b[?25l\x1b[1;{}r", view_rows.max(1))?;
@@ -128,6 +222,7 @@ pub fn run(
         cols,
         attach: true,
         auth_token: crate::config::effective_psk(),
+        env: terminal_env_overlay(),
     });
     proto::send(&mut stream, &identify)?;
 
@@ -164,11 +259,11 @@ pub fn run(
     // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
     // responses to our probes are client-side traffic, not pane input.
     let mut input_filter = input_filter::InputFilter::new();
-    // Mouse report decoder — the outer terminal is always in a reporting
-    // mode while attached: reports feed the child (when it tracks the
-    // mouse) or local copy-mode selection otherwise.
+    // Mouse report decoder — only active while the outer terminal is in
+    // a reporting mode (see sync_mouse_modes): reports feed the child
+    // (when it tracks the mouse) or local copy-mode selection. Inactive
+    // it is a pass-through, so keystrokes see zero added latency.
     let mut mouse_decoder = mouse::Decoder::new();
-    mouse_decoder.set_active(true);
     // Tracking mask currently applied to the outer terminal (None = not yet).
     let mut applied_mouse: Option<u8> = None;
     // Pending mouse-press position (x, y): arms a local selection — the
@@ -200,6 +295,9 @@ pub fn run(
 
     // Status bar text (updated by the server).
     let mut status_text = String::new();
+    // Column spans of each window entry in the status bar (1-based,
+    // start inclusive / end exclusive), for click-to-switch hit-testing.
+    let mut status_spans: Vec<(u16, u16, u8)> = Vec::new();
     // Current session name (from StatusBarUpdate, used for kill-session confirmation).
     let mut current_session = String::new();
     // Number of windows in the current session (from StatusBarUpdate).
@@ -250,7 +348,7 @@ pub fn run(
 
     // Clear screen and do initial render.
     {
-        let mut stdout = io::stdout();
+        let mut stdout = client_stdout();
         stdout.write_all(b"\x1b[2J\x1b[H")?;
         stdout.flush()?;
     }
@@ -280,10 +378,11 @@ pub fn run(
             let (new_rows, new_cols) = terminal::get_size();
             term_rows = new_rows as usize;
             term_cols = new_cols as usize;
+            client_trace_msg("EVT", &format!("sigwinch term={new_cols}x{new_rows}"));
             // Update scroll region to exclude the status bar.
             {
                 let view_rows = term_rows.saturating_sub(1).max(1);
-                let mut stdout = io::stdout();
+                let mut stdout = client_stdout();
                 write!(stdout, "\x1b[1;{}r", view_rows)?;
                 stdout.flush()?;
             }
@@ -297,11 +396,11 @@ pub fn run(
             if let Some(ref cm) = copy_mode {
                 // In copy mode: re-render the copy mode view.
                 let view_rows = term_rows.saturating_sub(1);
-                let mut stdout = io::stdout();
+                let mut stdout = client_stdout();
                 cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
             } else {
                 // Clear screen and re-render everything.
-                let mut stdout = io::stdout();
+                let mut stdout = client_stdout();
                 stdout.write_all(b"\x1b[2J\x1b[H")?;
                 renderer.invalidate();
                 grid.mark_all_dirty();
@@ -352,13 +451,13 @@ pub fn run(
             flash_msg = None;
             flash_deadline = None;
             // Re-render the normal status bar.
-            let mut stdout = io::stdout();
+            let mut stdout = client_stdout();
             render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
         }
 
         // If we have a flash message, render it on the status bar.
         if let Some(ref msg) = flash_msg {
-            let mut stdout = io::stdout();
+            let mut stdout = client_stdout();
             render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
         }
 
@@ -376,6 +475,7 @@ pub fn run(
                 let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n > 0 {
                     raw.extend_from_slice(&buf[..n as usize]);
+                    client_trace("KEY", &buf[..n as usize]);
                 } else if n == 0 {
                     stdin_eof = true;
                 }
@@ -385,6 +485,9 @@ pub fn run(
             // re-encoded for the pane (or handled locally) rather than
             // reaching the child as stray escape bytes.
             let (filtered, mouse_events) = mouse_decoder.feed(&filtered);
+            if !filtered.is_empty() {
+                client_trace("IN", &filtered);
+            }
             if !filtered.is_empty() || !mouse_events.is_empty() {
                 let input = &filtered[..];
 
@@ -393,7 +496,34 @@ pub fn run(
                 // (and always locally while copy mode is active).
                 let view_rows = term_rows.saturating_sub(1);
                 let mut mouse_copy_action: Option<copy_mode::CopyAction> = None;
+                // Copy-mode view dirty: drags/wheel arrive in bursts, so
+                // render once after the batch instead of per event — a full
+                // repaint per motion event is what made selection flicker.
+                let mut redraw_cm = false;
                 for ev in &mouse_events {
+                    // The status bar row is lrmux's own UI — clicks there
+                    // never reach the pane (the bounds check below already
+                    // drops them), so handling them here is passthrough-safe.
+                    if ev.y as usize == term_rows {
+                        if ev.is_wheel() {
+                            // Wheel on the bar cycles windows, tmux-style.
+                            let msg = if ev.is_wheel_up() {
+                                ClientMsg::PrevWindow
+                            } else {
+                                ClientMsg::NextWindow
+                            };
+                            send_cmd(&mut stream, &msg)?;
+                        } else if !ev.release && !ev.is_motion() && ev.cb & 3 == 0 {
+                            // Left press on a window entry switches to it.
+                            if let Some(&(_, _, idx)) = status_spans
+                                .iter()
+                                .find(|&&(s, e, _)| ev.x >= s && ev.x < e)
+                            {
+                                send_cmd(&mut stream, &ClientMsg::SelectWindow { index: idx })?;
+                            }
+                        }
+                        continue;
+                    }
                     let local = copy_mode.is_some() || !grid.wants_mouse();
                     if !local {
                         // Forward to the pane in the child's encoding.
@@ -433,33 +563,29 @@ pub fn run(
                             proto::send(&mut stream, &msg)?;
                             continue;
                         }
-                        // Wheel scrolls the copy-mode view (entering it on
-                        // wheel-up — like tmux mouse mode).
-                        if copy_mode.is_none() {
-                            if !ev.is_wheel_up() {
-                                continue;
+                        // Inside copy mode the wheel scrolls the copy-mode
+                        // view (exits when it reaches the bottom).
+                        if let Some(cm) = copy_mode.as_mut() {
+                            let total = grid.scrollback.len() + grid.rows();
+                            if ev.is_wheel_up() {
+                                cm.vrow = cm.vrow.saturating_sub(3);
+                            } else {
+                                if cm.vrow >= total.saturating_sub(1) {
+                                    // Already at the bottom — leave copy mode.
+                                    mouse_copy_action = Some(copy_mode::CopyAction::Quit);
+                                    break;
+                                }
+                                cm.vrow = (cm.vrow + 3).min(total - 1);
                             }
-                            copy_mode = Some(copy_mode::CopyMode::new(
-                                grid.scrollback.len(),
-                                grid.cursor_row,
-                                grid.cursor_col,
-                            ));
+                            cm.ensure_cursor_visible(view_rows);
+                            redraw_cm = true;
+                            continue;
                         }
-                        let cm = copy_mode.as_mut().unwrap();
-                        let total = grid.scrollback.len() + grid.rows();
-                        if ev.is_wheel_up() {
-                            cm.vrow = cm.vrow.saturating_sub(3);
-                        } else {
-                            if cm.vrow >= total.saturating_sub(1) {
-                                // Already at the bottom — leave copy mode.
-                                mouse_copy_action = Some(copy_mode::CopyAction::Quit);
-                                break;
-                            }
-                            cm.vrow = (cm.vrow + 3).min(total - 1);
-                        }
-                        cm.ensure_cursor_visible(view_rows);
-                        let mut stdout = io::stdout();
-                        cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                        // Otherwise the wheel isn't ours to interpret: when
+                        // the child doesn't track the mouse and altscroll
+                        // isn't set, outer-terminal reporting is off and no
+                        // report can reach us — the terminal scrolls its own
+                        // scrollback natively.
                         continue;
                     }
                     if ev.is_motion() {
@@ -484,13 +610,17 @@ pub fn run(
                         if let Some(cm) = copy_mode.as_mut()
                             && cm.selection_start.is_some()
                         {
+                            let before = (cm.vrow, cm.vcol, cm.viewport_top);
                             let total = grid.scrollback.len() + grid.rows();
                             cm.vrow =
                                 (cm.viewport_top + ev.y.saturating_sub(1) as usize).min(total - 1);
                             cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
-                            let mut stdout = io::stdout();
-                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                            // Skip the redraw when the motion stayed inside
+                            // the same cell — nothing changed on screen.
+                            if (cm.vrow, cm.vcol, cm.viewport_top) != before {
+                                redraw_cm = true;
+                            }
                         }
                         continue;
                     }
@@ -516,8 +646,7 @@ pub fn run(
                                 .min(grid.scrollback.len() + grid.rows() - 1);
                             cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
-                            let mut stdout = io::stdout();
-                            cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
+                            redraw_cm = true;
                         }
                         mouse_anchor = None;
                         continue;
@@ -556,6 +685,11 @@ pub fn run(
                         }
                         copy_mode::CopyAction::Continue => {}
                     }
+                }
+                // One repaint per input batch for copy-mode view changes.
+                if redraw_cm && let Some(cm) = copy_mode.as_ref() {
+                    let mut stdout = client_stdout();
+                    cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                 }
 
                 if copy_mode.is_some() {
@@ -600,7 +734,7 @@ pub fn run(
                                 };
                                 if handled {
                                     i += 3;
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     cm.render(
                                         &mut stdout,
                                         &grid,
@@ -630,7 +764,7 @@ pub fn run(
                                 };
                                 if handled {
                                     i += 4;
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     cm.render(
                                         &mut stdout,
                                         &grid,
@@ -652,7 +786,7 @@ pub fn run(
                             let action = cm.process_key(input[i], &grid, view_rows);
                             match action {
                                 copy_mode::CopyAction::Continue => {
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     cm.render(
                                         &mut stdout,
                                         &grid,
@@ -723,7 +857,7 @@ pub fn run(
                         renderer.invalidate();
                         // Re-establish the scroll region and re-render.
                         let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                         renderer.render(&mut stdout, &mut grid)?;
                         render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
@@ -739,7 +873,7 @@ pub fn run(
                         flash_msg = Some(msg);
                         flash_deadline =
                             Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         render_flash_status_bar(
                             &mut stdout,
                             flash_msg.as_ref().unwrap(),
@@ -770,7 +904,7 @@ pub fn run(
                             grid.cursor_col,
                         ));
                         let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         copy_mode.as_ref().unwrap().render(
                             &mut stdout,
                             &grid,
@@ -810,7 +944,7 @@ pub fn run(
                             match action {
                                 ConfirmAction::Confirmed | ConfirmAction::Cancelled => {
                                     confirm_state = ConfirmState::None;
-                                    let mut stdout = io::stdout();
+                                    let mut stdout = client_stdout();
                                     render_status_bar(
                                         &mut stdout,
                                         &status_text,
@@ -837,7 +971,7 @@ pub fn run(
                                     std::time::Instant::now() + std::time::Duration::from_secs(8),
                                 );
                             }
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             render_status_bar(
                                 &mut stdout,
                                 &status_text,
@@ -848,7 +982,7 @@ pub fn run(
                         }
                         ConfirmAction::Cancelled => {
                             confirm_state = ConfirmState::None;
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             render_status_bar(
                                 &mut stdout,
                                 &status_text,
@@ -864,6 +998,14 @@ pub fn run(
                 }
             }
         }
+        // Copy mode toggles via input — keep outer mouse reporting in
+        // sync (it backs drag-select while copy mode is active).
+        sync_mouse_modes(
+            &mut applied_mouse,
+            &grid,
+            &mut mouse_decoder,
+            copy_mode.is_some(),
+        );
         if stdin_eof {
             break;
         }
@@ -903,6 +1045,13 @@ pub fn run(
                         ServerMsg::ScrollbackUpdate { rows, replay } => {
                             // Push to internal scrollback (for copy mode).
                             let n = rows.len();
+                            client_trace_msg(
+                                "EVT",
+                                &format!(
+                                    "scrollback +{n}rows replay={replay} total={}",
+                                    grid.scrollback.len() + n
+                                ),
+                            );
                             for row in rows {
                                 grid.scrollback.push(row);
                             }
@@ -910,9 +1059,11 @@ pub fn run(
                             // terminal's native scrollback buffer — but only
                             // for live scroll. Replay chunks (history after a
                             // GridSnapshot) would scroll the just-rendered
-                            // content off screen, leaving it blank.
+                            // content off screen, leaving it blank. The same
+                            // applies while in copy mode: the scroll would
+                            // push the viewed rows away.
                             if n > 0 && copy_mode.is_none() && !replay {
-                                let mut stdout = io::stdout();
+                                let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
                                 // The terminal shifted all content up by n lines.
@@ -937,6 +1088,13 @@ pub fn run(
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
                             grid.set_mouse_flags(mouse_flags);
+                            client_trace_msg(
+                                "EVT",
+                                &format!(
+                                    "grid-update dirty={}rows cur={cursor_row};{cursor_col} vis={cursor_visible}",
+                                    dirty.len()
+                                ),
+                            );
                             needs_render = true;
                         }
                         ServerMsg::GridSnapshot {
@@ -974,7 +1132,11 @@ pub fn run(
                             grid.cursor_col = cursor_col as usize;
                             grid.cursor_visible = cursor_visible;
                             grid.set_mouse_flags(mouse_flags);
-                            let mut stdout = io::stdout();
+                            client_trace_msg(
+                                "EVT",
+                                &format!("snapshot {rows}x{cols} cur={cursor_row};{cursor_col}"),
+                            );
+                            let mut stdout = client_stdout();
                             // Reset scroll region to full screen, clear, then
                             // re-establish the scroll region. This ensures the
                             // clear affects the entire screen and the terminal
@@ -1015,7 +1177,7 @@ pub fn run(
                             current_session = session.clone();
                             current_window_count = windows.len();
                             session_count = sc as usize;
-                            status_text = format_status_bar(
+                            (status_text, status_spans) = format_status_bar(
                                 &session,
                                 &windows,
                                 active as usize,
@@ -1024,7 +1186,7 @@ pub fn run(
                                 &server,
                                 &activity,
                             );
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             if let Some(ref msg) = flash_msg {
                                 render_flash_status_bar(
                                     &mut stdout,
@@ -1066,7 +1228,7 @@ pub fn run(
                                 // Invalidate the renderer so the screen is fully redrawn.
                                 renderer.invalidate();
                                 let view_rows = term_rows.saturating_sub(1);
-                                let mut stdout = io::stdout();
+                                let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                                 renderer.render(&mut stdout, &mut grid)?;
                             }
@@ -1078,7 +1240,7 @@ pub fn run(
                             renderer.invalidate();
                             // Re-establish the scroll region and re-render.
                             let view_rows = term_rows.saturating_sub(1);
-                            let mut stdout = io::stdout();
+                            let mut stdout = client_stdout();
                             write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                             renderer.render(&mut stdout, &mut grid)?;
                         }
@@ -1098,7 +1260,7 @@ pub fn run(
                             // Child asked for the real terminal's fg/bg color.
                             // Flush any pending render bytes first so the OSC
                             // query isn't stuck behind a partial stdout write.
-                            let _ = io::stdout().flush();
+                            let _ = client_stdout().flush();
                             let mut probe_leftover = Vec::new();
                             if let Some(reply) =
                                 query_outer_osc_color(code, bell_terminated, &mut probe_leftover)
@@ -1120,21 +1282,31 @@ pub fn run(
                         // inside an attached session.
                         ServerMsg::PeerList { .. }
                         | ServerMsg::RegisterAck { .. }
-                        | ServerMsg::RelayAck { .. } => {}
+                        | ServerMsg::RelayAck { .. }
+                        | ServerMsg::SendKeysAck { .. } => {}
                     }
                 }
                 // GridUpdate/Snapshot carry the child's mouse flags — keep
                 // the outer terminal's reporting modes in sync.
-                sync_mouse_modes(&mut applied_mouse, &grid, &mut mouse_decoder);
+                sync_mouse_modes(
+                    &mut applied_mouse,
+                    &grid,
+                    &mut mouse_decoder,
+                    copy_mode.is_some(),
+                );
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
                 if needs_render && exit_reason.is_none() {
+                    client_trace_msg(
+                        "EVT",
+                        &format!("render cur={};{}", grid.cursor_row, grid.cursor_col),
+                    );
                     if let Some(ref cm) = copy_mode {
                         let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         cm.render(&mut stdout, &grid, view_rows, term_cols, &status_text)?;
                     } else {
-                        let mut stdout = io::stdout();
+                        let mut stdout = client_stdout();
                         renderer.render(&mut stdout, &mut grid)?;
                         render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
                     }
@@ -1592,7 +1764,7 @@ fn take_network_setup_flash() -> Option<String> {
 
 /// Render the confirmation prompt on the status bar line.
 fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let row = term_rows;
     // Reset SGR before clear/write so reverse/underline from the pane
     // cannot bleed into the prompt (same issue as the status bar).
@@ -1650,6 +1822,8 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
 /// Inactive windows with pending activity get a red bullet prefix.
 /// Identity is `[session]@server`, then the window list.
+/// Also returns each window entry's 1-based column span (start, end,
+/// window index) for mouse hit-testing on the status bar row.
 fn format_status_bar(
     session: &str,
     windows: &[String],
@@ -1658,7 +1832,7 @@ fn format_status_bar(
     high_output: bool,
     server: &str,
     activity: &[bool],
-) -> String {
+) -> (String, Vec<(u16, u16, u8)>) {
     // Each sequence starts with `0;` so reverse/underline/italic from the
     // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
     // Blue background + white text for inactive windows.
@@ -1702,15 +1876,36 @@ fn format_status_bar(
     } else {
         format!("[{SESSION}{session}{BAR}]@{server}")
     };
-    format!(
-        "{}lrmux {}{}{} | {} | {}{}",
-        BAR,
-        version_marker,
-        server_hash,
-        BAR,
-        identity,
-        parts.join("  "),
-        RESET
+
+    // Visible layout: "lrmux <hash><marker> | <identity> | <parts…>".
+    // Track each window entry's column span while composing so mouse
+    // clicks on the status bar row can be hit-tested against it.
+    let head_visible = "lrmux ".chars().count()
+        + server_hash.chars().count()
+        + usize::from(mismatch)
+        + " | ".chars().count()
+        + strip_ansi(&identity).chars().count()
+        + " | ".chars().count();
+    let mut spans: Vec<(u16, u16, u8)> = Vec::with_capacity(windows.len());
+    let mut col = head_visible as u16 + 1;
+    for (i, part) in parts.iter().enumerate() {
+        let w = strip_ansi(part).chars().count() as u16;
+        spans.push((col, col + w, i as u8));
+        col += w + 3; // entries are joined with " | "
+    }
+
+    (
+        format!(
+            "{}lrmux {}{}{} | {} | {}{}",
+            BAR,
+            version_marker,
+            server_hash,
+            BAR,
+            identity,
+            parts.join(" | "),
+            RESET
+        ),
+        spans,
     )
 }
 
@@ -1718,7 +1913,7 @@ fn format_status_bar(
 /// The status bar always occupies the last row of the terminal (term_rows).
 /// After rendering, the cursor is repositioned to the grid cursor location.
 fn render_status_bar(
-    stdout: &mut io::Stdout,
+    stdout: &mut TraceStdout,
     text: &str,
     term_rows: usize,
     term_cols: usize,
@@ -1765,7 +1960,7 @@ fn render_status_bar(
 
 /// Render the status bar with a flash message appended on the right.
 fn render_flash_status_bar(
-    stdout: &mut io::Stdout,
+    stdout: &mut TraceStdout,
     msg: &str,
     normal_text: &str,
     term_rows: usize,
@@ -1866,7 +2061,7 @@ fn restore_normal_view(
     term_rows: usize,
     term_cols: usize,
 ) -> io::Result<()> {
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     // Hide cursor (copy mode shows it; normal mode hides it).
     stdout.write_all(b"\x1b[?25l")?;
     // Reset scroll region to exclude status bar, then clear and re-render.
@@ -1876,7 +2071,13 @@ fn restore_normal_view(
     grid.mark_all_dirty();
     renderer.render(&mut stdout, grid)?;
     render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
-    render_status_bar(&mut io::stdout(), status_text, term_rows, term_cols, grid)?;
+    render_status_bar(
+        &mut client_stdout(),
+        status_text,
+        term_rows,
+        term_cols,
+        grid,
+    )?;
     Ok(())
 }
 
@@ -1884,7 +2085,7 @@ fn restore_normal_view(
 /// terminal is larger than the grid. Uses a dim background with a thin
 /// border line separating content from filler (per §2.16 of the design doc).
 fn render_filler(
-    stdout: &mut io::Stdout,
+    stdout: &mut TraceStdout,
     grid_rows: usize,
     grid_cols: usize,
     term_rows: usize,
@@ -1988,7 +2189,7 @@ fn apply_row(grid: &mut Grid, row: usize, cells: &[Cell]) {
 
 /// Restore the terminal (exit alternate screen, show cursor).
 fn restore_terminal() {
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     // Disable mouse reporting we may have enabled, reset scroll region
     // to full screen, show cursor, clear screen.
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
@@ -1996,20 +2197,34 @@ fn restore_terminal() {
     let _ = stdout.flush();
 }
 
-/// Keep the outer terminal's mouse reporting in sync with the child's
-/// requested tracking mask. Reporting is always on while attached (it
-/// backs local drag-to-select), only the tracking level changes.
-fn sync_mouse_modes(applied: &mut Option<u8>, grid: &Grid, decoder: &mut mouse::Decoder) {
-    let desired = grid.mouse_tracking;
+/// Keep the outer terminal's mouse reporting in sync with what can use
+/// reports: the child's tracking mask, alternate-scroll (wheel→arrows
+/// translation needs wheel reports), or copy mode (drag-select). With
+/// none of those, reporting stays off and the terminal keeps its native
+/// wheel scrollback and selection — lrmux never interprets the wheel.
+fn sync_mouse_modes(
+    applied: &mut Option<u8>,
+    grid: &Grid,
+    decoder: &mut mouse::Decoder,
+    local: bool,
+) {
+    let mut desired = grid.mouse_tracking;
+    if local || (grid.mouse_altscroll && desired == 0) {
+        // Button-event reporting gives drag + wheel reports for local
+        // copy-mode selection or altscroll translation.
+        desired |= 0b010;
+    }
     if *applied == Some(desired) {
         return;
     }
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
-    let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
+    if desired != 0 {
+        let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
+    }
     let _ = stdout.flush();
     *applied = Some(desired);
-    decoder.set_active(true);
+    decoder.set_active(desired != 0);
 }
 
 /// Try to parse a complete server frame from the buffer.
@@ -2031,7 +2246,7 @@ fn try_parse_server_frame(buf: &mut Vec<u8>) -> io::Result<Option<ServerMsg>> {
 /// Waits for any key to dismiss.
 fn show_log_overlay(lines: &[String]) {
     use std::io::Read;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let (rows, cols) = terminal::get_size();
 
     // Clear screen and show the log.
@@ -2074,7 +2289,7 @@ fn show_log_overlay(lines: &[String]) {
 /// Returns the selected session name, or None if cancelled.
 fn show_session_chooser(sessions: &[String]) -> Option<String> {
     use std::io::Read;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let (rows, _cols) = terminal::get_size();
 
     write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
@@ -2113,7 +2328,7 @@ fn show_session_chooser(sessions: &[String]) -> Option<String> {
 /// Waits for any key to dismiss.
 fn show_help_overlay(server_version: &str) {
     use std::io::Read;
-    let mut stdout = io::stdout();
+    let mut stdout = client_stdout();
     let (rows, _cols) = terminal::get_size();
 
     write!(stdout, "\x1b[2J\x1b[H\x1b[?25h").ok();
@@ -2330,6 +2545,7 @@ fn query_osc_on_fds(
             let n = unsafe { libc::read(read_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
             if n > 0 {
                 extra_input.extend_from_slice(&tmp[..n as usize]);
+                client_trace("KEY", &tmp[..n as usize]);
                 continue;
             }
             break;
@@ -2337,6 +2553,7 @@ fn query_osc_on_fds(
     }
 
     let w = unsafe { libc::write(write_fd, query.as_ptr() as *const _, query.len()) };
+    client_trace("QRY", query);
     if w < 0 {
         if fl >= 0 {
             unsafe {
@@ -2346,7 +2563,7 @@ fn query_osc_on_fds(
         return None;
     }
     if write_fd == libc::STDOUT_FILENO {
-        let _ = io::stdout().flush();
+        let _ = client_stdout().flush();
     }
 
     let mut buf = Vec::with_capacity(128);
@@ -2377,6 +2594,7 @@ fn query_osc_on_fds(
             continue;
         }
         buf.extend_from_slice(&tmp[..n as usize]);
+        client_trace("KEY", &tmp[..n as usize]);
         if let Some(end) = osc_reply_end(&buf) {
             // Anything before/after the reply bytes is user input that
             // raced the probe — hand it back, don't eat it.
@@ -2423,13 +2641,94 @@ fn osc_reply_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
+// --- Byte-level client trace (LRMUX_TRACE) ---
+//
+// `client-<pid>.trace` records, with millisecond timestamps relative to
+// the client's first traced event:
+//   KEY — raw bytes read from stdin (before filtering)
+//   IN  — bytes that survived the input filter / mouse split (pane-bound)
+//   OUT — bytes written to the outer terminal (renderer, status bar, …)
+//   EVT — non-byte events (snapshot applied, resize, refresh)
+
+/// Shared client trace file, opened lazily once per process.
+fn client_trace_file() -> Option<&'static Mutex<std::fs::File>> {
+    static F: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        crate::log::open_trace(&format!("client-{}.trace", std::process::id())).map(Mutex::new)
+    })
+    .as_ref()
+}
+
+/// Append a timestamped line to the client trace (no-op when disabled).
+fn client_trace(tag: &str, data: &[u8]) {
+    if let Some(f) = client_trace_file()
+        && let Ok(mut g) = f.lock()
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let ms = START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
+            * 1000.0;
+        let _ = writeln!(
+            g,
+            "[+{ms:>11.3}ms] {tag} len={:5} | {}",
+            data.len(),
+            crate::log::vis_bytes(data)
+        );
+    }
+}
+
+/// Same as `client_trace` for text events (resize, snapshot, …).
+fn client_trace_msg(tag: &str, msg: &str) {
+    client_trace(tag, msg.as_bytes());
+}
+
+/// stdout that tees every write into the client trace file.
+/// `write_fmt` (the `write!` macro path) lands as one traced line per
+/// call via the `write_all` override.
+pub(crate) struct TraceStdout {
+    inner: io::Stdout,
+}
+
+pub(crate) fn client_stdout() -> TraceStdout {
+    TraceStdout {
+        inner: io::stdout(),
+    }
+}
+
+impl Write for TraceStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        client_trace("OUT", buf);
+        self.inner.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        client_trace("OUT", buf);
+        self.inner.write_all(buf)
+    }
+
+    // `write!` would otherwise land as one line per format piece —
+    // materialize the arguments so a trace line holds a whole sequence.
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        if client_trace_file().is_some() {
+            client_trace("OUT", args.to_string().as_bytes());
+        }
+        self.inner.write_fmt(args)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn status_bar_shows_server_next_to_session() {
-        let text = format_status_bar(
+        let (text, _) = format_status_bar(
             "lrmux",
             &["zsh".into()],
             0,
@@ -2447,7 +2746,7 @@ mod tests {
 
     #[test]
     fn status_bar_omits_empty_server() {
-        let text = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
+        let (text, _) = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
         let visible = strip_ansi(&text);
         assert!(!visible.contains('@'), "{visible}");
         assert!(visible.contains("lrmux"), "{visible}");
@@ -2455,7 +2754,7 @@ mod tests {
 
     #[test]
     fn status_bar_marks_inactive_window_activity() {
-        let text = format_status_bar(
+        let (text, _) = format_status_bar(
             "lrmux",
             &["zsh".into(), "vim".into()],
             0,
@@ -2467,5 +2766,31 @@ mod tests {
         let visible = strip_ansi(&text);
         assert!(visible.contains("●1:vim"), "{visible}");
         assert!(!visible.contains("●0:"), "{visible}");
+    }
+
+    #[test]
+    fn status_bar_window_spans_cover_each_entry() {
+        let (text, spans) = format_status_bar(
+            "sess",
+            &["zsh".into(), "vim".into()],
+            1,
+            "abc123",
+            false,
+            "srv",
+            &[true, false],
+        );
+        let visible = strip_ansi(&text);
+        assert_eq!(spans.len(), 2);
+        // Each span must start exactly on its "i:name" text. The activity
+        // bullet is part of the entry's span. find() gives byte offsets —
+        // convert to 1-based char columns (● is 3 bytes, 1 column).
+        let col_of =
+            |needle: &str| visible[..visible.find(needle).unwrap()].chars().count() as u16 + 1;
+        let w0 = col_of("●0:zsh");
+        let w1 = col_of("1:vim*");
+        assert_eq!(spans[0], (w0, w0 + "●0:zsh".chars().count() as u16, 0));
+        assert_eq!(spans[1], (w1, w1 + "1:vim*".chars().count() as u16, 1));
+        assert_eq!(spans[1].0, spans[0].1 + 3); // joined with " | "
+        assert!(visible.contains("●0:zsh | 1:vim*"), "{visible}");
     }
 }

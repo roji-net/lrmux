@@ -275,7 +275,7 @@ impl CopyMode {
     /// Render the copy mode view: scrollback + visible grid with cursor and selection.
     pub fn render(
         &self,
-        stdout: &mut io::Stdout,
+        stdout: &mut super::TraceStdout,
         grid: &Grid,
         view_rows: usize,
         term_cols: usize,
@@ -419,7 +419,7 @@ impl CopyMode {
 /// Tracks and updates the current SGR state to minimize output.
 #[allow(clippy::too_many_arguments)]
 fn emit_sgr_batch(
-    stdout: &mut io::Stdout,
+    stdout: &mut super::TraceStdout,
     fg: Color,
     bg: Color,
     attrs: crate::grid::Attr,
@@ -517,7 +517,7 @@ fn emit_sgr_batch(
 }
 
 /// Reset SGR to default.
-fn emit_reset(stdout: &mut io::Stdout) -> io::Result<()> {
+fn emit_reset(stdout: &mut super::TraceStdout) -> io::Result<()> {
     stdout.write_all(b"\x1b[0m")
 }
 

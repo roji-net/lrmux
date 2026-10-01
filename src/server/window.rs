@@ -16,24 +16,31 @@ pub struct Window {
     /// True when this window produced output while no interactive client
     /// was viewing it. Cleared when any client focuses the window.
     pub activity: bool,
+    /// tmux `remain-on-exit`: keep the pane after the child exits on ANY
+    /// exit code, instead of auto-closing on success codes.
+    pub remain_on_exit: bool,
 }
 
 impl Window {
-    pub fn new(rows: u16, cols: u16, name: String) -> Self {
+    /// `session_id` is the owning session's id — exported to the pane's
+    /// child in the tmux-compat `TMUX` env var.
+    pub fn new(rows: u16, cols: u16, name: String, session_id: u32) -> Self {
         Self {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
-            pane: Pane::new(rows, cols),
+            pane: Pane::new(rows, cols, session_id),
             name,
             activity: false,
+            remain_on_exit: false,
         }
     }
 
-    pub fn new_in_cwd(rows: u16, cols: u16, name: String, cwd: &str) -> Self {
+    pub fn new_in_cwd(rows: u16, cols: u16, name: String, cwd: &str, session_id: u32) -> Self {
         Self {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
-            pane: Pane::new_in_cwd(rows, cols, cwd),
+            pane: Pane::new_in_cwd(rows, cols, cwd, session_id),
             name,
             activity: false,
+            remain_on_exit: false,
         }
     }
 
@@ -43,12 +50,15 @@ impl Window {
         name: String,
         command: &str,
         cwd: Option<&str>,
+        session_id: u32,
+        env: &[(String, String)],
     ) -> Self {
         Self {
             id: WINDOW_ID.fetch_add(1, Ordering::Relaxed),
-            pane: Pane::new_with_command(rows, cols, command, cwd),
+            pane: Pane::new_with_command(rows, cols, command, cwd, session_id, env),
             name,
             activity: false,
+            remain_on_exit: false,
         }
     }
 

@@ -325,6 +325,7 @@ fn query_peers_tcp(addr: &str) -> io::Result<Vec<proto::PeerInfo>> {
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &ident)?;
     match ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {

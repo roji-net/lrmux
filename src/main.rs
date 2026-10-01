@@ -54,6 +54,16 @@ fn connect_to_server(server: &str) -> io::Result<crate::ipc::ConnStream> {
 }
 
 fn main() {
+    // tmux-compat shim: a server with tmux_compat enabled installs a
+    // `tmux` symlink to this binary; invoked under that name, speak the
+    // tmux command subset over control mode instead of the lrmux CLI.
+    let invoked_as = std::env::args()
+        .next()
+        .and_then(|a| std::path::Path::new(&a).file_stem().map(|s| s.to_owned()));
+    if invoked_as.is_some_and(|n| n == "tmux") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(client::tmux_shim::run(&args));
+    }
     if let Err(e) = run() {
         eprintln!("lrmux: {e}");
         std::process::exit(1);
@@ -68,6 +78,8 @@ enum CliAction {
     ControlMode { target: Option<String> },
     /// `lrmux -- <cmd>`: create a new window running <cmd> (non-interactive when nested).
     RunCommand(String),
+    /// `lrmux tmux <args>`: tmux-compat command shim (same as argv[0]==tmux).
+    TmuxShim(Vec<String>),
     /// `session-selector` / `ss`: force the interactive selector (no auto-join).
     SessionSelector,
     /// `new-session -s <name> -c <cwd> [-- <cmd>]`
@@ -120,8 +132,9 @@ enum CliAction {
     ListWindows(Option<String>),
     /// `kill-server -t <name>`: kill a named server.
     KillServer(String),
-    /// `new-window -t <target> -n <name> -c <cwd> [-- <cmd>]`
+    /// `new-window -s <server> -t <target> -n <name> -c <cwd> [-- <cmd>]`
     NewWindow {
+        server: Option<String>,
         target: cmd::Target,
         name: Option<String>,
         cwd: Option<String>,
@@ -131,15 +144,17 @@ enum CliAction {
     KillWindow(cmd::Target),
     /// `capture-pane -t <target> [-p] [-c|--colors] [--format …] [--clipboard] [--file path]`
     CapturePane {
-        target: cmd::Target,
+        server: Option<String>,
+        target: Option<String>,
         print: bool,
         colors: bool,
         format: crate::server::CaptureFormat,
         clipboard: bool,
         file: Option<String>,
     },
-    /// `send-keys -t <target> <keys> -q`: send keys to a pane's PTY.
+    /// `send-keys -s <server> -t <target> <keys> -q`: send keys to a pane's PTY.
     SendKeys {
+        server: Option<String>,
         target: cmd::Target,
         keys: Vec<u8>,
         quiet: bool,
@@ -210,6 +225,9 @@ fn parse_args() -> CliAction {
         } else if args[i] == "--via" && i + 1 < args.len() {
             crate::ipc::set_via_addr(Some(args[i + 1].clone()));
             i += 2;
+        } else if args[i] == "--tmux-compat" {
+            crate::config::set_tmux_compat(true);
+            i += 1;
         } else {
             filtered.push(args[i].clone());
             i += 1;
@@ -222,7 +240,14 @@ fn parse_args() -> CliAction {
     }
 
     let subcmd = args.get(1).map(|s| s.as_str());
-    let subcmd_args = if args.len() > 2 { &args[2..] } else { &[] };
+    let subcmd_args: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
+
+    // `lrmux tmux <args>`: run the tmux-compat command shim explicitly
+    // (same code path as when the binary is invoked through a `tmux`
+    // symlink) — handy for testing without touching PATH.
+    if subcmd == Some("tmux") {
+        return CliAction::TmuxShim(subcmd_args.to_vec());
+    }
 
     // `-h`/`--help` after a subcommand shows that command's help
     // (except after `--`, where args belong to the wrapped command).
@@ -393,7 +418,14 @@ fn parse_args() -> CliAction {
                         && a[1..].contains('e')
                 });
             CliAction::CapturePane {
-                target: parsed.target(),
+                server: parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .map(|s| s.to_string()),
+                target: parsed
+                    .get("t")
+                    .or_else(|| parsed.get("target"))
+                    .map(|s| s.to_string()),
                 print: parsed.has("p") || parsed.has("print"),
                 colors,
                 format,
@@ -558,6 +590,10 @@ fn parse_new_window(args: &[String]) -> CliAction {
         .map(|s| s.to_string());
     let command = shell_command_from_parsed(&parsed);
     CliAction::NewWindow {
+        server: parsed
+            .get("s")
+            .or_else(|| parsed.get("server"))
+            .map(|s| s.to_string()),
         target: parsed.target(),
         name,
         cwd,
@@ -572,6 +608,10 @@ fn parse_send_keys(args: &[String]) -> CliAction {
     let quiet = parsed.has("q") || parsed.has("quiet");
     let keys = parse_tmux_keys(&parsed.positional);
     CliAction::SendKeys {
+        server: parsed
+            .get("s")
+            .or_else(|| parsed.get("server"))
+            .map(|s| s.to_string()),
         target: parsed.target(),
         keys,
         quiet,
@@ -730,6 +770,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -768,6 +809,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -777,10 +819,11 @@ fn run() -> io::Result<()> {
                         return Ok(());
                     }
                 }
-                let msg = proto::encode_client(&ClientMsg::NewWindowIn {
-                    session: None,
-                    command,
-                });
+                // Target the pane's own session (exported as LRMUX_SESSION
+                // in "$id" form). Without it the server would pick its first
+                // session, which may not be the one this pane lives in.
+                let session = std::env::var("LRMUX_SESSION").ok();
+                let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
                 proto::send(&mut stream, &msg)?;
                 // Give the server time to process the message before closing.
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -805,6 +848,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -849,6 +893,7 @@ fn run() -> io::Result<()> {
                     cols: 80,
                     attach: false,
                     auth_token: crate::config::effective_psk(),
+                    env: Vec::new(),
                 });
                 proto::send(&mut stream, &msg)?;
                 match proto::decode_server(&mut stream) {
@@ -941,12 +986,12 @@ fn run() -> io::Result<()> {
 
     match action {
         CliAction::Help(topic) => print_help(topic.as_deref()),
+        CliAction::TmuxShim(args) => {
+            std::process::exit(client::tmux_shim::run(&args));
+        }
         CliAction::Unknown(cmd) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "unknown command '{cmd}'. Try `lrmux --help`.\n\
-                 (Inside a pane, bare `lrmux` opens a new window; typos do not.)"
-            ),
+            format!("unknown command '{cmd}'. Try `lrmux --help`."),
         )),
         CliAction::Versions => {
             print_versions();
@@ -995,6 +1040,7 @@ fn run() -> io::Result<()> {
                         cols: 80,
                         attach: false,
                         auth_token: crate::config::effective_psk(),
+                        env: Vec::new(),
                     });
                     proto::send(&mut stream, &msg)?;
                     match proto::decode_server(&mut stream) {
@@ -1094,6 +1140,7 @@ fn run() -> io::Result<()> {
                 cols: 80,
                 attach: false,
                 auth_token: crate::config::effective_psk(),
+                env: Vec::new(),
             });
             proto::send(&mut stream, &msg)?;
             match proto::decode_server(&mut stream) {
@@ -1204,11 +1251,12 @@ fn run() -> io::Result<()> {
         }
         CliAction::KillServer(name) => kill_server(&name),
         CliAction::NewWindow {
+            server,
             target,
             name: _,
             cwd: _,
             command,
-        } => cli_new_window(&target, command),
+        } => cli_new_window(server.as_deref(), &target, command),
         CliAction::KillWindow(_target) => {
             eprintln!("lrmux: kill-window not yet implemented");
             Ok(())
@@ -1222,18 +1270,28 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         CliAction::CapturePane {
+            server,
             target,
             print,
             colors,
             format,
             clipboard,
             file,
-        } => cli_capture_window(&target, format, colors, print, clipboard, file.as_deref()),
+        } => cli_capture_window(
+            server.as_deref(),
+            target.as_deref(),
+            format,
+            colors,
+            print,
+            clipboard,
+            file.as_deref(),
+        ),
         CliAction::SendKeys {
+            server,
             target,
             keys,
             quiet,
-        } => cli_send_keys(&target, &keys, quiet),
+        } => cli_send_keys(server.as_deref(), &target, &keys, quiet),
     }
 }
 
@@ -1571,6 +1629,7 @@ fn list_peers(server: Option<&str>) -> io::Result<()> {
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &ident)?;
     match ipc::stream::decode_with_deadline(&mut stream, std::time::Duration::from_secs(2), |r| {
@@ -1742,6 +1801,7 @@ fn push_psk_to_running_server(psk: &str) -> io::Result<()> {
         cols: 80,
         attach: true,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     let _ = proto::decode_server(&mut stream)?;
@@ -1811,6 +1871,7 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
         cols: 0,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &identify)?;
     let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
@@ -1877,8 +1938,23 @@ fn kill_server(name: &str) -> io::Result<()> {
 }
 
 /// CLI: create a new window in a session.
-fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
+fn cli_new_window(
+    server_flag: Option<&str>,
+    target: &cmd::Target,
+    command: Option<String>,
+) -> io::Result<()> {
+    // Inside a pane, default to the pane's server (LRMUX_SERVER) and
+    // session (LRMUX_SESSION, "$id" form) — otherwise the window lands
+    // on server "default"/session 0 regardless of where lrmux ran.
+    let server = server_flag
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LRMUX_SERVER").ok())
+        .unwrap_or_else(|| "default".to_string());
+    let session = target
+        .session
+        .clone()
+        .or_else(|| std::env::var("LRMUX_SESSION").ok());
+    let mut stream = connect_to_server(&server)?;
     // Send Identify first (required by the protocol).
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
@@ -1886,6 +1962,7 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
         cols,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     // Wait for IdentifyAck.
@@ -1900,12 +1977,97 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
         Err(e) => return Err(e),
     }
     // Send NewWindowIn.
-    let msg = proto::encode_client(&ClientMsg::NewWindowIn {
-        session: target.session.clone(),
-        command,
-    });
+    let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
     proto::send(&mut stream, &msg)?;
     Ok(())
+}
+
+/// Does `name` resolve to a live local server socket? (TCP endpoints
+/// come through `-s host:port`, not bare `-t` parts.)
+fn local_server_exists(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', ':']) && ipc::server_exists(&ipc::socket_path(name))
+}
+
+/// Resolved `capture-pane` target: optional server override, session
+/// name and window index (index only — names error out).
+#[derive(Default)]
+struct CaptureTarget {
+    server: Option<String>,
+    session: Option<String>,
+    window: Option<u8>,
+}
+
+/// Resolve `-t` into a `CaptureTarget`. Forms: `sess` (session on the
+/// selected/default server), `sess:win` (tmux-style session:index),
+/// `srv` (a bare running-server name → first session), `srv:sess`
+/// (when `srv` is a running local server and the second part is not a
+/// bare index), and the explicit `srv:sess:win` three-part form.
+fn resolve_capture_target(
+    server_flag: Option<&str>,
+    raw: Option<&str>,
+) -> Result<CaptureTarget, String> {
+    let mut server = server_flag.map(|s| s.to_string());
+    let mut session = None;
+    let mut window: Option<String> = None;
+    let t = raw.unwrap_or("");
+    if !t.is_empty() {
+        let parts: Vec<&str> = t.split(':').collect();
+        match parts.as_slice() {
+            [a] => {
+                if server.is_none() && local_server_exists(a) {
+                    server = Some(a.to_string());
+                } else {
+                    session = Some(a.to_string());
+                }
+            }
+            [a, b] => {
+                if server.is_none()
+                    && !b.is_empty()
+                    && !b.chars().all(|c| c.is_ascii_digit())
+                    && !b.starts_with('@')
+                    && local_server_exists(a)
+                {
+                    server = Some(a.to_string());
+                    session = Some(b.to_string());
+                } else if !b.is_empty() {
+                    session = Some(a.to_string());
+                    window = Some(b.to_string());
+                } else {
+                    session = Some(a.to_string());
+                }
+            }
+            [a, b, c, ..] => {
+                if server.is_none() {
+                    server = Some(a.to_string());
+                    session = Some(b.to_string());
+                    window = Some(c.to_string());
+                } else {
+                    session = Some(parts[..parts.len() - 1].join(":"));
+                    window = Some(c.to_string());
+                }
+            }
+            [] => {}
+        }
+    }
+    let window = match window {
+        None => None,
+        Some(w) => {
+            let w = w.strip_prefix('@').unwrap_or(&w);
+            match w.parse::<u8>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return Err(format!(
+                        "invalid window target '{w}' — use a window index (e.g. -t session:0)"
+                    ));
+                }
+            }
+        }
+    };
+    Ok(CaptureTarget {
+        server,
+        session,
+        window,
+    })
 }
 
 /// CLI: capture the content of a pane.
@@ -1915,82 +2077,88 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
 /// - `--file <path>` writes the capture to that file
 /// - `--clipboard` copies via pbcopy / wl-copy / xclip / xsel
 fn cli_capture_window(
-    target: &cmd::Target,
+    server_flag: Option<&str>,
+    raw_target: Option<&str>,
     format: crate::server::CaptureFormat,
     colors: bool,
     print: bool,
     clipboard: bool,
     file: Option<&str>,
 ) -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
-    let (rows, cols) = (24u16, 80u16);
-    let msg = proto::encode_client(&ClientMsg::Identify {
-        rows,
-        cols,
-        attach: false,
-        auth_token: crate::config::effective_psk(),
-    });
-    proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::IdentifyAck { .. }) => {}
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected IdentifyAck",
-            ));
-        }
-        Err(e) => return Err(e),
-    }
-    let window = target.window.as_ref().and_then(|w| w.parse::<u8>().ok());
-    let msg = proto::encode_client(&ClientMsg::CaptureWindow {
-        session: target.session.clone(),
-        window,
-        format: format.as_u8(),
+    let target = match resolve_capture_target(server_flag, raw_target) {
+        Ok(t) => t,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+    };
+    // `-s host:port` connects over TCP; a bare name is a local socket.
+    let (server_name, tcp) = match target.server.as_deref() {
+        Some(s) if s.contains(':') => (s.to_string(), Some(s)),
+        Some(s) => (s.to_string(), None),
+        None => ("default".to_string(), None),
+    };
+    let session = target.session;
+    let content = client::capture_pane(
+        &server_name,
+        tcp,
+        session.clone(),
+        target.window,
+        format.as_u8(),
         colors,
-        // Palette comes from the pane (OSC 10/11 answered for that PTY),
-        // not from this CLI's TTY — they can differ.
-        term_fg: None,
-        term_bg: None,
-    });
-    proto::send(&mut stream, &msg)?;
-    // Wait for WindowCapture response.
-    loop {
-        match proto::decode_server(&mut stream) {
-            Ok(ServerMsg::WindowCapture { content }) => {
-                let to_stdout = print || (file.is_none() && !clipboard);
-                if to_stdout {
-                    print!("{content}");
-                    if !content.ends_with('\n') {
-                        println!();
-                    }
-                }
-                if let Some(path) = file {
-                    std::fs::write(path, &content)?;
-                }
-                if clipboard && !client::copy_mode::copy_to_clipboard(&content) {
-                    return Err(io::Error::other(
-                        "clipboard: no pbcopy/wl-copy/xclip/xsel found",
-                    ));
-                }
-                return Ok(());
-            }
-            Ok(_) => {
-                // Ignore other messages (StatusBarUpdate, etc.) and keep waiting.
-            }
-            Err(e) => return Err(e),
+    )
+    .map_err(|e| {
+        // Session miss on the default server while the name matches a
+        // running server → point at the server syntax.
+        if let Some(s) = &session
+            && e.to_string().contains("no session")
+            && local_server_exists(s)
+        {
+            io::Error::new(
+                e.kind(),
+                format!("{e} — '{s}' is also a running server; try `-s {s}` or `-t {s}:<session>`"),
+            )
+        } else {
+            e
+        }
+    })?;
+
+    let to_stdout = print || (file.is_none() && !clipboard);
+    if to_stdout {
+        print!("{content}");
+        if !content.ends_with('\n') {
+            println!();
         }
     }
+    if let Some(path) = file {
+        std::fs::write(path, &content)?;
+    }
+    if clipboard && !client::copy_mode::copy_to_clipboard(&content) {
+        return Err(io::Error::other(
+            "clipboard: no pbcopy/wl-copy/xclip/xsel found",
+        ));
+    }
+    Ok(())
 }
 
 /// CLI: send keys to a pane's PTY.
-fn cli_send_keys(target: &cmd::Target, keys: &[u8], quiet: bool) -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
+fn cli_send_keys(
+    server: Option<&str>,
+    target: &cmd::Target,
+    keys: &[u8],
+    quiet: bool,
+) -> io::Result<()> {
+    // Inside a pane, default to the pane's server (LRMUX_SERVER), like
+    // cli_new_window — otherwise send-keys always lands on "default".
+    let server = server
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LRMUX_SERVER").ok())
+        .unwrap_or_else(|| "default".to_string());
+    let mut stream = connect_to_server(&server)?;
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
         rows,
         cols,
         attach: false,
         auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
     });
     proto::send(&mut stream, &msg)?;
     match proto::decode_server(&mut stream) {
@@ -2018,12 +2186,39 @@ fn cli_send_keys(target: &cmd::Target, keys: &[u8], quiet: bool) -> io::Result<(
         keys: keys.to_vec(),
     });
     proto::send(&mut stream, &msg)?;
-    // Give the server time to process the message before we close the socket.
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    if !quiet {
-        eprintln!("lrmux: send-keys: message sent");
+    // Wait for the server's SendKeysAck — the command's exit code must
+    // reflect whether the keys actually reached a pane. Bounded so an
+    // older server (no ack support) fails instead of hanging.
+    stream.set_nonblocking(true)?;
+    let ack = {
+        let mut rd =
+            crate::ipc::stream::DeadlineReader::new(&mut stream, std::time::Duration::from_secs(3));
+        loop {
+            match proto::decode_server(&mut rd) {
+                Ok(ServerMsg::SendKeysAck { ok, reason }) => break Ok((ok, reason)),
+                Ok(_) => continue, // unrelated messages (e.g. status bar)
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    match ack {
+        Ok((true, reason)) => {
+            if !quiet {
+                eprintln!("lrmux: send-keys: {reason}");
+            }
+            Ok(())
+        }
+        Ok((false, reason)) => Err(io::Error::other(reason)),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "send-keys: server did not acknowledge within 3s (older server?)",
+        )),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("send-keys: no acknowledgment from server: {e}"),
+        )),
     }
-    Ok(())
 }
 
 /// Bootstrap for a freshly forked server: first session/window options.

@@ -8,6 +8,7 @@ use crate::pty::{Pty, PtySize, default_shell_argv};
 use crate::vt;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use std::ffi::CString;
+use std::path::PathBuf;
 
 /// Global pane ID counter (tmux uses %N format).
 static PANE_ID: AtomicU32 = AtomicU32::new(0);
@@ -36,19 +37,25 @@ pub struct Pane {
     pub default_fg: Option<(u8, u8, u8)>,
     /// Last known outer-terminal default background (OSC 11), if observed.
     pub default_bg: Option<(u8, u8, u8)>,
+    /// Byte-level trace file for this pane (enabled by LRMUX_TRACE).
+    trace: Option<std::fs::File>,
+    /// Trace clock origin (pane spawn time).
+    trace_start: std::time::Instant,
 }
 
 impl Pane {
     /// Spawn a new pane with the default shell.
-    pub fn new(rows: u16, cols: u16) -> Self {
+    /// `session_id` is the owning session's id — exported to the child in
+    /// the tmux-compat `TMUX` env var.
+    pub fn new(rows: u16, cols: u16, session_id: u32) -> Self {
         let argv = default_shell_argv();
-        Self::new_with_argv(rows, cols, &argv, None)
+        Self::new_with_argv(rows, cols, &argv, None, session_id, &[])
     }
 
     /// Spawn a new pane with the default shell in a specific directory.
-    pub fn new_in_cwd(rows: u16, cols: u16, cwd: &str) -> Self {
+    pub fn new_in_cwd(rows: u16, cols: u16, cwd: &str, session_id: u32) -> Self {
         let argv = default_shell_argv();
-        Self::new_with_argv(rows, cols, &argv, Some(cwd))
+        Self::new_with_argv(rows, cols, &argv, Some(cwd), session_id, &[])
     }
 
     /// Spawn a new pane with a custom command string.
@@ -59,7 +66,14 @@ impl Pane {
     /// does not). After the command exits the shell exits, so the pane
     /// closes — no `exec` needed. Optional `cwd` sets the child's working
     /// directory (tmux `new-session -c`).
-    pub fn new_with_command(rows: u16, cols: u16, command: &str, cwd: Option<&str>) -> Self {
+    pub fn new_with_command(
+        rows: u16,
+        cols: u16,
+        command: &str,
+        cwd: Option<&str>,
+        session_id: u32,
+        env: &[(String, String)],
+    ) -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let cmd = command.trim();
         let argv = vec![
@@ -69,16 +83,43 @@ impl Pane {
             CString::new("-ci").unwrap(),
             CString::new(cmd).unwrap(),
         ];
-        Self::new_with_argv(rows, cols, &argv, cwd)
+        Self::new_with_argv(rows, cols, &argv, cwd, session_id, env)
     }
 
     /// Spawn a new pane with the given argv and optional working directory.
-    fn new_with_argv(rows: u16, cols: u16, argv: &[CString], cwd: Option<&str>) -> Self {
-        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd);
+    /// `env` carries extra variables for the child (tmux `new-window -e`).
+    fn new_with_argv(
+        rows: u16,
+        cols: u16,
+        argv: &[CString],
+        cwd: Option<&str>,
+        session_id: u32,
+        env: &[(String, String)],
+    ) -> Self {
+        // Allocate the pane id before spawn so the tmux-compat env can carry it.
+        let id = PANE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut extra_env = tmux_compat_env(session_id, id);
+        // Own session in tmux $id target form: lets a nested `lrmux`
+        // (NewWindowIn, etc.) address the session that spawned the pane
+        // rather than defaulting to the server's first session. Ids are
+        // stable across renames, unlike the session name.
+        extra_env.push(("LRMUX_SESSION".into(), format!("${session_id}")));
+        extra_env.extend(env.iter().cloned());
+        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd, &extra_env);
+
+        let mut trace = open_pane_trace(id);
+        if let Some(ref mut f) = trace {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "# pane %{id} session ${session_id} argv={:?} size={}x{}",
+                argv, cols, rows
+            );
+        }
         let grid = Grid::new(rows as usize, cols as usize, 10_000);
         let vt_parser = vte::Parser::new();
         Self {
-            id: PANE_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             pty,
             grid,
             vt_parser,
@@ -90,6 +131,8 @@ impl Pane {
             cc_utf8_pending: Vec::new(),
             default_fg: None,
             default_bg: None,
+            trace,
+            trace_start: std::time::Instant::now(),
         }
     }
 
@@ -137,6 +180,27 @@ impl Pane {
         format!("%{}", self.id)
     }
 
+    /// Trace a non-byte event (resize, exit, …) as an EVT line.
+    pub fn trace_event(&mut self, msg: &str) {
+        self.trace("EVT", msg.as_bytes());
+    }
+
+    /// Append one timestamped line to this pane's trace file, when enabled
+    /// (`LRMUX_TRACE`). Tags: IN = client keystrokes→PTY, OUT = PTY→grid,
+    /// RPL = our replies to the child's terminal queries.
+    fn trace(&mut self, tag: &str, data: &[u8]) {
+        if let Some(ref mut f) = self.trace {
+            use std::io::Write;
+            let ms = self.trace_start.elapsed().as_secs_f64() * 1000.0;
+            let _ = writeln!(
+                f,
+                "[+{ms:>11.3}ms] {tag} len={:5} | {}",
+                data.len(),
+                crate::log::vis_bytes(data)
+            );
+        }
+    }
+
     /// Get the PTY master fd (for poll). Returns -1 if the child has exited.
     pub fn pty_fd(&self) -> i32 {
         if self.exited {
@@ -168,6 +232,7 @@ impl Pane {
             if n > 0 {
                 let n = n as usize;
                 raw.extend_from_slice(&buf[..n]);
+                self.trace("OUT", &buf[..n]);
                 if let Ok(path) = std::env::var("LRMUX_VT_DUMP") {
                     use std::io::Write;
                     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -181,7 +246,7 @@ impl Pane {
                 let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
                 if !parsed.immediate_replies.is_empty() {
                     // CPR / DSR / DA — answer from our grid state.
-                    self.write_input(&parsed.immediate_replies)?;
+                    self.write_input_tagged("RPL", &parsed.immediate_replies)?;
                 }
                 osc_queries.extend(parsed.osc_queries);
                 if raw.len() >= MAX_DRAIN {
@@ -262,6 +327,13 @@ impl Pane {
     /// event loop when the PTY becomes writable. This keeps escape sequences
     /// intact (e.g., arrow keys) instead of splitting them across writes.
     pub fn write_input(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_input_tagged("IN", data)
+    }
+
+    /// `write_input` with a trace tag distinguishing the byte source
+    /// ("IN" = client input, "RPL" = our terminal-query replies).
+    pub(crate) fn write_input_tagged(&mut self, tag: &str, data: &[u8]) -> io::Result<()> {
+        self.trace(tag, data);
         self.pending_input.extend_from_slice(data);
         self.flush_pending_input()?;
         // `flush_pending_input` holds an incomplete ESC sequence until more
@@ -608,4 +680,122 @@ mod tests {
         let st = b"\x1b]11;rgb:0000/0000/0000\x1b\\";
         assert_eq!(ansi_input_seq_len(st), Some(st.len()));
     }
+
+    #[test]
+    fn vis_bytes_escapes_controls_keeps_utf8() {
+        use crate::log::vis_bytes;
+        assert_eq!(vis_bytes(b"hi\r\n"), "hi\\r\\n");
+        assert_eq!(vis_bytes(b"\x1b[6n"), "\\e[6n");
+        assert_eq!(vis_bytes(b"\x07bel\x01"), "\\abel\\x01");
+        // Box-drawing char ─ stays a char, not three \xNN escapes.
+        assert_eq!(vis_bytes("─x".as_bytes()), "─x");
+        // Invalid UTF-8 byte -> hex escape; C1 control -> \u{..}
+        assert_eq!(vis_bytes(&[0xff]), "\\xff");
+        assert_eq!(vis_bytes(&[0xc2, 0x9b]), "\\u{9b}");
+    }
+
+    #[test]
+    fn tmux_env_pairs_match_tmux_shape() {
+        let env = tmux_env_pairs("/tmp/lrmux-501/srv", 12345, 7, 3);
+        assert_eq!(env.len(), 4);
+        assert_eq!(env[0].0, "TMUX");
+        assert_eq!(env[0].1, "/tmp/lrmux-501/srv,12345,7");
+        // tmux shape: <socket path>,<server pid>,<session id>
+        let fields: Vec<&str> = env[0].1.split(',').collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(env[1], ("TMUX_PANE".into(), "%3".into()));
+        // tmux also advertises itself via TERM_PROGRAM
+        assert_eq!(env[2], ("TERM_PROGRAM".into(), "tmux".into()));
+        assert_eq!(env[3].0, "TERM_PROGRAM_VERSION");
+    }
+}
+
+/// Extra env exported to pane children in tmux-compat mode
+/// (`[behavior] tmux_compat` / `--tmux-compat`): `TMUX` carries
+/// `<socket>,<server pid>,<session id>` (same shape as tmux),
+/// `TMUX_PANE` is the `%N` pane id, and `TERM_PROGRAM`/`TERM_PROGRAM_VERSION`
+/// identify the mux as tmux — as real tmux does — so apps that detect a
+/// multiplexer env see a consistent picture.
+fn tmux_compat_env(session_id: u32, pane_id: u32) -> Vec<(String, String)> {
+    if !crate::config::tmux_compat() {
+        return Vec::new();
+    }
+    let sock = crate::ipc::socket_path(crate::server::server_name());
+    let mut env = tmux_env_pairs(
+        &sock.display().to_string(),
+        std::process::id(),
+        session_id,
+        pane_id,
+    );
+    if let Some(bin) = ensure_tmux_shim() {
+        // PATH prepend is best-effort: interactive shell init files
+        // (path_helper, user rc) may reorder it. `LRMUX_TMUX` and
+        // `TMUX_BIN` are the reliable handles — absolute paths to the
+        // shim binary that survive any shell init.
+        let shim = bin.join("tmux").display().to_string();
+        env.push(("LRMUX_TMUX".into(), shim.clone()));
+        env.push(("TMUX_BIN".into(), shim));
+        let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+        if !path.split(':').any(|d| d == bin.to_string_lossy()) {
+            env.push(("PATH".into(), format!("{}:{path}", bin.display())));
+        }
+    }
+    env
+}
+
+/// Directory holding the `tmux` compatibility shim
+/// (`<socket dir>/bin`, created lazily). In tmux-compat mode it is
+/// prepended to pane children's PATH so tools that shell out to `tmux`
+// reach this binary's tmux-subset command mode (see argv[0] check in
+/// `main`). Returns None if the shim could not be installed.
+fn ensure_tmux_shim() -> Option<PathBuf> {
+    static SHIM_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SHIM_DIR
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let sock = crate::ipc::socket_path(crate::server::server_name());
+            let dir = sock.parent()?.join("bin");
+            std::fs::create_dir_all(&dir).ok()?;
+            let link = dir.join("tmux");
+            // Refresh the link if it is missing or points elsewhere
+            // (e.g. a different lrmux binary after a rebuild).
+            let stale = match std::fs::read_link(&link) {
+                Ok(target) => target != exe,
+                Err(_) => true,
+            };
+            if stale {
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(&exe, &link).ok()?;
+            }
+            Some(dir)
+        })
+        .clone()
+}
+
+fn tmux_env_pairs(
+    socket: &str,
+    server_pid: u32,
+    session_id: u32,
+    pane_id: u32,
+) -> Vec<(String, String)> {
+    vec![
+        ("TMUX".into(), format!("{socket},{server_pid},{session_id}")),
+        ("TMUX_PANE".into(), format!("%{pane_id}")),
+        // Real tmux panes also see TERM_PROGRAM=tmux; apps that detect
+        // a multiplexer key off it (or off TERM), not just $TMUX.
+        ("TERM_PROGRAM".into(), "tmux".into()),
+        (
+            "TERM_PROGRAM_VERSION".into(),
+            crate::client::tmux_shim::TMUX_VERSION.into(),
+        ),
+    ]
+}
+
+/// Open this pane's byte-trace file (`LRMUX_TRACE`), or None when
+/// tracing is disabled.
+fn open_pane_trace(pane_id: u32) -> Option<std::fs::File> {
+    // Namespace by server name: every server shares the same logs dir,
+    // so a bare pane-%N.trace would be overwritten by each server.
+    let server = crate::server::server_name();
+    crate::log::open_trace(&format!("pane-{server}-%{pane_id}.trace"))
 }
