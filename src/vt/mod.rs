@@ -156,7 +156,8 @@ impl Perform for VtHandler<'_> {
             // which is why whole UIs look underlined inside lrmux but not
             // in a real terminal.
             'm' if intermediates.is_empty() => {
-                self.grid.set_sgr(&p);
+                let groups: Vec<&[u16]> = params.iter().collect();
+                self.grid.set_sgr(&groups);
             }
 
             // Scroll
@@ -246,13 +247,22 @@ impl Perform for VtHandler<'_> {
                 }
             }
 
-            // SCP - save cursor position
-            's' => {
+            // SCP / RCP — plain forms only. `\x1b[?u` is a kitty keyboard
+            // flags query and `\x1b[>Nu` / `\x1b[<u` push/pop its state —
+            // all share the 'u' final byte. Treating them as RCP jumps
+            // the cursor to the saved position and corrupts every later
+            // relative move (observed: Claude's diff renderer drawing at
+            // the top of the screen).
+            's' if intermediates.is_empty() => {
                 self.grid.save_cursor();
             }
-            // RCP - restore cursor position
-            'u' => {
+            'u' if intermediates.is_empty() => {
                 self.grid.restore_cursor();
+            }
+            // kitty keyboard flags query — answer 0 (no progressive
+            // enhancements) so the child falls back to legacy keys.
+            'u' if intermediates == b"?" => {
+                self.result.immediate_replies.extend_from_slice(b"\x1b[?0u");
             }
 
             // Repeat preceding character (REP)
@@ -344,7 +354,7 @@ pub fn parse_bytes(parser: &mut vte::Parser, grid: &mut Grid, bytes: &[u8]) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Grid;
+    use crate::grid::{Color, Grid};
 
     fn row_text(grid: &Grid, row: usize) -> String {
         grid.row(row)
@@ -439,6 +449,37 @@ mod tests {
     }
 
     #[test]
+    fn kitty_keyboard_query_does_not_restore_cursor() {
+        // Claude emits \x1b[?u (kitty keyboard flags query) at startup.
+        // Its final byte is 'u' — treating it as RCP jumps the cursor to
+        // the saved position and corrupts every subsequent relative move.
+        let mut grid = Grid::new(10, 20, 10);
+        grid.move_cursor(8, 5);
+        grid.save_cursor();
+        grid.move_cursor(3, 7);
+        let mut parser = vte::Parser::new();
+        let r = parse_bytes(&mut parser, &mut grid, b"\x1b[?u");
+        assert_eq!(
+            (grid.cursor_row, grid.cursor_col),
+            (3, 7),
+            "\x1b[?u must not move the cursor"
+        );
+        // The query gets an answer: 0 = no progressive enhancements.
+        assert!(
+            String::from_utf8_lossy(&r.immediate_replies).contains("\x1b[?0u"),
+            "kitty flags query should be answered"
+        );
+
+        // Push/pop forms (\x1b[>1u / \x1b[<u) are ignored, not cursor ops.
+        parse_bytes(&mut parser, &mut grid, b"\x1b[>1u\x1b[<u");
+        assert_eq!((grid.cursor_row, grid.cursor_col), (3, 7));
+
+        // Plain \x1b[u still restores.
+        parse_bytes(&mut parser, &mut grid, b"\x1b[u");
+        assert_eq!((grid.cursor_row, grid.cursor_col), (8, 5));
+    }
+
+    #[test]
     fn decset_mouse_modes() {
         let mut grid = Grid::new(1, 20, 10);
         let mut parser = vte::Parser::new();
@@ -452,5 +493,43 @@ mod tests {
         assert_eq!(grid.mouse_fmt, 0);
         assert!(!grid.wants_mouse());
         assert!(grid.mouse_altscroll); // 1007 untouched
+    }
+    #[test]
+    fn sgr_combined_fg_bg_extended_colors() {
+        // Rich/Textual emit fg+bg in ONE SGR: \x1b[38;2;f;f;f;48;2;b;b;bm.
+        // The fg args must not eat the 48 group, and leftover RGB
+        // components must never land on SGR 0 (reset) — a regression here
+        // made styled text render with default colors.
+        let mut grid = Grid::new(4, 80, 10);
+        let mut parser = vte::Parser::new();
+        parse_bytes(
+            &mut parser,
+            &mut grid,
+            b"\x1b[38;2;255;255;255;48;2;0;0;255mHELLO",
+        );
+        let c = &grid.row(0).unwrap()[0];
+        assert_eq!(c.fg, Color::Rgb(255, 255, 255));
+        assert_eq!(c.bg, Color::Rgb(0, 0, 255));
+
+        // Indexed + trailing attrs in the same sequence.
+        let mut grid = Grid::new(4, 80, 10);
+        let mut parser = vte::Parser::new();
+        parse_bytes(&mut parser, &mut grid, b"\x1b[38;5;196;1;48;5;21mX");
+        let c = &grid.row(0).unwrap()[0];
+        assert_eq!(c.fg, Color::Indexed(196));
+        assert_eq!(c.bg, Color::Indexed(21));
+        assert!(c.attrs.bold);
+
+        // Colon subparams and colorspace-prefixed truecolor.
+        let mut grid = Grid::new(4, 80, 10);
+        let mut parser = vte::Parser::new();
+        parse_bytes(
+            &mut parser,
+            &mut grid,
+            b"\x1b[38:2:10:20:30;48:2:0:40:50:60mY",
+        );
+        let c = &grid.row(0).unwrap()[0];
+        assert_eq!(c.fg, Color::Rgb(10, 20, 30));
+        assert_eq!(c.bg, Color::Rgb(40, 50, 60));
     }
 }

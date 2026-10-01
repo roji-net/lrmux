@@ -54,6 +54,23 @@ pub struct Grid {
     dirty: Vec<bool>,
 }
 
+/// Parse the argument list of an SGR extended color (38/48/58).
+/// `args` starts at the color-space selector: `5;n` is indexed and
+/// `2;r;g;b` is truecolor. A leading colorspace id (`2;cs;r;g;b`,
+/// colon syntax) is skipped.
+fn parse_sgr_color(args: &[u16]) -> Option<Color> {
+    match args.first() {
+        Some(&5) => args.get(1).map(|n| Color::Indexed(*n as u8)),
+        Some(&2) if args.len() == 4 => {
+            Some(Color::Rgb(args[1] as u8, args[2] as u8, args[3] as u8))
+        }
+        Some(&2) if args.len() >= 5 => {
+            Some(Color::Rgb(args[2] as u8, args[3] as u8, args[4] as u8))
+        }
+        _ => None,
+    }
+}
+
 impl Grid {
     pub fn new(rows: usize, cols: usize, scrollback_capacity: usize) -> Self {
         let rows = rows.max(1);
@@ -549,7 +566,13 @@ impl Grid {
     }
 
     /// Set the current text attributes from SGR parameters.
-    pub fn set_sgr(&mut self, params: &[u16]) {
+    ///
+    /// `params` are vte param groups: one `&[u16]` per `;`-separated
+    /// parameter, with `:`-separated subparams flattened inside each
+    /// group (e.g. `38:2:r:g:b` arrives as `[38, 2, r, g, b]`).
+    /// Color arguments may therefore live inside the group itself or
+    /// in the following groups; both forms are consumed correctly.
+    pub fn set_sgr(&mut self, params: &[&[u16]]) {
         if params.is_empty() {
             self.fg = Color::Default;
             self.bg = Color::Default;
@@ -559,7 +582,9 @@ impl Grid {
 
         let mut i = 0;
         while i < params.len() {
-            match params[i] {
+            let group = params[i];
+            let code = group.first().copied().unwrap_or(0);
+            match code {
                 0 => {
                     self.fg = Color::Default;
                     self.bg = Color::Default;
@@ -573,73 +598,54 @@ impl Grid {
                 23 => self.attrs.italic = false,
                 24 => self.attrs.underline = false,
                 27 => self.attrs.reverse = false,
-                38 => {
-                    // Foreground color
-                    if i + 1 < params.len() {
-                        match params[i + 1] {
-                            2 => {
-                                // Truecolor: 38;2;R;G;B
-                                if i + 4 < params.len() {
-                                    self.fg = Color::Rgb(
-                                        params[i + 2] as u8,
-                                        params[i + 3] as u8,
-                                        params[i + 4] as u8,
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            5 if i + 2 < params.len() => {
-                                // 256-color: 38;5;N
-                                self.fg = Color::Indexed(params[i + 2] as u8);
-                                i += 2;
-                            }
+                38 | 48 | 58 => {
+                    // Extended color: 38=fg, 48=bg, 58=underline (ignored).
+                    // Color args ride inside `group` as colon subparams
+                    // (`38:2:r:g:b`) or follow as `;`-separated groups
+                    // (`38;2;r;g;b`). Consume only what the mode needs so
+                    // trailing params (e.g. `38;5;196;1`) are not eaten.
+                    let mut args: Vec<u16> = group[1.min(group.len())..].to_vec();
+                    let mut consumed = 1;
+                    // Pull at least the mode argument from the next group.
+                    if args.is_empty() && i + consumed < params.len() {
+                        args.extend_from_slice(params[i + consumed]);
+                        consumed += 1;
+                    }
+                    let needed = match args.first() {
+                        Some(&5) => 2,
+                        Some(&2) => 4,
+                        _ => 1,
+                    };
+                    while args.len() < needed && i + consumed < params.len() {
+                        args.extend_from_slice(params[i + consumed]);
+                        consumed += 1;
+                    }
+                    if let Some(color) = parse_sgr_color(&args) {
+                        match code {
+                            38 => self.fg = color,
+                            48 => self.bg = color,
                             _ => {}
                         }
-                        i += 1;
                     }
+                    i += consumed - 1;
                 }
                 39 => self.fg = Color::Default,
-                48 => {
-                    // Background color
-                    if i + 1 < params.len() {
-                        match params[i + 1] {
-                            2 => {
-                                // Truecolor: 48;2;R;G;B
-                                if i + 4 < params.len() {
-                                    self.bg = Color::Rgb(
-                                        params[i + 2] as u8,
-                                        params[i + 3] as u8,
-                                        params[i + 4] as u8,
-                                    );
-                                    i += 4;
-                                }
-                            }
-                            5 if i + 2 < params.len() => {
-                                // 256-color: 48;5;N
-                                self.bg = Color::Indexed(params[i + 2] as u8);
-                                i += 2;
-                            }
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-                }
                 49 => self.bg = Color::Default,
                 30..=37 => {
                     // Standard 16-color foreground
-                    self.fg = Color::Indexed(params[i] as u8 - 30);
+                    self.fg = Color::Indexed(code as u8 - 30);
                 }
                 90..=97 => {
                     // Bright foreground
-                    self.fg = Color::Indexed(params[i] as u8 - 90 + 8);
+                    self.fg = Color::Indexed(code as u8 - 90 + 8);
                 }
                 40..=47 => {
                     // Standard 16-color background
-                    self.bg = Color::Indexed(params[i] as u8 - 40);
+                    self.bg = Color::Indexed(code as u8 - 40);
                 }
                 100..=107 => {
                     // Bright background
-                    self.bg = Color::Indexed(params[i] as u8 - 100 + 8);
+                    self.bg = Color::Indexed(code as u8 - 100 + 8);
                 }
                 _ => {}
             }

@@ -647,9 +647,16 @@ pub fn run(
                         if !cc_bytes.is_empty() {
                             forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
                         }
-                        // Proxy OSC 10/11 color queries to a real attached TTY.
+                        // OSC 10/11 color queries: answer from the pane's
+                        // cached palette when known — a real-TTY roundtrip
+                        // takes ~10-20ms and lands in the child's input queue
+                        // after apps with a short read window already moved
+                        // on (the reply then echoes as typed garbage). Proxy
+                        // only when we have nothing truthful to say.
                         for q in osc_queries {
-                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            if !answer_osc_color_query(pane, &q, &clients) {
+                                proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            }
                         }
                         pty_activity.push((si, wi));
                     }
@@ -663,7 +670,9 @@ pub fn run(
                             forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
                         }
                         for q in osc_queries {
-                            proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            if !answer_osc_color_query(pane, &q, &clients) {
+                                proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            }
                         }
                         let exit_code = pane.reap_child().unwrap_or(0);
                         pane.trace_event(&format!("child exited, code {exit_code}"));
@@ -3219,6 +3228,43 @@ fn resolve_capture_palette(
         fg: term_fg,
         bg: term_bg,
     })
+}
+
+/// Answer a child's OSC 10/11 color query directly from the pane's cached
+/// palette — seeded by the attaching client's probe and by earlier proxied
+/// replies — falling back to any attached client's probed palette (the
+/// same outer-terminal colors are a valid answer for every pane). Returns
+/// false when nothing is known — the caller then proxies to a real client
+/// TTY instead of inventing a color.
+fn answer_osc_color_query(
+    pane: &mut crate::server::pane::Pane,
+    query: &crate::vt::OscColorQuery,
+    clients: &[ClientConn],
+) -> bool {
+    let rgb = match query.code {
+        10 => pane
+            .default_fg
+            .or_else(|| clients.iter().find_map(|c| c.palette.fg)),
+        11 => pane
+            .default_bg
+            .or_else(|| clients.iter().find_map(|c| c.palette.bg)),
+        _ => None,
+    };
+    let Some((r, g, b)) = rgb else { return false };
+    let reply = format_osc_color_reply(query.code, (r, g, b), query.bell_terminated);
+    pane.write_input_tagged("RPL", reply.as_bytes()).is_ok()
+}
+
+/// xterm-style OSC color reply: 16-bit channels (8-bit value replicated),
+/// terminated the same way the child's query was.
+fn format_osc_color_reply(code: u8, (r, g, b): (u8, u8, u8), bell: bool) -> String {
+    format!(
+        "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}{}",
+        r as u16 * 257,
+        g as u16 * 257,
+        b as u16 * 257,
+        if bell { "\x07" } else { "\x1b\\" },
+    )
 }
 
 /// Ask an attached client to query its real TTY for OSC 10/11.
@@ -5835,5 +5881,26 @@ fn resolve_session_target(
             sessions.iter().position(|s| s.id == id)
         }
         t => find_session(sessions, &Some(t.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod osc_color_reply_tests {
+    use super::format_osc_color_reply;
+
+    #[test]
+    fn preserves_code_and_bell_terminator() {
+        assert_eq!(
+            format_osc_color_reply(10, (0xc7, 0xf1, 0xc7), true),
+            "\x1b]10;rgb:c7c7/f1f1/c7c7\x07"
+        );
+    }
+
+    #[test]
+    fn preserves_st_terminator() {
+        assert_eq!(
+            format_osc_color_reply(11, (0, 0, 0), false),
+            "\x1b]11;rgb:0000/0000/0000\x1b\\"
+        );
     }
 }

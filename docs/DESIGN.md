@@ -720,7 +720,8 @@ records events; sometimes a bug needs the exact byte stream instead.
 - **Panes** — `pane-%<id>.trace`: `IN` client keystrokes written to the
   PTY, `OUT` raw bytes read from the PTY (child output before VT
   parsing), `RPL` replies we generate to the child's terminal queries
-  (CPR/DSR/DA and proxied OSC answers), `EVT` pane events (resize,
+  (CPR/DSR/DA and OSC color answers, local or proxied), `EVT` pane
+  events (resize,
   child exit).
 - **Attached clients** — `client-<pid>.trace`: `KEY` raw bytes read
   from stdin (including bytes consumed by palette probes), `IN` bytes
