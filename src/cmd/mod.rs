@@ -319,9 +319,11 @@ Anything else is sent as literal text.",
         aliases: &["capturep", "capture-window"],
         summary: "Print a pane's contents",
         usage: "    \
-lrmux capture-pane -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|markdown] [--clipboard] [--file <path>]",
+lrmux capture-pane [-s <server|host:port>] -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|markdown] [--clipboard] [--file <path>]",
         body: "\
--t, --target <target>          Pane to capture\n\
+-s, --server <server|host:port>  Server to query (name or TCP address)\n\
+-t, --target <target>          Target pane: session, session:N,\n\
+                               server:session or server:session:N\n\
 -p, --print                    Print to stdout\n\
 -c, --colors                   Include cell styles\n\
 --format <ascii|ansi|html|markdown>\n\
@@ -509,6 +511,7 @@ LRMUX_SYSLOG=host:port   Send logs to remote syslog (UDP RFC 3164)\n    \
 LRMUX_LOG_LEVEL=debug|info|warn|error   Log level (default: info)\n    \
 LRMUX=1                  Set automatically inside lrmux panes\n    \
 LRMUX_SERVER=name        Server name (set automatically inside lrmux panes)\n    \
+LRMUX_SESSION=$id        Session id (set automatically inside lrmux panes)\n    \
 LRMUX_PSK=<secret>       TCP pre-shared key override\n\
 \n\
 PREFIX KEY: Ctrl-A (default)\n\

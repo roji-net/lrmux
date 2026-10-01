@@ -114,6 +114,77 @@ pub fn terminal_env_overlay() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Capture a pane's contents from a server. `tcp` overrides the local
+/// Unix socket lookup of `server`. `window: None` captures the client's
+/// active window (index 0 for this transient connection).
+pub fn capture_pane(
+    server: &str,
+    tcp: Option<&str>,
+    session: Option<String>,
+    window: Option<u8>,
+    format: u8,
+    colors: bool,
+) -> io::Result<String> {
+    let mut stream = match tcp {
+        Some(addr) => ipc::connect_tcp(addr)?,
+        None => {
+            let sock = ipc::socket_path(server);
+            if !ipc::server_exists(&sock) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("server '{server}' is not running"),
+                ));
+            }
+            ipc::ConnStream::Unix(ipc::connect(&sock)?)
+        }
+    };
+    proto::send(
+        &mut stream,
+        &proto::encode_client(&ClientMsg::Identify {
+            rows: 24,
+            cols: 80,
+            attach: false,
+            auth_token: crate::config::effective_psk(),
+            env: Vec::new(),
+        }),
+    )?;
+    loop {
+        match ipc::stream::decode_with_deadline(
+            &mut stream,
+            std::time::Duration::from_secs(5),
+            |r| proto::decode_server(r),
+        )? {
+            ServerMsg::IdentifyAck { .. } => break,
+            ServerMsg::Error { msg } => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+            }
+            _ => {}
+        }
+    }
+    proto::send(
+        &mut stream,
+        &proto::encode_client(&ClientMsg::CaptureWindow {
+            session,
+            window,
+            format,
+            colors,
+            term_fg: None,
+            term_bg: None,
+        }),
+    )?;
+    loop {
+        match ipc::stream::decode_with_deadline(
+            &mut stream,
+            std::time::Duration::from_secs(5),
+            |r| proto::decode_server(r),
+        )? {
+            ServerMsg::WindowCapture { content } => return Ok(content),
+            ServerMsg::Error { msg } => return Err(io::Error::other(msg)),
+            _ => {}
+        }
+    }
+}
+
 /// Run the client: connect to server, relay stdin → server, render grid updates.
 /// If `new_session` is provided, a NewSession command is sent right after the handshake.
 /// If `select_session` is provided, a SelectSession command is sent to switch to that session.
@@ -224,6 +295,9 @@ pub fn run(
 
     // Status bar text (updated by the server).
     let mut status_text = String::new();
+    // Column spans of each window entry in the status bar (1-based,
+    // start inclusive / end exclusive), for click-to-switch hit-testing.
+    let mut status_spans: Vec<(u16, u16, u8)> = Vec::new();
     // Current session name (from StatusBarUpdate, used for kill-session confirmation).
     let mut current_session = String::new();
     // Number of windows in the current session (from StatusBarUpdate).
@@ -418,6 +492,29 @@ pub fn run(
                 let view_rows = term_rows.saturating_sub(1);
                 let mut mouse_copy_action: Option<copy_mode::CopyAction> = None;
                 for ev in &mouse_events {
+                    // The status bar row is lrmux's own UI — clicks there
+                    // never reach the pane (the bounds check below already
+                    // drops them), so handling them here is passthrough-safe.
+                    if ev.y as usize == term_rows {
+                        if ev.is_wheel() {
+                            // Wheel on the bar cycles windows, tmux-style.
+                            let msg = if ev.is_wheel_up() {
+                                ClientMsg::PrevWindow
+                            } else {
+                                ClientMsg::NextWindow
+                            };
+                            send_cmd(&mut stream, &msg)?;
+                        } else if !ev.release && !ev.is_motion() && ev.cb & 3 == 0 {
+                            // Left press on a window entry switches to it.
+                            if let Some(&(_, _, idx)) = status_spans
+                                .iter()
+                                .find(|&&(s, e, _)| ev.x >= s && ev.x < e)
+                            {
+                                send_cmd(&mut stream, &ClientMsg::SelectWindow { index: idx })?;
+                            }
+                        }
+                        continue;
+                    }
                     let local = copy_mode.is_some() || !grid.wants_mouse();
                     if !local {
                         // Forward to the pane in the child's encoding.
@@ -1039,7 +1136,7 @@ pub fn run(
                             current_session = session.clone();
                             current_window_count = windows.len();
                             session_count = sc as usize;
-                            status_text = format_status_bar(
+                            (status_text, status_spans) = format_status_bar(
                                 &session,
                                 &windows,
                                 active as usize,
@@ -1674,6 +1771,8 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
 /// Inactive windows with pending activity get a red bullet prefix.
 /// Identity is `[session]@server`, then the window list.
+/// Also returns each window entry's 1-based column span (start, end,
+/// window index) for mouse hit-testing on the status bar row.
 fn format_status_bar(
     session: &str,
     windows: &[String],
@@ -1682,7 +1781,7 @@ fn format_status_bar(
     high_output: bool,
     server: &str,
     activity: &[bool],
-) -> String {
+) -> (String, Vec<(u16, u16, u8)>) {
     // Each sequence starts with `0;` so reverse/underline/italic from the
     // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
     // Blue background + white text for inactive windows.
@@ -1726,15 +1825,36 @@ fn format_status_bar(
     } else {
         format!("[{SESSION}{session}{BAR}]@{server}")
     };
-    format!(
-        "{}lrmux {}{}{} | {} | {}{}",
-        BAR,
-        version_marker,
-        server_hash,
-        BAR,
-        identity,
-        parts.join("  "),
-        RESET
+
+    // Visible layout: "lrmux <hash><marker> | <identity> | <parts…>".
+    // Track each window entry's column span while composing so mouse
+    // clicks on the status bar row can be hit-tested against it.
+    let head_visible = "lrmux ".chars().count()
+        + server_hash.chars().count()
+        + usize::from(mismatch)
+        + " | ".chars().count()
+        + strip_ansi(&identity).chars().count()
+        + " | ".chars().count();
+    let mut spans: Vec<(u16, u16, u8)> = Vec::with_capacity(windows.len());
+    let mut col = head_visible as u16 + 1;
+    for (i, part) in parts.iter().enumerate() {
+        let w = strip_ansi(part).chars().count() as u16;
+        spans.push((col, col + w, i as u8));
+        col += w + 2; // entries are joined with two spaces
+    }
+
+    (
+        format!(
+            "{}lrmux {}{}{} | {} | {}{}",
+            BAR,
+            version_marker,
+            server_hash,
+            BAR,
+            identity,
+            parts.join("  "),
+            RESET
+        ),
+        spans,
     )
 }
 
@@ -2453,7 +2573,7 @@ mod tests {
 
     #[test]
     fn status_bar_shows_server_next_to_session() {
-        let text = format_status_bar(
+        let (text, _) = format_status_bar(
             "lrmux",
             &["zsh".into()],
             0,
@@ -2471,7 +2591,7 @@ mod tests {
 
     #[test]
     fn status_bar_omits_empty_server() {
-        let text = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
+        let (text, _) = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
         let visible = strip_ansi(&text);
         assert!(!visible.contains('@'), "{visible}");
         assert!(visible.contains("lrmux"), "{visible}");
@@ -2479,7 +2599,7 @@ mod tests {
 
     #[test]
     fn status_bar_marks_inactive_window_activity() {
-        let text = format_status_bar(
+        let (text, _) = format_status_bar(
             "lrmux",
             &["zsh".into(), "vim".into()],
             0,
@@ -2491,5 +2611,30 @@ mod tests {
         let visible = strip_ansi(&text);
         assert!(visible.contains("●1:vim"), "{visible}");
         assert!(!visible.contains("●0:"), "{visible}");
+    }
+
+    #[test]
+    fn status_bar_window_spans_cover_each_entry() {
+        let (text, spans) = format_status_bar(
+            "sess",
+            &["zsh".into(), "vim".into()],
+            1,
+            "abc123",
+            false,
+            "srv",
+            &[true, false],
+        );
+        let visible = strip_ansi(&text);
+        assert_eq!(spans.len(), 2);
+        // Each span must start exactly on its "i:name" text. The activity
+        // bullet is part of the entry's span. find() gives byte offsets —
+        // convert to 1-based char columns (● is 3 bytes, 1 column).
+        let col_of =
+            |needle: &str| visible[..visible.find(needle).unwrap()].chars().count() as u16 + 1;
+        let w0 = col_of("●0:zsh");
+        let w1 = col_of("1:vim*");
+        assert_eq!(spans[0], (w0, w0 + "●0:zsh".chars().count() as u16, 0));
+        assert_eq!(spans[1], (w1, w1 + "1:vim*".chars().count() as u16, 1));
+        assert_eq!(spans[1].0, spans[0].1 + 2); // joined with two spaces
     }
 }

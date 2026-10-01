@@ -1449,17 +1449,17 @@ pub fn run(
                                             return Ok(());
                                         }
                                         ClientMsg::NewWindowIn { session, command } => {
-                                            // Find the target session by name, or use the first.
+                                            // "$N" = session id (what
+                                            // LRMUX_SESSION exports), else
+                                            // name. None = the requesting
+                                            // client's session.
                                             let si = match session {
-                                                Some(ref name) => {
-                                                    sessions.iter().position(|s| &s.name == name)
+                                                Some(ref spec) => {
+                                                    resolve_newwin_session(&sessions, spec)
                                                 }
                                                 None => {
-                                                    if sessions.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(0)
-                                                    }
+                                                    let si = clients[client_idx].session_idx;
+                                                    (si < sessions.len()).then_some(si)
                                                 }
                                             };
                                             if let Some(si) = si {
@@ -1507,35 +1507,52 @@ pub fn run(
                                             };
                                             let fmt =
                                                 super::capture::CaptureFormat::from_u8(format);
-                                            let content = if let Some(si) = si {
+                                            let reply: Result<String, String> = if let Some(si) = si
+                                            {
                                                 let wi = match window {
                                                     Some(w) => Some(w as usize),
-                                                    None => Some(clients[client_idx].active_window),
+                                                    None => Some(
+                                                        clients[client_idx].active_window.min(
+                                                            sessions[si]
+                                                                .windows
+                                                                .len()
+                                                                .saturating_sub(1),
+                                                        ),
+                                                    ),
                                                 };
-                                                if let Some(wi) = wi
-                                                    && wi < sessions[si].windows.len()
-                                                {
-                                                    let palette = resolve_capture_palette(
-                                                        &sessions, &clients, si, wi, term_fg,
-                                                        term_bg,
-                                                    );
-                                                    Some(super::capture::render_pane(
-                                                        &sessions[si].windows[wi].pane,
-                                                        fmt,
-                                                        colors,
-                                                        false,
-                                                        palette,
-                                                    ))
-                                                } else {
-                                                    None
+                                                match wi {
+                                                    Some(wi) if wi < sessions[si].windows.len() => {
+                                                        let palette = resolve_capture_palette(
+                                                            &sessions, &clients, si, wi, term_fg,
+                                                            term_bg,
+                                                        );
+                                                        Ok(super::capture::render_pane(
+                                                            &sessions[si].windows[wi].pane,
+                                                            fmt,
+                                                            colors,
+                                                            false,
+                                                            palette,
+                                                        ))
+                                                    }
+                                                    _ => Err(format!(
+                                                        "session '{}' has no window {}; \
+                                                         windows: {}",
+                                                        sessions[si].name,
+                                                        wi.unwrap_or(0),
+                                                        session_window_names(&sessions[si])
+                                                    )),
                                                 }
                                             } else {
-                                                None
+                                                Err(no_session_error(&session, &sessions))
                                             };
-                                            let msg =
-                                                proto::encode_server(&ServerMsg::WindowCapture {
-                                                    content: content.unwrap_or_default(),
-                                                });
+                                            let msg = match reply {
+                                                Ok(content) => proto::encode_server(
+                                                    &ServerMsg::WindowCapture { content },
+                                                ),
+                                                Err(msg) => {
+                                                    proto::encode_server(&ServerMsg::Error { msg })
+                                                }
+                                            };
                                             let _ = client_send(&mut clients[client_idx], &msg);
                                         }
                                         ClientMsg::SendKeys {
@@ -1743,13 +1760,10 @@ pub fn run(
                         match msg {
                             ClientMsg::NewWindowIn { session, command } => {
                                 let si = match session {
-                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
+                                    Some(ref spec) => resolve_newwin_session(&sessions, spec),
                                     None => {
-                                        if sessions.is_empty() {
-                                            None
-                                        } else {
-                                            Some(0)
-                                        }
+                                        let si = clients[client_idx].session_idx;
+                                        (si < sessions.len()).then_some(si)
                                     }
                                 };
                                 if let Some(si) = si {
@@ -3089,6 +3103,82 @@ fn seed_client_focus_palette(sessions: &mut [Session], clients: &[ClientConn], c
         return;
     };
     seed_pane_palette(sessions, c.session_idx, c.active_window, c.palette);
+}
+
+/// Error text for a CaptureWindow session lookup miss, listing the
+/// sessions that do exist and suggesting a close name when one matches.
+fn no_session_error(session: &Option<String>, sessions: &[Session]) -> String {
+    let avail = session_names(sessions);
+    let mut msg = match session {
+        Some(name) => format!(
+            "no session '{name}' on server '{}' (sessions: {avail})",
+            crate::server::server_name()
+        ),
+        None => format!("server '{}' has no sessions", crate::server::server_name()),
+    };
+    if let Some(name) = session
+        && let Some(guess) = closest_name(name, sessions.iter().map(|s| s.name.as_str()))
+    {
+        msg.push_str(&format!(" — did you mean '{guess}'?"));
+    }
+    msg
+}
+
+fn session_names(sessions: &[Session]) -> String {
+    if sessions.is_empty() {
+        return "none".to_string();
+    }
+    sessions
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn session_window_names(session: &Session) -> String {
+    session
+        .windows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| format!("{i}:{}", w.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Closest candidate by edit distance; also accepts a prefix match so
+/// e.g. `web` suggests `web-server`.
+fn closest_name<'a>(want: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut best: Option<(&'a str, usize)> = None;
+    for c in candidates {
+        let prefix = want.len() >= 3 && (c.starts_with(want) || want.starts_with(c));
+        let d = if prefix {
+            want.len().abs_diff(c.len())
+        } else {
+            edit_distance(want, c)
+        };
+        let acceptable = d <= 3 || prefix;
+        if acceptable && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((c, d));
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push(
+                (prev[j] + usize::from(ca != *cb))
+                    .min(prev[j + 1] + 1)
+                    .min(cur[j] + 1),
+            );
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Palette for HTML capture: pane cache, then viewers of that window, then
@@ -5554,6 +5644,13 @@ fn find_session(sessions: &[Session], name: &Option<String>) -> Option<usize> {
             .position(|s| s.name == *n || s.id_str() == *n),
         None => Some(0),
     }
+}
+
+/// Resolve a NewWindowIn session spec: session name or "$id" (the form
+/// `LRMUX_SESSION` exports to panes so nested `lrmux` commands target
+/// the pane's own session).
+fn resolve_newwin_session(sessions: &[Session], spec: &str) -> Option<usize> {
+    find_session(sessions, &Some(spec.to_string()))
 }
 
 /// Find a window by index (or return the first if index is None).

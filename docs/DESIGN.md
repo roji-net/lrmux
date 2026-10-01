@@ -139,6 +139,7 @@ All elements are configurable and the status bar can be disabled entirely.
 - **Mouse events are never consumed by lrmux.** When the child enables mouse tracking (DECSET 1000/1002/1003), the client enables reporting on the outer terminal and forwards each event to the pane, re-encoded in the format the child requested: legacy X10, UTF-8 extended (1005) or SGR (1006). The server-side VT parser tracks the requested modes and ships them to the client in `GridSnapshot`/`GridUpdate` (`mouse_flags` byte); the client decodes terminal reports (SGR is requested, X10 tolerated) and re-encodes — preserving the passthrough invariant.
 - Alternate scroll (DECSET 1007): when a child sets it without a tracking mode, wheel ticks are translated into three arrow-key presses (app-cursor-keys aware) — the standard xterm behavior.
 - **Local selection**: the client always keeps the outer terminal in button-event reporting (1002+1006) while attached. When the child requests no mouse handling, a left-drag selects text against the client-side grid — never including pane borders, filler, or the status bar — and releasing copies it (clipboard + internal paste buffer), exiting copy mode. A plain click without drag does nothing. The wheel scrolls copy-mode scrollback (enters on wheel-up, exits at the bottom). Local handling also takes over whenever copy mode is active, even if the child tracks the mouse.
+- **Status bar interaction**: clicks on the status bar row never reach the pane (the row is outside the pane's coordinate space and is dropped either way), so lrmux uses them itself without weakening the passthrough invariant: a left press on a window entry switches to that window, and the wheel on the bar cycles prev/next window — tmux's `mouse`-on behavior.
 - Reporting is disabled again when the child turns tracking off, and always restored on client exit.
 
 ### 2.11 Window numbering
@@ -191,9 +192,11 @@ Running `lrmux` with no arguments:
 
 The interactive selector:
 
-- A **flat list** of `server / session` entries across all running servers (e.g. `default / lrmux`, `default / home`, `work / api`).
-- **Fuzzy filter**: typing filters the list by fuzzy match on the `server / session` string (fzf-style).
+- A **flat list** of `server / session` entries across all running servers (e.g. `default / lrmux`, `default / home`, `work / api`), with an `Address` column (`host:port`) shown when any listed server has TCP enabled.
+- **Fuzzy filter behind `/`**: pressing `/` enters filter mode; typed characters narrow the list by fuzzy match on the `server / session` string, `Enter` joins the selection, `Esc` clears the filter and exits the mode. Bindings are inert while filtering, so letters like `n` cannot fire actions mid-typing.
 - `j`/`k` or arrow keys to navigate, `Enter` to join the selected session.
+- `C` captures the highlighted pane to a file: prompts for a filename (prefilled `server-session.ansi`, first keystroke replaces the whole suggestion) and picks the capture format from the extension (`.ansi` → SGR, `.html` → HTML, `.md` → Markdown, anything else → plain text).
+- `V` previews the highlighted pane's live contents (ANSI capture) in a scrollable popup (`j`/`k`/arrows, `d`/`u` half-page, `g`/`G`, `q`/`Esc` to close) without attaching.
 - `n` creates a new session: prompts for a name with a **default derived from CWD** (per §2.13) pre-filled; user can accept or edit it. Session is created on the currently highlighted server (or `default` if none highlighted).
 - `N` creates a new server + session: prompts for a server name (default: `default` or `default-2` etc. on collision) and a session name (default: CWD-derived), then spawns both.
 - If no servers are running, the selector shows a single "create new server + session" prompt with defaults pre-filled.
@@ -688,6 +691,24 @@ own env. `TERM` is deliberately not refreshed — a pane's `TERM`
 describes lrmux's own emulation, not the outer terminal's. This is not
 gated on `tmux_compat`; it benefits all panes. `set-environment`
 /`unset-environment` edit the same env manually.
+
+#### `capture-pane` targeting
+
+`lrmux capture-pane` accepts `-s <server|host:port>` to pick the server
+(local Unix-socket name or a TCP address) and `-t <target>` with these
+forms:
+
+- `sess` — session on the chosen server (`-s` or `default`).
+- `sess:N` — tmux-style session:window-index (`@N` also accepted).
+- `srv` — a bare running-server name captures its first session.
+- `srv:sess` — when `srv` names a running local server and the second
+  part is not a bare index, the first part is read as the server.
+- `srv:sess:N` — explicit three-part form.
+
+Lookups that miss return an error instead of an empty capture: the
+server replies with the available session/window names and a "did you
+mean …" suggestion for near matches (edit distance or prefix). If the
+missed session name is also a running server, the CLI hints at `-s`.
 
 ---
 

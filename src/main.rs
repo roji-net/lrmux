@@ -143,7 +143,8 @@ enum CliAction {
     KillWindow(cmd::Target),
     /// `capture-pane -t <target> [-p] [-c|--colors] [--format …] [--clipboard] [--file path]`
     CapturePane {
-        target: cmd::Target,
+        server: Option<String>,
+        target: Option<String>,
         print: bool,
         colors: bool,
         format: crate::server::CaptureFormat,
@@ -415,7 +416,14 @@ fn parse_args() -> CliAction {
                         && a[1..].contains('e')
                 });
             CliAction::CapturePane {
-                target: parsed.target(),
+                server: parsed
+                    .get("s")
+                    .or_else(|| parsed.get("server"))
+                    .map(|s| s.to_string()),
+                target: parsed
+                    .get("t")
+                    .or_else(|| parsed.get("target"))
+                    .map(|s| s.to_string()),
                 print: parsed.has("p") || parsed.has("print"),
                 colors,
                 format,
@@ -801,10 +809,11 @@ fn run() -> io::Result<()> {
                         return Ok(());
                     }
                 }
-                let msg = proto::encode_client(&ClientMsg::NewWindowIn {
-                    session: None,
-                    command,
-                });
+                // Target the pane's own session (exported as LRMUX_SESSION
+                // in "$id" form). Without it the server would pick its first
+                // session, which may not be the one this pane lives in.
+                let session = std::env::var("LRMUX_SESSION").ok();
+                let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
                 proto::send(&mut stream, &msg)?;
                 // Give the server time to process the message before closing.
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1250,13 +1259,22 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         CliAction::CapturePane {
+            server,
             target,
             print,
             colors,
             format,
             clipboard,
             file,
-        } => cli_capture_window(&target, format, colors, print, clipboard, file.as_deref()),
+        } => cli_capture_window(
+            server.as_deref(),
+            target.as_deref(),
+            format,
+            colors,
+            print,
+            clipboard,
+            file.as_deref(),
+        ),
         CliAction::SendKeys {
             target,
             keys,
@@ -1909,7 +1927,15 @@ fn kill_server(name: &str) -> io::Result<()> {
 
 /// CLI: create a new window in a session.
 fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
+    // Inside a pane, default to the pane's server (LRMUX_SERVER) and
+    // session (LRMUX_SESSION, "$id" form) — otherwise the window lands
+    // on server "default"/session 0 regardless of where lrmux ran.
+    let server = std::env::var("LRMUX_SERVER").unwrap_or_else(|_| "default".to_string());
+    let session = target
+        .session
+        .clone()
+        .or_else(|| std::env::var("LRMUX_SESSION").ok());
+    let mut stream = connect_to_server(&server)?;
     // Send Identify first (required by the protocol).
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
@@ -1932,12 +1958,97 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
         Err(e) => return Err(e),
     }
     // Send NewWindowIn.
-    let msg = proto::encode_client(&ClientMsg::NewWindowIn {
-        session: target.session.clone(),
-        command,
-    });
+    let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
     proto::send(&mut stream, &msg)?;
     Ok(())
+}
+
+/// Does `name` resolve to a live local server socket? (TCP endpoints
+/// come through `-s host:port`, not bare `-t` parts.)
+fn local_server_exists(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', ':']) && ipc::server_exists(&ipc::socket_path(name))
+}
+
+/// Resolved `capture-pane` target: optional server override, session
+/// name and window index (index only — names error out).
+#[derive(Default)]
+struct CaptureTarget {
+    server: Option<String>,
+    session: Option<String>,
+    window: Option<u8>,
+}
+
+/// Resolve `-t` into a `CaptureTarget`. Forms: `sess` (session on the
+/// selected/default server), `sess:win` (tmux-style session:index),
+/// `srv` (a bare running-server name → first session), `srv:sess`
+/// (when `srv` is a running local server and the second part is not a
+/// bare index), and the explicit `srv:sess:win` three-part form.
+fn resolve_capture_target(
+    server_flag: Option<&str>,
+    raw: Option<&str>,
+) -> Result<CaptureTarget, String> {
+    let mut server = server_flag.map(|s| s.to_string());
+    let mut session = None;
+    let mut window: Option<String> = None;
+    let t = raw.unwrap_or("");
+    if !t.is_empty() {
+        let parts: Vec<&str> = t.split(':').collect();
+        match parts.as_slice() {
+            [a] => {
+                if server.is_none() && local_server_exists(a) {
+                    server = Some(a.to_string());
+                } else {
+                    session = Some(a.to_string());
+                }
+            }
+            [a, b] => {
+                if server.is_none()
+                    && !b.is_empty()
+                    && !b.chars().all(|c| c.is_ascii_digit())
+                    && !b.starts_with('@')
+                    && local_server_exists(a)
+                {
+                    server = Some(a.to_string());
+                    session = Some(b.to_string());
+                } else if !b.is_empty() {
+                    session = Some(a.to_string());
+                    window = Some(b.to_string());
+                } else {
+                    session = Some(a.to_string());
+                }
+            }
+            [a, b, c, ..] => {
+                if server.is_none() {
+                    server = Some(a.to_string());
+                    session = Some(b.to_string());
+                    window = Some(c.to_string());
+                } else {
+                    session = Some(parts[..parts.len() - 1].join(":"));
+                    window = Some(c.to_string());
+                }
+            }
+            [] => {}
+        }
+    }
+    let window = match window {
+        None => None,
+        Some(w) => {
+            let w = w.strip_prefix('@').unwrap_or(&w);
+            match w.parse::<u8>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return Err(format!(
+                        "invalid window target '{w}' — use a window index (e.g. -t session:0)"
+                    ));
+                }
+            }
+        }
+    };
+    Ok(CaptureTarget {
+        server,
+        session,
+        window,
+    })
 }
 
 /// CLI: capture the content of a pane.
@@ -1947,72 +2058,65 @@ fn cli_new_window(target: &cmd::Target, command: Option<String>) -> io::Result<(
 /// - `--file <path>` writes the capture to that file
 /// - `--clipboard` copies via pbcopy / wl-copy / xclip / xsel
 fn cli_capture_window(
-    target: &cmd::Target,
+    server_flag: Option<&str>,
+    raw_target: Option<&str>,
     format: crate::server::CaptureFormat,
     colors: bool,
     print: bool,
     clipboard: bool,
     file: Option<&str>,
 ) -> io::Result<()> {
-    let mut stream = connect_to_server("default")?;
-    let (rows, cols) = (24u16, 80u16);
-    let msg = proto::encode_client(&ClientMsg::Identify {
-        rows,
-        cols,
-        attach: false,
-        auth_token: crate::config::effective_psk(),
-        env: Vec::new(),
-    });
-    proto::send(&mut stream, &msg)?;
-    match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::IdentifyAck { .. }) => {}
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected IdentifyAck",
-            ));
-        }
-        Err(e) => return Err(e),
-    }
-    let window = target.window.as_ref().and_then(|w| w.parse::<u8>().ok());
-    let msg = proto::encode_client(&ClientMsg::CaptureWindow {
-        session: target.session.clone(),
-        window,
-        format: format.as_u8(),
+    let target = match resolve_capture_target(server_flag, raw_target) {
+        Ok(t) => t,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+    };
+    // `-s host:port` connects over TCP; a bare name is a local socket.
+    let (server_name, tcp) = match target.server.as_deref() {
+        Some(s) if s.contains(':') => (s.to_string(), Some(s)),
+        Some(s) => (s.to_string(), None),
+        None => ("default".to_string(), None),
+    };
+    let session = target.session;
+    let content = client::capture_pane(
+        &server_name,
+        tcp,
+        session.clone(),
+        target.window,
+        format.as_u8(),
         colors,
-        // Palette comes from the pane (OSC 10/11 answered for that PTY),
-        // not from this CLI's TTY — they can differ.
-        term_fg: None,
-        term_bg: None,
-    });
-    proto::send(&mut stream, &msg)?;
-    // Wait for WindowCapture response.
-    loop {
-        match proto::decode_server(&mut stream) {
-            Ok(ServerMsg::WindowCapture { content }) => {
-                let to_stdout = print || (file.is_none() && !clipboard);
-                if to_stdout {
-                    print!("{content}");
-                    if !content.ends_with('\n') {
-                        println!();
-                    }
-                }
-                if let Some(path) = file {
-                    std::fs::write(path, &content)?;
-                }
-                if clipboard && !client::copy_mode::copy_to_clipboard(&content) {
-                    return Err(io::Error::other(
-                        "clipboard: no pbcopy/wl-copy/xclip/xsel found",
-                    ));
-                }
-                return Ok(());
-            }
-            Ok(_) => {
-                // Ignore other messages (StatusBarUpdate, etc.) and keep waiting.
-            }
-            Err(e) => return Err(e),
+    )
+    .map_err(|e| {
+        // Session miss on the default server while the name matches a
+        // running server → point at the server syntax.
+        if let Some(s) = &session
+            && e.to_string().contains("no session")
+            && local_server_exists(s)
+        {
+            io::Error::new(
+                e.kind(),
+                format!("{e} — '{s}' is also a running server; try `-s {s}` or `-t {s}:<session>`"),
+            )
+        } else {
+            e
+        }
+    })?;
+
+    let to_stdout = print || (file.is_none() && !clipboard);
+    if to_stdout {
+        print!("{content}");
+        if !content.ends_with('\n') {
+            println!();
         }
     }
+    if let Some(path) = file {
+        std::fs::write(path, &content)?;
+    }
+    if clipboard && !client::copy_mode::copy_to_clipboard(&content) {
+        return Err(io::Error::other(
+            "clipboard: no pbcopy/wl-copy/xclip/xsel found",
+        ));
+    }
+    Ok(())
 }
 
 /// CLI: send keys to a pane's PTY.

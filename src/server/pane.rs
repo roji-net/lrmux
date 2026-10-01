@@ -95,6 +95,11 @@ impl Pane {
         // Allocate the pane id before spawn so the tmux-compat env can carry it.
         let id = PANE_ID.fetch_add(1, Ordering::Relaxed);
         let mut extra_env = tmux_compat_env(session_id, id);
+        // Own session in tmux $id target form: lets a nested `lrmux`
+        // (NewWindowIn, etc.) address the session that spawned the pane
+        // rather than defaulting to the server's first session. Ids are
+        // stable across renames, unlike the session name.
+        extra_env.push(("LRMUX_SESSION".into(), format!("${session_id}")));
         extra_env.extend(env.iter().cloned());
         let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd, &extra_env);
 

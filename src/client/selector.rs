@@ -357,6 +357,9 @@ fn name_prompt(
     let _raw = terminal::enter_raw_mode().ok()?;
     let mut stdout = io::stdout();
     let mut name = default.to_string();
+    // The prefilled default starts "selected": the first printable key
+    // replaces it entirely (Save-As dialog style).
+    let mut selected_all = !default.is_empty();
     loop {
         let _ = write!(stdout, "\x1b[2J\x1b[H");
         let _ = write!(stdout, "{title}\r\n");
@@ -379,9 +382,18 @@ fn name_prompt(
             }
             0x03 | 0x1b => return None,
             0x7f | 0x08 => {
-                name.pop();
+                if selected_all {
+                    name.clear();
+                    selected_all = false;
+                } else {
+                    name.pop();
+                }
             }
             b if b.is_ascii_graphic() || b == b' ' => {
+                if selected_all {
+                    name.clear();
+                    selected_all = false;
+                }
                 name.push(b as char);
             }
             _ => {}
@@ -454,6 +466,9 @@ fn interactive_selector(
         .and_then(|h| entries.iter().position(|e| matches_hint(e, h)))
         .unwrap_or(0);
     let mut query: String = String::new();
+    // `/` enters filter mode: while filtering, letters/digits edit the
+    // query instead of firing bindings (so "fin" no longer hits `n`).
+    let mut filtering = false;
     let mut flash: Option<String> = None;
 
     let filtered = |q: &str| -> Vec<usize> {
@@ -591,11 +606,18 @@ fn interactive_selector(
         if let Some(msg) = &flash {
             write!(stdout, "\x1b[31m{msg}\x1b[0m\r\n")?;
         }
-        write!(
-            stdout,
-            "\x1b[90mEnter=join  0-9=jump  n=new session  N=new server  q=quit\x1b[0m\r\n"
-        )?;
-        write!(stdout, "filter> {}", query)?;
+        if filtering {
+            write!(stdout, "filter> {query}")?;
+        } else {
+            write!(
+                stdout,
+                "\x1b[90mEnter=join  /=filter  C=capture  V=view  n=new session  N=new server  q=quit\x1b[0m"
+            )?;
+            if !query.is_empty() {
+                write!(stdout, "  \x1b[90mfilter: {query}\x1b[0m")?;
+            }
+        }
+        write!(stdout, "\r\n")?;
         stdout.flush()?;
 
         let mut buf = [0u8; 1];
@@ -604,6 +626,51 @@ fn interactive_selector(
             break;
         }
         let key = buf[0];
+
+        // In filter mode every printable key edits the query; Esc clears
+        // the filter and leaves the mode; Enter picks the selection.
+        if filtering {
+            match key {
+                b'\r' | b'\n' => {
+                    if let Some(&idx) = filt.get(selected) {
+                        let e = &entries[idx];
+                        if let Some(err) = &e.unreachable {
+                            let addr = e.tcp.as_deref().unwrap_or("?");
+                            flash = Some(format!("cannot reach {} @ {addr}: {err}", e.server));
+                            continue;
+                        }
+                        return Ok(entry_choice(e));
+                    }
+                }
+                0x1b => {
+                    let mut seq = [0u8; 2];
+                    let n2 = unsafe {
+                        libc::read(io::stdin().as_raw_fd(), seq.as_mut_ptr() as *mut _, 2)
+                    };
+                    if n2 == 2 && seq[0] == b'[' {
+                        match seq[1] {
+                            b'A' if selected > 0 => selected -= 1,
+                            b'B' if selected + 1 < filt.len() => selected += 1,
+                            _ => {}
+                        }
+                    } else {
+                        query.clear();
+                        filtering = false;
+                    }
+                }
+                0x7f | 0x08 => {
+                    query.pop();
+                    selected = 0;
+                }
+                0x03 => return Ok(SelectorResult::Quit),
+                b if b >= 0x20 => {
+                    query.push(b as char);
+                    selected = 0;
+                }
+                _ => {}
+            }
+            continue;
+        }
 
         match key {
             b'\r' | b'\n' => {
@@ -614,18 +681,7 @@ fn interactive_selector(
                         flash = Some(format!("cannot reach {} @ {addr}: {err}", e.server));
                         continue;
                     }
-                    if e.session == "(no sessions)" {
-                        return Ok(SelectorResult::NewSession {
-                            server: e.server.clone(),
-                            name: None,
-                            tcp: e.tcp.clone(),
-                        });
-                    }
-                    return Ok(SelectorResult::Attach {
-                        server: e.server.clone(),
-                        session: e.session.clone(),
-                        tcp: e.tcp.clone(),
-                    });
+                    return Ok(entry_choice(e));
                 }
             }
             b'0'..=b'9' => {
@@ -638,19 +694,11 @@ fn interactive_selector(
                         selected = jump;
                         continue;
                     }
-                    if e.session == "(no sessions)" {
-                        return Ok(SelectorResult::NewSession {
-                            server: e.server.clone(),
-                            name: None,
-                            tcp: e.tcp.clone(),
-                        });
-                    }
-                    return Ok(SelectorResult::Attach {
-                        server: e.server.clone(),
-                        session: e.session.clone(),
-                        tcp: e.tcp.clone(),
-                    });
+                    return Ok(entry_choice(e));
                 }
+            }
+            b'/' => {
+                filtering = true;
             }
             b'q' | 0x03 => {
                 return Ok(SelectorResult::Quit);
@@ -665,12 +713,25 @@ fn interactive_selector(
                         b'B' if selected + 1 < filt.len() => selected += 1,
                         _ => {}
                     }
+                } else if !query.is_empty() {
+                    query.clear();
+                    selected = 0;
                 } else {
                     return Ok(SelectorResult::Quit);
                 }
             }
             b'j' if selected + 1 < filt.len() => selected += 1,
             b'k' => selected = selected.saturating_sub(1),
+            b'C' => {
+                if let Some(&idx) = filt.get(selected) {
+                    capture_entry(&mut flash, &entries[idx]);
+                }
+            }
+            b'V' => {
+                if let Some(&idx) = filt.get(selected) {
+                    view_entry(&mut flash, &entries[idx]);
+                }
+            }
             b'n' => {
                 let (server, tcp) = filt
                     .get(selected)
@@ -710,26 +771,262 @@ fn interactive_selector(
                     return Ok(SelectorResult::NewServer { name });
                 }
             }
-            0x7f | 0x08 => {
-                query.pop();
-                selected = 0;
-            }
-            b if b.is_ascii_alphabetic()
-                || b == b'/'
-                || b == b'-'
-                || b == b'_'
-                || b == b'.'
-                || b == b' '
-                || b == b'@' =>
-            {
-                query.push(b as char);
-                selected = 0;
-            }
             _ => {}
         }
     }
 
     Ok(SelectorResult::Quit)
+}
+
+/// SelectorResult for a chosen entry — attach, or new session when the
+/// row is the "(no sessions)" placeholder.
+fn entry_choice(e: &Entry) -> SelectorResult {
+    if e.session == "(no sessions)" {
+        SelectorResult::NewSession {
+            server: e.server.clone(),
+            name: None,
+            tcp: e.tcp.clone(),
+        }
+    } else {
+        SelectorResult::Attach {
+            server: e.server.clone(),
+            session: e.session.clone(),
+            tcp: e.tcp.clone(),
+        }
+    }
+}
+
+/// `C` — prompt for a filename and save the pane's capture; the file
+/// extension picks the format (.ansi/.html/.md → colored formats,
+/// anything else → plain text).
+fn capture_entry(flash: &mut Option<String>, e: &Entry) {
+    if let Some(err) = &e.unreachable {
+        *flash = Some(format!("cannot reach {}: {err}", e.server));
+        return;
+    }
+    if e.session == "(no sessions)" {
+        *flash = Some(format!("server '{}' has no sessions", e.server));
+        return;
+    }
+    let default = format!(
+        "{}-{}.ansi",
+        sanitize_filename(&e.server),
+        sanitize_filename(&e.session)
+    );
+    let Some((path, _)) = name_prompt(
+        "lrmux — capture pane",
+        "Save to",
+        &default,
+        "Enter=save (.ansi .html .md .txt pick the format)  Esc=cancel",
+        None,
+    ) else {
+        return;
+    };
+    let format = capture_format_for_path(&path);
+    match super::capture_pane(
+        &e.server,
+        e.tcp.as_deref(),
+        Some(e.session.clone()),
+        None,
+        format.as_u8(),
+        true,
+    ) {
+        Ok(content) => match std::fs::write(&path, &content) {
+            Ok(()) => *flash = Some(format!("saved {} bytes → {path}", content.len())),
+            Err(err) => *flash = Some(format!("write {path}: {err}")),
+        },
+        Err(err) => *flash = Some(format!("capture: {err}")),
+    }
+}
+
+/// `V` — show the pane's live content in a scrollable popup without
+/// attaching.
+fn view_entry(flash: &mut Option<String>, e: &Entry) {
+    if let Some(err) = &e.unreachable {
+        *flash = Some(format!("cannot reach {}: {err}", e.server));
+        return;
+    }
+    if e.session == "(no sessions)" {
+        *flash = Some(format!("server '{}' has no sessions", e.server));
+        return;
+    }
+    match super::capture_pane(
+        &e.server,
+        e.tcp.as_deref(),
+        Some(e.session.clone()),
+        None,
+        crate::server::CaptureFormat::Ansi.as_u8(),
+        true,
+    ) {
+        Ok(content) => {
+            let title = format!("{} — {}", e.session_cell(), e.status_label());
+            let _ = view_popup(&title, &content);
+        }
+        Err(err) => *flash = Some(format!("capture: {err}")),
+    }
+}
+
+fn capture_format_for_path(path: &str) -> crate::server::CaptureFormat {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ansi") => crate::server::CaptureFormat::Ansi,
+        Some("html") | Some("htm") => crate::server::CaptureFormat::Html,
+        Some("md") | Some("markdown") => crate::server::CaptureFormat::Markdown,
+        _ => crate::server::CaptureFormat::Ascii,
+    }
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Fullscreen scrollable viewer for an ANSI capture. j/k/↑↓ scroll,
+/// d/u half-page, g/G ends, q/Esc/Enter close.
+fn view_popup(title: &str, content: &str) -> io::Result<()> {
+    let (rows, cols) = terminal::get_size();
+    let lines: Vec<&str> = content.lines().collect();
+    let view_rows = (rows as usize).saturating_sub(3);
+    let mut scroll = 0usize;
+    let mut stdout = io::stdout();
+    let max_scroll = lines.len().saturating_sub(view_rows);
+    loop {
+        write!(stdout, "\x1b[2J\x1b[H")?;
+        write!(stdout, "\x1b[1m{title}\x1b[0m\r\n")?;
+        write!(stdout, "\x1b[90m{}\x1b[0m\r\n", "─".repeat(cols as usize))?;
+        for line in lines.iter().skip(scroll).take(view_rows) {
+            write!(stdout, "{}\x1b[0m\r\n", truncate_ansi(line, cols as usize))?;
+        }
+        let pos = if max_scroll == 0 {
+            "all".to_string()
+        } else {
+            format!(
+                "{}/{}",
+                scroll + view_rows.min(lines.len() - scroll),
+                lines.len()
+            )
+        };
+        write!(
+            stdout,
+            "\x1b[90mj/k/↑↓ scroll  d/u half-page  g/G top/end  q/Esc close   {pos}\x1b[0m"
+        )?;
+        stdout.flush()?;
+
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(io::stdin().as_raw_fd(), buf.as_mut_ptr() as *mut _, 1) };
+        if n <= 0 {
+            return Ok(());
+        }
+        match buf[0] {
+            b'q' | 0x03 | b'\r' | b'\n' => return Ok(()),
+            b'j' => scroll = (scroll + 1).min(max_scroll),
+            b'k' => scroll = scroll.saturating_sub(1),
+            b'd' => scroll = (scroll + view_rows / 2).min(max_scroll),
+            b'u' => scroll = scroll.saturating_sub(view_rows / 2),
+            b'g' => scroll = 0,
+            b'G' => scroll = max_scroll,
+            0x1b => {
+                let mut seq = [0u8; 2];
+                let n2 =
+                    unsafe { libc::read(io::stdin().as_raw_fd(), seq.as_mut_ptr() as *mut _, 2) };
+                if n2 == 2 && seq[0] == b'[' {
+                    match seq[1] {
+                        b'A' => scroll = scroll.saturating_sub(1),
+                        b'B' => scroll = (scroll + 1).min(max_scroll),
+                        b'5' | b'6' => {
+                            // PageUp/PageDown: trailing '~'
+                            let mut t = [0u8; 1];
+                            let _ = unsafe {
+                                libc::read(io::stdin().as_raw_fd(), t.as_mut_ptr() as *mut _, 1)
+                            };
+                            if seq[1] == b'5' {
+                                scroll = scroll.saturating_sub(view_rows);
+                            } else {
+                                scroll = (scroll + view_rows).min(max_scroll);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Truncate a line that may contain ANSI escapes to `width` visible
+/// characters, copying escape sequences verbatim and always ending
+/// with a reset (caller appends one too — belt and suspenders).
+fn truncate_ansi(line: &str, width: usize) -> String {
+    let cs: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut vis = 0usize;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        i += 1;
+        if c != '\x1b' {
+            if vis >= width {
+                break;
+            }
+            out.push(c);
+            vis += 1;
+            continue;
+        }
+        out.push('\x1b');
+        match cs.get(i).copied() {
+            Some('[') => {
+                out.push('[');
+                i += 1;
+                // CSI: copy until the final byte (@..=~).
+                while i < cs.len() {
+                    let c2 = cs[i];
+                    out.push(c2);
+                    i += 1;
+                    if ('@'..='~').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                out.push(']');
+                i += 1;
+                // OSC: copy until BEL or ST.
+                while i < cs.len() {
+                    let c2 = cs[i];
+                    out.push(c2);
+                    i += 1;
+                    if c2 == '\x07' {
+                        break;
+                    }
+                    if c2 == '\x1b' && cs.get(i) == Some(&'\\') {
+                        out.push('\\');
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            Some(other) => {
+                out.push(other);
+                i += 1;
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// Simple subsequence fuzzy match: each char of `query` must appear in `text` in order.
