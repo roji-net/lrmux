@@ -1574,63 +1574,23 @@ pub fn run(
                                             window,
                                             keys,
                                         } => {
-                                            crate::log::info(&format!(
-                                                "SendKeys: session={:?} window={:?} keys_len={}",
-                                                session,
+                                            let (ok, reason) = handle_send_keys(
+                                                &mut sessions,
+                                                clients[client_idx].active_window,
+                                                &session,
                                                 window,
+                                                &keys,
+                                            );
+                                            crate::log::info(&format!(
+                                                "SendKeys: session={session:?} window={window:?} keys_len={} ok={ok} {reason}",
                                                 keys.len()
                                             ));
-                                            // Find the target session by name, or use the first.
-                                            let si = match session {
-                                                Some(ref name) => {
-                                                    sessions.iter().position(|s| &s.name == name)
-                                                }
-                                                None => {
-                                                    if sessions.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(0)
-                                                    }
-                                                }
-                                            };
-                                            if let Some(si) = si {
-                                                let wi = match window {
-                                                    Some(w) => Some(w as usize),
-                                                    None => Some(clients[client_idx].active_window),
-                                                };
-                                                if let Some(wi) = wi
-                                                    && wi < sessions[si].windows.len()
-                                                {
-                                                    crate::log::info(&format!(
-                                                        "SendKeys: writing {} bytes to session '{}' window {}",
-                                                        keys.len(),
-                                                        sessions[si].name,
-                                                        wi
-                                                    ));
-                                                    let translated = translate_cursor_keys(
-                                                        &keys,
-                                                        sessions[si].windows[wi]
-                                                            .pane
-                                                            .grid
-                                                            .app_cursor_keys,
-                                                    );
-                                                    let _ = sessions[si].windows[wi]
-                                                        .pane
-                                                        .write_input(&translated);
-                                                } else {
-                                                    crate::log::warn(&format!(
-                                                        "SendKeys: window index {} out of range (session '{}' has {} windows)",
-                                                        wi.unwrap_or(0),
-                                                        sessions[si].name,
-                                                        sessions[si].windows.len()
-                                                    ));
-                                                }
-                                            } else {
-                                                crate::log::warn(&format!(
-                                                    "SendKeys: session {:?} not found",
-                                                    session
-                                                ));
-                                            }
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::SendKeysAck {
+                                                    ok,
+                                                    reason,
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
                                         }
                                         ClientMsg::GetLog => {
                                             let lines = crate::log::get_ring_log();
@@ -1873,39 +1833,20 @@ pub fn run(
                                 window,
                                 keys,
                             } => {
-                                crate::log::info(&format!(
-                                    "SendKeys: session={:?} window={:?} keys_len={} (from POLLHUP)",
-                                    session,
+                                let (ok, reason) = handle_send_keys(
+                                    &mut sessions,
+                                    clients[client_idx].active_window,
+                                    &session,
                                     window,
+                                    &keys,
+                                );
+                                crate::log::info(&format!(
+                                    "SendKeys: session={session:?} window={window:?} keys_len={} ok={ok} (from POLLHUP) {reason}",
                                     keys.len()
                                 ));
-                                let si = match session {
-                                    Some(ref name) => sessions.iter().position(|s| &s.name == name),
-                                    None => Some(0),
-                                };
-                                if let Some(si) = si
-                                    && let Some(session) = sessions.get_mut(si)
-                                {
-                                    let wi = match window {
-                                        Some(w) => Some(w as usize),
-                                        None => Some(clients[client_idx].active_window),
-                                    };
-                                    if let Some(wi) = wi
-                                        && let Some(window) = session.windows.get_mut(wi)
-                                    {
-                                        let translated = translate_cursor_keys(
-                                            &keys,
-                                            window.pane.grid.app_cursor_keys,
-                                        );
-                                        let _ = window.pane.write_input(&translated);
-                                        crate::log::info(&format!(
-                                            "SendKeys: writing {} bytes to session '{}' window {}",
-                                            translated.len(),
-                                            session.name,
-                                            wi
-                                        ));
-                                    }
-                                }
+                                let msg =
+                                    proto::encode_server(&ServerMsg::SendKeysAck { ok, reason });
+                                let _ = client_send(&mut clients[client_idx], &msg);
                             }
                             ClientMsg::SelectSession { name } => {
                                 if let Some(idx) = sessions.iter().position(|s| s.name == name) {
@@ -3140,6 +3081,56 @@ fn session_window_names(session: &Session) -> String {
         .map(|(i, w)| format!("{i}:{}", w.name))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Resolve a SendKeys target and write the keys (translated for the
+/// pane's cursor-key mode) to the pane's PTY. Returns `(ok, reason)`
+/// for the `SendKeysAck` reply — `ok=false` covers unknown session,
+/// window index out of range, and PTY write failure.
+fn handle_send_keys(
+    sessions: &mut [Session],
+    active_window: usize,
+    session: &Option<String>,
+    window: Option<u8>,
+    keys: &[u8],
+) -> (bool, String) {
+    let si = match session {
+        Some(name) => match sessions.iter().position(|s| &s.name == name) {
+            Some(i) => i,
+            None => return (false, no_session_error(session, sessions)),
+        },
+        None => {
+            if sessions.is_empty() {
+                return (false, "no sessions".into());
+            }
+            0
+        }
+    };
+    let wi = match window {
+        Some(w) => w as usize,
+        None => active_window,
+    };
+    let sess = &mut sessions[si];
+    if wi >= sess.windows.len() {
+        return (
+            false,
+            format!(
+                "session '{}' has no window {}; windows: {}",
+                sess.name,
+                wi,
+                session_window_names(sess)
+            ),
+        );
+    }
+    let translated = translate_cursor_keys(keys, sess.windows[wi].pane.grid.app_cursor_keys);
+    let n = translated.len();
+    match sess.windows[wi].pane.write_input(&translated) {
+        Ok(()) => (
+            true,
+            format!("wrote {n} bytes to session '{}' window {wi}", sess.name),
+        ),
+        Err(e) => (false, format!("pty write failed: {e}")),
+    }
 }
 
 /// Closest candidate by edit distance; also accepts a prefix match so

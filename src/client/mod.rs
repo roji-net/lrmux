@@ -1282,7 +1282,8 @@ pub fn run(
                         // inside an attached session.
                         ServerMsg::PeerList { .. }
                         | ServerMsg::RegisterAck { .. }
-                        | ServerMsg::RelayAck { .. } => {}
+                        | ServerMsg::RelayAck { .. }
+                        | ServerMsg::SendKeysAck { .. } => {}
                     }
                 }
                 // GridUpdate/Snapshot carry the child's mouse flags — keep

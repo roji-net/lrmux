@@ -2186,12 +2186,39 @@ fn cli_send_keys(
         keys: keys.to_vec(),
     });
     proto::send(&mut stream, &msg)?;
-    // Give the server time to process the message before we close the socket.
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    if !quiet {
-        eprintln!("lrmux: send-keys: message sent");
+    // Wait for the server's SendKeysAck — the command's exit code must
+    // reflect whether the keys actually reached a pane. Bounded so an
+    // older server (no ack support) fails instead of hanging.
+    stream.set_nonblocking(true)?;
+    let ack = {
+        let mut rd =
+            crate::ipc::stream::DeadlineReader::new(&mut stream, std::time::Duration::from_secs(3));
+        loop {
+            match proto::decode_server(&mut rd) {
+                Ok(ServerMsg::SendKeysAck { ok, reason }) => break Ok((ok, reason)),
+                Ok(_) => continue, // unrelated messages (e.g. status bar)
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    match ack {
+        Ok((true, reason)) => {
+            if !quiet {
+                eprintln!("lrmux: send-keys: {reason}");
+            }
+            Ok(())
+        }
+        Ok((false, reason)) => Err(io::Error::other(reason)),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "send-keys: server did not acknowledge within 3s (older server?)",
+        )),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("send-keys: no acknowledgment from server: {e}"),
+        )),
     }
-    Ok(())
 }
 
 /// Bootstrap for a freshly forked server: first session/window options.

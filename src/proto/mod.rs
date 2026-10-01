@@ -257,6 +257,10 @@ pub enum ServerMsg {
     /// Acknowledge RelayOpen. On `ok` the connection becomes a raw byte
     /// pipe to the requested address — no more framed messages.
     RelayAck { ok: bool, reason: String },
+    /// Acknowledge SendKeys — `ok=false` when the target session/window
+    /// did not resolve or the PTY write failed (`reason` explains).
+    /// Missing from older servers; clients should bound the wait.
+    SendKeysAck { ok: bool, reason: String },
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -308,6 +312,7 @@ const S_PSK_UPDATED: u8 = 0x1c;
 const S_PEER_LIST: u8 = 0x1d;
 const S_REGISTER_ACK: u8 = 0x1e;
 const S_RELAY_ACK: u8 = 0x1f;
+const S_SEND_KEYS_ACK: u8 = 0x20;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -767,6 +772,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
         }
         ServerMsg::RelayAck { ok, reason } => {
             payload.push(S_RELAY_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
+        }
+        ServerMsg::SendKeysAck { ok, reason } => {
+            payload.push(S_SEND_KEYS_ACK);
             payload.push(if *ok { 1 } else { 0 });
             payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             payload.extend_from_slice(reason.as_bytes());
@@ -1403,6 +1414,11 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let reason = read_len_string(&mut r)?;
             Ok(ServerMsg::RelayAck { ok, reason })
         }
+        S_SEND_KEYS_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::SendKeysAck { ok, reason })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -1679,6 +1695,26 @@ mod tests {
             });
             match decode_server(&mut &ack[..]).unwrap() {
                 ServerMsg::RelayAck { ok: got, reason: r } => {
+                    assert_eq!(got, ok);
+                    assert_eq!(r, reason);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn send_keys_ack_roundtrip() {
+        for (ok, reason) in [
+            (true, "wrote 5 bytes to session 'main' window 0"),
+            (false, "no session 'nope' on server 'default'"),
+        ] {
+            let bytes = encode_server(&ServerMsg::SendKeysAck {
+                ok,
+                reason: reason.into(),
+            });
+            match decode_server(&mut &bytes[..]).unwrap() {
+                ServerMsg::SendKeysAck { ok: got, reason: r } => {
                     assert_eq!(got, ok);
                     assert_eq!(r, reason);
                 }
