@@ -122,7 +122,16 @@ pub fn parse_flags(args: &[String]) -> ParsedCmd {
                 // Known boolean flags: d (detach), p (print), q (quiet), P (detached)
                 if matches!(
                     rest,
-                    "detach" | "print" | "quiet" | "detached" | "colors" | "clipboard" | "headless"
+                    "detach"
+                        | "print"
+                        | "quiet"
+                        | "detached"
+                        | "colors"
+                        | "clipboard"
+                        | "headless"
+                        | "shift"
+                        | "alt"
+                        | "ctrl"
                 ) {
                     cmd.flags.insert(rest.to_string(), String::new());
                 } else if i + 1 < args.len() && !args[i + 1].starts_with('-') {
@@ -315,6 +324,32 @@ Up, Down, Left, Right, Home, End, PageUp, PageDown, M-x.\n\
 Anything else is sent as literal text.",
     },
     CommandSpec {
+        name: "send-event",
+        aliases: &["sende"],
+        summary: "Send a synthetic mouse/focus event to a pane",
+        usage: "    lrmux send-event -t <target> <event> [<x> <y>] [options]",
+        body: "\
+-t, --target <target>   Pane to write\n\
+<x> <y>                 1-based cell position (default: pane cursor)\n\
+\n\
+Events:\n\
+  click                 press + release (see --button, --count)\n\
+  mousedown, mouseup    button press / release\n\
+  mousemove, hover      pointer motion (no button)\n\
+  drag                  motion with --button held\n\
+  wheel-up, wheel-down, wheel-left, wheel-right\n\
+  focus-in, focus-out   focus reporting (mode 1004) events\n\
+\n\
+--button <b>            left|middle|right for click/drag (default: left)\n\
+--shift --alt --ctrl    Modifier keys\n\
+--count <n>             Repeat the event n times\n\
+-q, --quiet             Suppress stderr\n\
+\n\
+Mouse reports are encoded in the pane's negotiated format\n\
+(X10/UTF-8/SGR); the server warns when the pane has not enabled\n\
+mouse tracking. Useful for driving and debugging TUI apps.",
+    },
+    CommandSpec {
         name: "capture-pane",
         aliases: &["capturep", "capture-window"],
         summary: "Print a pane's contents",
@@ -449,6 +484,93 @@ pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
     COMMANDS
         .iter()
         .find(|c| c.name == name || c.aliases.contains(&name))
+}
+
+/// Build the wire events for `send-event` from parsed flags:
+///   <event> [<x> <y>] [--button <b>] [--shift] [--alt] [--ctrl] [--count <n>]
+///
+/// Mouse names map to X10/SGR cb bits; "click" expands to press+release.
+/// Coords are 1-based; omitted coords send 0, which the server resolves
+/// to the pane's cursor cell. Shared by the CLI and control mode.
+pub fn build_input_events(parsed: &ParsedCmd) -> Result<Vec<crate::proto::InputEvent>, String> {
+    use crate::proto::{EV_FOCUS_IN, EV_FOCUS_OUT, EV_MOUSE, InputEvent};
+
+    let name = parsed.positional.first().map(|s| s.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return Err("usage: send-event <event> [<x> <y>]".into());
+    }
+    let mods: u8 = (parsed.has("shift") as u8) * 4
+        + (parsed.has("alt") as u8) * 8
+        + (parsed.has("ctrl") as u8) * 16;
+    let button: u8 = match parsed
+        .get("button")
+        .or_else(|| parsed.get("b"))
+        .unwrap_or("left")
+    {
+        "left" | "l" | "0" => 0,
+        "middle" | "m" | "1" => 1,
+        "right" | "r" | "2" => 2,
+        other => return Err(format!("unknown --button '{other}' (left|middle|right)")),
+    };
+    let count = parsed
+        .get("count")
+        .or_else(|| parsed.get("n"))
+        .map(|s| s.parse::<u32>())
+        .transpose()
+        .map_err(|_| "invalid --count".to_string())?
+        .unwrap_or(1)
+        .clamp(1, 255);
+
+    let coord = |idx: usize| -> Result<u16, String> {
+        match parsed.positional.get(idx) {
+            Some(s) => s
+                .parse::<u16>()
+                .map_err(|_| format!("invalid coordinate '{s}'")),
+            None => Ok(0),
+        }
+    };
+    let (x, y) = (coord(1)?, coord(2)?);
+    let mouse = |cb: u8, release: bool| InputEvent {
+        kind: EV_MOUSE,
+        cb: cb | mods,
+        x,
+        y,
+        release,
+    };
+    let focus = |kind: u8| InputEvent {
+        kind,
+        cb: 0,
+        x: 0,
+        y: 0,
+        release: false,
+    };
+
+    let mut events = Vec::new();
+    for _ in 0..count {
+        match name {
+            "focus-in" | "focus" => events.push(focus(EV_FOCUS_IN)),
+            "focus-out" | "blur" => events.push(focus(EV_FOCUS_OUT)),
+            "click" | "mouseclick" => {
+                events.push(mouse(button, false));
+                events.push(mouse(button, true));
+            }
+            "mousedown" | "press" => events.push(mouse(button, false)),
+            "mouseup" | "release" => events.push(mouse(button, true)),
+            "mousemove" | "hover" | "motion" => events.push(mouse(0x20 | 0x03, false)),
+            "drag" => events.push(mouse(0x20 | button, false)),
+            "wheel-up" | "wheelup" | "wheel" => events.push(mouse(64, false)),
+            "wheel-down" | "wheeldown" => events.push(mouse(65, false)),
+            "wheel-left" => events.push(mouse(66, false)),
+            "wheel-right" => events.push(mouse(67, false)),
+            _ => {
+                return Err(format!(
+                    "unknown event '{name}' (click, mousedown, mouseup, mousemove, \
+                     drag, wheel-up|down|left|right, focus-in, focus-out)"
+                ));
+            }
+        }
+    }
+    Ok(events)
 }
 
 /// `new-session` should create the session and return, not attach.
@@ -816,5 +938,96 @@ mod tests {
         assert_eq!(canonical_name("send"), "send-keys");
         assert_eq!(canonical_name("show"), "show-option");
         assert_eq!(canonical_name("new"), "new-session");
+    }
+
+    #[test]
+    fn send_event_click_expands_to_press_release() {
+        use crate::proto::EV_MOUSE;
+        let parsed = parse_flags(&["click".into(), "10".into(), "5".into()]);
+        let events = build_input_events(&parsed).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, EV_MOUSE);
+        assert_eq!(events[0].cb, 0); // left button
+        assert_eq!((events[0].x, events[0].y), (10, 5));
+        assert!(!events[0].release);
+        assert!(events[1].release);
+        assert_eq!(events[1].cb, 0);
+    }
+
+    #[test]
+    fn send_event_buttons_mods_and_wheel() {
+        use crate::proto::EV_MOUSE;
+
+        let parsed = parse_flags(&[
+            "--button".into(),
+            "right".into(),
+            "mousedown".into(),
+            "3".into(),
+            "2".into(),
+        ]);
+        let events = build_input_events(&parsed).unwrap();
+        assert_eq!(events[0].cb, 2);
+        assert_eq!(events[0].kind, EV_MOUSE);
+        assert!(!events[0].release);
+
+        // Modifiers fold into cb: shift=4, alt=8, ctrl=16.
+        let parsed = parse_flags(&[
+            "--shift".into(),
+            "--ctrl".into(),
+            "wheel-down".into(),
+            "1".into(),
+            "1".into(),
+        ]);
+        let events = build_input_events(&parsed).unwrap();
+        assert_eq!(events[0].cb, 65 | 4 | 16);
+
+        // Button aliases.
+        for (b, want) in [("l", 0), ("middle", 1), ("r", 2), ("2", 2)] {
+            let parsed = parse_flags(&["-b".into(), b.into(), "mouseup".into()]);
+            let events = build_input_events(&parsed).unwrap();
+            assert_eq!(events[0].cb, want, "button {b}");
+            assert!(events[0].release);
+        }
+    }
+
+    #[test]
+    fn send_event_motion_focus_and_defaults() {
+        use crate::proto::{EV_FOCUS_IN, EV_FOCUS_OUT, EV_MOUSE};
+
+        // Omitted coords encode 0 — the server maps them to the cursor cell.
+        let parsed = parse_flags(&["hover".into()]);
+        let events = build_input_events(&parsed).unwrap();
+        assert_eq!(events[0].kind, EV_MOUSE);
+        assert_eq!(events[0].cb, 0x20 | 0x03); // motion bit, no-button
+        assert_eq!((events[0].x, events[0].y), (0, 0));
+
+        let parsed = parse_flags(&["drag".into(), "4".into(), "4".into()]);
+        let events = build_input_events(&parsed).unwrap();
+        assert_eq!(events[0].cb, 0x20); // motion bit + left button
+
+        for (name, want) in [("focus-in", EV_FOCUS_IN), ("blur", EV_FOCUS_OUT)] {
+            let parsed = parse_flags(&[name.into()]);
+            let events = build_input_events(&parsed).unwrap();
+            assert_eq!(events[0].kind, want);
+            assert_eq!((events[0].cb, events[0].x, events[0].y), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn send_event_count_and_errors() {
+        let parsed = parse_flags(&["--count".into(), "3".into(), "click".into()]);
+        assert_eq!(build_input_events(&parsed).unwrap().len(), 6);
+
+        assert!(build_input_events(&parse_flags(&[])).is_err());
+        assert!(build_input_events(&parse_flags(&["bogus".into()])).is_err());
+        assert!(
+            build_input_events(&parse_flags(&[
+                "--button".into(),
+                "pinky".into(),
+                "click".into()
+            ]))
+            .is_err()
+        );
+        assert!(build_input_events(&parse_flags(&["click".into(), "notanum".into()])).is_err());
     }
 }

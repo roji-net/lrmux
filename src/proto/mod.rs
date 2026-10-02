@@ -126,6 +126,15 @@ pub enum ClientMsg {
         window: Option<u8>,
         keys: Vec<u8>,
     },
+    /// Inject synthetic input events into a window's PTY (CLI: send-event).
+    /// Mouse reports are encoded server-side in the pane's negotiated
+    /// format (X10/UTF-8/SGR). If session is None, uses the first session.
+    /// If window is None, uses the active window.
+    SendEvent {
+        session: Option<String>,
+        window: Option<u8>,
+        events: Vec<InputEvent>,
+    },
     /// Request the server's in-memory ring log.
     GetLog,
     /// Control mode client identifies itself.
@@ -261,6 +270,30 @@ pub enum ServerMsg {
     /// did not resolve or the PTY write failed (`reason` explains).
     /// Missing from older servers; clients should bound the wait.
     SendKeysAck { ok: bool, reason: String },
+    /// Acknowledge SendEvent — same contract as SendKeysAck.
+    /// Missing from older servers; clients should bound the wait.
+    SendEventAck { ok: bool, reason: String },
+}
+
+/// A synthetic input event carried by `ClientMsg::SendEvent`.
+/// `kind` selects the encoding on the server:
+///   EV_MOUSE (0)     — mouse report; `cb` is the X10/SGR button byte
+///                      (button | shift<<2 | alt<<3 | ctrl<<4 | motion<<5 |
+///                      wheel<<6), `x`/`y` are 1-based (0 = pane cursor),
+///                      `release` picks the SGR 'm' terminator.
+///   EV_FOCUS_IN (1)  — focus gained report (ESC [ I); cb/x/y unused.
+///   EV_FOCUS_OUT (2) — focus lost report (ESC [ O); cb/x/y unused.
+pub const EV_MOUSE: u8 = 0;
+pub const EV_FOCUS_IN: u8 = 1;
+pub const EV_FOCUS_OUT: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputEvent {
+    pub kind: u8,
+    pub cb: u8,
+    pub x: u16,
+    pub y: u16,
+    pub release: bool,
 }
 
 // ── Type tags ───────────────────────────────────────────────────────
@@ -295,6 +328,7 @@ const C_SET_PSK: u8 = 0x1b;
 const C_LIST_PEERS: u8 = 0x1c;
 const C_REGISTER: u8 = 0x1d;
 const C_RELAY_OPEN: u8 = 0x1e;
+const C_SEND_EVENT: u8 = 0x1f;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -313,6 +347,7 @@ const S_PEER_LIST: u8 = 0x1d;
 const S_REGISTER_ACK: u8 = 0x1e;
 const S_RELAY_ACK: u8 = 0x1f;
 const S_SEND_KEYS_ACK: u8 = 0x20;
+const S_SEND_EVENT_ACK: u8 = 0x21;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -510,6 +545,36 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             }
             payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
             payload.extend_from_slice(keys);
+        }
+        ClientMsg::SendEvent {
+            session,
+            window,
+            events,
+        } => {
+            payload.push(C_SEND_EVENT);
+            match session {
+                Some(s) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(s.as_bytes());
+                }
+                None => payload.push(0),
+            }
+            match window {
+                Some(w) => {
+                    payload.push(1);
+                    payload.push(*w);
+                }
+                None => payload.push(0),
+            }
+            payload.push(events.len().min(255) as u8);
+            for ev in events.iter().take(255) {
+                payload.push(ev.kind);
+                payload.push(ev.cb);
+                payload.extend_from_slice(&ev.x.to_le_bytes());
+                payload.extend_from_slice(&ev.y.to_le_bytes());
+                payload.push(if ev.release { 1 } else { 0 });
+            }
         }
         ClientMsg::GetLog => {
             payload.push(C_GET_LOG);
@@ -778,6 +843,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
         }
         ServerMsg::SendKeysAck { ok, reason } => {
             payload.push(S_SEND_KEYS_ACK);
+            payload.push(if *ok { 1 } else { 0 });
+            payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+            payload.extend_from_slice(reason.as_bytes());
+        }
+        ServerMsg::SendEventAck { ok, reason } => {
+            payload.push(S_SEND_EVENT_ACK);
             payload.push(if *ok { 1 } else { 0 });
             payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             payload.extend_from_slice(reason.as_bytes());
@@ -1067,6 +1138,47 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
                 session,
                 window,
                 keys,
+            })
+        }
+        C_SEND_EVENT => {
+            let session = if r.first() == Some(&1) {
+                r = &r[1..];
+                let len = read_u32(&mut r)? as usize;
+                let s = String::from_utf8_lossy(&r[..len]).into_owned();
+                r = &r[len..];
+                Some(s)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let window = if r.first() == Some(&1) {
+                let w = r[1];
+                r = &r[2..];
+                Some(w)
+            } else {
+                r = &r[1..];
+                None
+            };
+            let count = read_u8(&mut r)? as usize;
+            let mut events = Vec::with_capacity(count);
+            for _ in 0..count {
+                let kind = read_u8(&mut r)?;
+                let cb = read_u8(&mut r)?;
+                let x = read_u16(&mut r)?;
+                let y = read_u16(&mut r)?;
+                let release = read_u8(&mut r)? != 0;
+                events.push(InputEvent {
+                    kind,
+                    cb,
+                    x,
+                    y,
+                    release,
+                });
+            }
+            Ok(ClientMsg::SendEvent {
+                session,
+                window,
+                events,
             })
         }
         C_GET_LOG => Ok(ClientMsg::GetLog),
@@ -1419,6 +1531,11 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let reason = read_len_string(&mut r)?;
             Ok(ServerMsg::SendKeysAck { ok, reason })
         }
+        S_SEND_EVENT_ACK => {
+            let ok = read_u8(&mut r)? != 0;
+            let reason = read_len_string(&mut r)?;
+            Ok(ServerMsg::SendEventAck { ok, reason })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -1715,6 +1832,87 @@ mod tests {
             });
             match decode_server(&mut &bytes[..]).unwrap() {
                 ServerMsg::SendKeysAck { ok: got, reason: r } => {
+                    assert_eq!(got, ok);
+                    assert_eq!(r, reason);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn send_event_roundtrip() {
+        let msg = encode_client(&ClientMsg::SendEvent {
+            session: Some("work".into()),
+            window: Some(2),
+            events: vec![
+                InputEvent {
+                    kind: EV_MOUSE,
+                    cb: 0x43, // wheel-up | ctrl
+                    x: 10,
+                    y: 5,
+                    release: false,
+                },
+                InputEvent {
+                    kind: EV_MOUSE,
+                    cb: 0,
+                    x: 10,
+                    y: 5,
+                    release: true,
+                },
+                InputEvent {
+                    kind: EV_FOCUS_IN,
+                    cb: 0,
+                    x: 0,
+                    y: 0,
+                    release: false,
+                },
+            ],
+        });
+        match decode_client(&mut &msg[..]).unwrap() {
+            ClientMsg::SendEvent {
+                session,
+                window,
+                events,
+            } => {
+                assert_eq!(session.as_deref(), Some("work"));
+                assert_eq!(window, Some(2));
+                assert_eq!(events.len(), 3);
+                assert_eq!(events[0].cb, 0x43);
+                assert_eq!((events[0].x, events[0].y), (10, 5));
+                assert!(!events[0].release);
+                assert!(events[1].release);
+                assert_eq!(events[2].kind, EV_FOCUS_IN);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Defaults (no session/window) round-trip too.
+        let msg = encode_client(&ClientMsg::SendEvent {
+            session: None,
+            window: None,
+            events: vec![],
+        });
+        match decode_client(&mut &msg[..]).unwrap() {
+            ClientMsg::SendEvent {
+                session,
+                window,
+                events,
+            } => {
+                assert!(session.is_none());
+                assert!(window.is_none());
+                assert!(events.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        for (ok, reason) in [(true, "sent 2 event(s)"), (false, "no window 9")] {
+            let ack = encode_server(&ServerMsg::SendEventAck {
+                ok,
+                reason: reason.into(),
+            });
+            match decode_server(&mut &ack[..]).unwrap() {
+                ServerMsg::SendEventAck { ok: got, reason: r } => {
                     assert_eq!(got, ok);
                     assert_eq!(r, reason);
                 }

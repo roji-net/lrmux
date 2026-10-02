@@ -159,6 +159,14 @@ enum CliAction {
         keys: Vec<u8>,
         quiet: bool,
     },
+    /// `send-event -s <server> -t <target> <event> [<x> <y>] [-q]`:
+    /// inject synthetic mouse/focus events into a pane's PTY.
+    SendEvent {
+        server: Option<String>,
+        target: cmd::Target,
+        events: Vec<proto::InputEvent>,
+        quiet: bool,
+    },
     /// `select-window -t <target>`
     SelectWindow(cmd::Target),
     /// `rename-window -t <target> <name>`
@@ -437,6 +445,7 @@ fn parse_args() -> CliAction {
             }
         }
         Some("send-keys") | Some("send") => parse_send_keys(subcmd_args),
+        Some("send-event") | Some("sende") => parse_send_event(subcmd_args),
         Some("versions") | Some("version") => CliAction::Versions,
         // Bare `lrmux` (no subcommand) → selector / attach.
         None => CliAction::Default,
@@ -614,6 +623,29 @@ fn parse_send_keys(args: &[String]) -> CliAction {
             .map(|s| s.to_string()),
         target: parsed.target(),
         keys,
+        quiet,
+    }
+}
+
+/// Parse `send-event` args.
+///   send-event -t <target> <event> [<x> <y>] [--button b] [--shift|--alt|--ctrl] [--count n] -q
+fn parse_send_event(args: &[String]) -> CliAction {
+    let parsed = cmd::parse_flags(args);
+    let quiet = parsed.has("q") || parsed.has("quiet");
+    let events = match cmd::build_input_events(&parsed) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("lrmux: send-event: {e}");
+            std::process::exit(2);
+        }
+    };
+    CliAction::SendEvent {
+        server: parsed
+            .get("s")
+            .or_else(|| parsed.get("server"))
+            .map(|s| s.to_string()),
+        target: parsed.target(),
+        events,
         quiet,
     }
 }
@@ -1292,6 +1324,12 @@ fn run() -> io::Result<()> {
             keys,
             quiet,
         } => cli_send_keys(server.as_deref(), &target, &keys, quiet),
+        CliAction::SendEvent {
+            server,
+            target,
+            events,
+            quiet,
+        } => cli_send_event(server.as_deref(), &target, &events, quiet),
     }
 }
 
@@ -2217,6 +2255,80 @@ fn cli_send_keys(
         Err(e) => Err(io::Error::new(
             e.kind(),
             format!("send-keys: no acknowledgment from server: {e}"),
+        )),
+    }
+}
+
+/// CLI: send synthetic input events (mouse reports, focus events) to a
+/// pane's PTY. Same connection flow as `cli_send_keys`, waiting for the
+/// server's SendEventAck so the exit code reflects delivery.
+fn cli_send_event(
+    server: Option<&str>,
+    target: &cmd::Target,
+    events: &[proto::InputEvent],
+    quiet: bool,
+) -> io::Result<()> {
+    let server = server
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LRMUX_SERVER").ok())
+        .unwrap_or_else(|| "default".to_string());
+    let mut stream = connect_to_server(&server)?;
+    let msg = proto::encode_client(&ClientMsg::Identify {
+        rows: 24,
+        cols: 80,
+        attach: false,
+        auth_token: crate::config::effective_psk(),
+        env: Vec::new(),
+    });
+    proto::send(&mut stream, &msg)?;
+    match proto::decode_server(&mut stream) {
+        Ok(ServerMsg::IdentifyAck { .. }) => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck",
+            ));
+        }
+        Err(e) => return Err(e),
+    }
+    if !quiet {
+        eprintln!("lrmux: send-event: target={:?} events={:?}", target, events);
+    }
+    let window = target.window.as_ref().and_then(|w| w.parse::<u8>().ok());
+    let msg = proto::encode_client(&ClientMsg::SendEvent {
+        session: target.session.clone(),
+        window,
+        events: events.to_vec(),
+    });
+    proto::send(&mut stream, &msg)?;
+    stream.set_nonblocking(true)?;
+    let ack = {
+        let mut rd =
+            crate::ipc::stream::DeadlineReader::new(&mut stream, std::time::Duration::from_secs(3));
+        loop {
+            match proto::decode_server(&mut rd) {
+                Ok(ServerMsg::SendEventAck { ok, reason }) => break Ok((ok, reason)),
+                Ok(_) => continue, // unrelated messages (e.g. status bar)
+                Err(e) => break Err(e),
+            }
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    match ack {
+        Ok((true, reason)) => {
+            if !quiet {
+                eprintln!("lrmux: send-event: {reason}");
+            }
+            Ok(())
+        }
+        Ok((false, reason)) => Err(io::Error::other(reason)),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "send-event: server did not acknowledge within 3s (older server?)",
+        )),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("send-event: no acknowledgment from server: {e}"),
         )),
     }
 }

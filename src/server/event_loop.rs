@@ -479,11 +479,15 @@ pub fn run(
         } else {
             None
         };
+        // Deferred query replies: a child going raw produces no poll event,
+        // so while any pane holds one we bound poll() to retry promptly.
+        let mut replies_deferred = false;
         for (si, session) in sessions.iter().enumerate() {
             for (wi, w) in session.windows.iter().enumerate() {
                 if w.pane.is_exited() {
                     continue;
                 }
+                replies_deferred |= w.pane.has_deferred_replies();
                 pty_map.push((si, wi));
                 let pending = !w.pane.pending_input.is_empty();
                 fds.push(libc::pollfd {
@@ -530,13 +534,16 @@ pub fn run(
             }
         }
 
-        let timeout_ms = match next_announce {
+        let mut timeout_ms = match next_announce {
             Some(t) => t
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
                 .clamp(0, i32::MAX as u128) as i32,
             None => -1,
         };
+        if replies_deferred && !(0..=10).contains(&timeout_ms) {
+            timeout_ms = 10;
+        }
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -638,7 +645,17 @@ pub fn run(
                 }
                 let session = &mut sessions[si];
                 let pane = &mut session.windows[wi].pane;
-                match pane.process_pty_output() {
+                // OSC 10/11 color queries get answered inside the pane from
+                // its cached palette or the clients' probed colors — a
+                // real-TTY roundtrip takes ~10-20ms and lands in the child's
+                // input queue after apps with a short read window already
+                // moved on (the reply then echoes as typed garbage). Only
+                // queries without a known answer come back for proxying.
+                let palette_fallback = super::capture::TerminalPalette {
+                    fg: clients.iter().find_map(|c| c.palette.fg),
+                    bg: clients.iter().find_map(|c| c.palette.bg),
+                };
+                match pane.process_pty_output(palette_fallback) {
                     Ok((true, raw, osc_queries)) => {
                         let pane_id = pane.id;
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
@@ -647,15 +664,9 @@ pub fn run(
                         if !cc_bytes.is_empty() {
                             forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
                         }
-                        // OSC 10/11 color queries: answer from the pane's
-                        // cached palette when known — a real-TTY roundtrip
-                        // takes ~10-20ms and lands in the child's input queue
-                        // after apps with a short read window already moved
-                        // on (the reply then echoes as typed garbage). Proxy
-                        // only when we have nothing truthful to say.
                         for q in osc_queries {
-                            if !answer_osc_color_query(pane, &q, &clients) {
-                                proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            if !proxy_osc_color_query(&mut clients, si, wi, pane_id, &q) {
+                                pane.drop_waiting_reply();
                             }
                         }
                         pty_activity.push((si, wi));
@@ -670,8 +681,8 @@ pub fn run(
                             forward_output_to_control_clients(&mut clients, pane_id, &cc_bytes);
                         }
                         for q in osc_queries {
-                            if !answer_osc_color_query(pane, &q, &clients) {
-                                proxy_osc_color_query(&mut clients, si, wi, pane_id, &q);
+                            if !proxy_osc_color_query(&mut clients, si, wi, pane_id, &q) {
+                                pane.drop_waiting_reply();
                             }
                         }
                         let exit_code = pane.reap_child().unwrap_or(0);
@@ -711,6 +722,14 @@ pub fn run(
                 if si < sessions.len() && wi < sessions[si].windows.len() {
                     let _ = sessions[si].windows[wi].pane.flush_pending_input();
                 }
+            }
+        }
+
+        // Deliver query replies deferred while the pane tty was cooked —
+        // flushed every pass since the child's tcsetattr wakes no fd.
+        for session in sessions.iter_mut() {
+            for w in session.windows.iter_mut() {
+                let _ = w.pane.flush_deferred_replies();
             }
         }
 
@@ -900,7 +919,9 @@ pub fn run(
                                             ));
                                         }
                                         ClientMsg::TermOscReply { pane_id, data } => {
-                                            // Real TTY answered OSC 10/11 — cache palette + inject.
+                                            // Real TTY answered OSC 10/11 — cache palette
+                                            // and splice the reply into its queue slot so
+                                            // it stays ordered vs. sibling query replies.
                                             if let Some((si, wi)) =
                                                 find_pane_by_id(&sessions, pane_id)
                                             {
@@ -909,7 +930,7 @@ pub fn run(
                                                     .note_osc_color_reply(&data);
                                                 let _ = sessions[si].windows[wi]
                                                     .pane
-                                                    .write_input_tagged("RPL", &data);
+                                                    .fill_osc_reply(&data);
                                             }
                                         }
                                         ClientMsg::TermPalette { fg, bg } => {
@@ -1592,6 +1613,29 @@ pub fn run(
                                                 });
                                             let _ = client_send(&mut clients[client_idx], &msg);
                                         }
+                                        ClientMsg::SendEvent {
+                                            session,
+                                            window,
+                                            events,
+                                        } => {
+                                            let (ok, reason) = handle_send_event(
+                                                &mut sessions,
+                                                clients[client_idx].active_window,
+                                                &session,
+                                                window,
+                                                &events,
+                                            );
+                                            crate::log::info(&format!(
+                                                "SendEvent: session={session:?} window={window:?} events={} ok={ok} {reason}",
+                                                events.len()
+                                            ));
+                                            let msg =
+                                                proto::encode_server(&ServerMsg::SendEventAck {
+                                                    ok,
+                                                    reason,
+                                                });
+                                            let _ = client_send(&mut clients[client_idx], &msg);
+                                        }
                                         ClientMsg::GetLog => {
                                             let lines = crate::log::get_ring_log();
                                             let msg =
@@ -1846,6 +1890,26 @@ pub fn run(
                                 ));
                                 let msg =
                                     proto::encode_server(&ServerMsg::SendKeysAck { ok, reason });
+                                let _ = client_send(&mut clients[client_idx], &msg);
+                            }
+                            ClientMsg::SendEvent {
+                                session,
+                                window,
+                                events,
+                            } => {
+                                let (ok, reason) = handle_send_event(
+                                    &mut sessions,
+                                    clients[client_idx].active_window,
+                                    &session,
+                                    window,
+                                    &events,
+                                );
+                                crate::log::info(&format!(
+                                    "SendEvent: session={session:?} window={window:?} events={} ok={ok} (from POLLHUP) {reason}",
+                                    events.len()
+                                ));
+                                let msg =
+                                    proto::encode_server(&ServerMsg::SendEventAck { ok, reason });
                                 let _ = client_send(&mut clients[client_idx], &msg);
                             }
                             ClientMsg::SelectSession { name } => {
@@ -3034,6 +3098,10 @@ fn seed_pane_palette(
     if let Some(rgb) = pal.bg {
         pane.default_bg = Some(rgb);
     }
+    // Cold-start race: the app's query may already be sitting in a Waiting
+    // slot for a proxied answer — resolve it from the palette that just
+    // landed so the reply isn't hostage to the client roundtrip.
+    let _ = pane.resolve_waiting_from_palette(super::capture::TerminalPalette::default());
 }
 
 fn seed_client_focus_palette(sessions: &mut [Session], clients: &[ClientConn], client_idx: usize) {
@@ -3083,6 +3151,42 @@ fn session_window_names(session: &Session) -> String {
         .join(", ")
 }
 
+/// Resolve a SendKeys/SendEvent target to (session_idx, window_idx).
+/// `Err` covers unknown session and window index out of range.
+fn resolve_send_target(
+    sessions: &[Session],
+    active_window: usize,
+    session: &Option<String>,
+    window: Option<u8>,
+) -> Result<(usize, usize), String> {
+    let si = match session {
+        Some(name) => match sessions.iter().position(|s| &s.name == name) {
+            Some(i) => i,
+            None => return Err(no_session_error(session, sessions)),
+        },
+        None => {
+            if sessions.is_empty() {
+                return Err("no sessions".into());
+            }
+            0
+        }
+    };
+    let wi = match window {
+        Some(w) => w as usize,
+        None => active_window,
+    };
+    let sess = &sessions[si];
+    if wi >= sess.windows.len() {
+        return Err(format!(
+            "session '{}' has no window {}; windows: {}",
+            sess.name,
+            wi,
+            session_window_names(sess)
+        ));
+    }
+    Ok((si, wi))
+}
+
 /// Resolve a SendKeys target and write the keys (translated for the
 /// pane's cursor-key mode) to the pane's PTY. Returns `(ok, reason)`
 /// for the `SendKeysAck` reply — `ok=false` covers unknown session,
@@ -3094,34 +3198,11 @@ fn handle_send_keys(
     window: Option<u8>,
     keys: &[u8],
 ) -> (bool, String) {
-    let si = match session {
-        Some(name) => match sessions.iter().position(|s| &s.name == name) {
-            Some(i) => i,
-            None => return (false, no_session_error(session, sessions)),
-        },
-        None => {
-            if sessions.is_empty() {
-                return (false, "no sessions".into());
-            }
-            0
-        }
-    };
-    let wi = match window {
-        Some(w) => w as usize,
-        None => active_window,
+    let (si, wi) = match resolve_send_target(sessions, active_window, session, window) {
+        Ok(t) => t,
+        Err(e) => return (false, e),
     };
     let sess = &mut sessions[si];
-    if wi >= sess.windows.len() {
-        return (
-            false,
-            format!(
-                "session '{}' has no window {}; windows: {}",
-                sess.name,
-                wi,
-                session_window_names(sess)
-            ),
-        );
-    }
     let translated = translate_cursor_keys(keys, sess.windows[wi].pane.grid.app_cursor_keys);
     let n = translated.len();
     match sess.windows[wi].pane.write_input(&translated) {
@@ -3131,6 +3212,84 @@ fn handle_send_keys(
         ),
         Err(e) => (false, format!("pty write failed: {e}")),
     }
+}
+
+/// Resolve a SendEvent target, encode each event and write the bytes to
+/// the pane's PTY. Mouse reports are encoded in the pane's negotiated
+/// format (X10/UTF-8/SGR) — a pane that never enabled mouse tracking gets
+/// SGR-encoded bytes anyway, so a debugger can inject events blindly.
+/// x/y == 0 means "the pane's current cursor cell".
+fn handle_send_event(
+    sessions: &mut [Session],
+    active_window: usize,
+    session: &Option<String>,
+    window: Option<u8>,
+    events: &[proto::InputEvent],
+) -> (bool, String) {
+    if events.is_empty() {
+        return (false, "no events".into());
+    }
+    let (si, wi) = match resolve_send_target(sessions, active_window, session, window) {
+        Ok(t) => t,
+        Err(e) => return (false, e),
+    };
+    let pane = &mut sessions[si].windows[wi].pane;
+    let data = match encode_input_events(pane, events) {
+        Ok(d) => d,
+        Err(e) => return (false, e),
+    };
+    match pane.write_input(&data) {
+        Ok(()) => {
+            let mut reason = format!(
+                "sent {} event(s) ({} bytes) to pane {}",
+                events.len(),
+                data.len(),
+                pane.id_str()
+            );
+            let has_mouse = events.iter().any(|e| e.kind == proto::EV_MOUSE);
+            if has_mouse && !pane.grid.wants_mouse() {
+                reason.push_str(" — warning: pane has not enabled mouse tracking");
+            }
+            (true, reason)
+        }
+        Err(e) => (false, format!("pty write failed: {e}")),
+    }
+}
+
+/// Encode a SendEvent list into bytes for a pane: mouse reports in the
+/// pane's negotiated format (SGR when none was negotiated), focus reports
+/// as raw CSI sequences. x/y == 0 resolve to the pane's cursor cell.
+fn encode_input_events(
+    pane: &crate::server::pane::Pane,
+    events: &[proto::InputEvent],
+) -> Result<Vec<u8>, String> {
+    let fmt = if pane.grid.mouse_tracking == 0 {
+        6
+    } else {
+        pane.grid.mouse_fmt
+    };
+    let (cur_x, cur_y) = (
+        pane.grid.cursor_col as u16 + 1,
+        pane.grid.cursor_row as u16 + 1,
+    );
+    let mut data = Vec::new();
+    for ev in events {
+        match ev.kind {
+            proto::EV_MOUSE => {
+                let report = crate::client::mouse::Event {
+                    cb: ev.cb,
+                    x: if ev.x == 0 { cur_x } else { ev.x },
+                    y: if ev.y == 0 { cur_y } else { ev.y },
+                    release: ev.release,
+                };
+                data.extend_from_slice(&crate::client::mouse::encode_report(fmt, &report));
+            }
+            proto::EV_FOCUS_IN => data.extend_from_slice(b"\x1b[I"),
+            proto::EV_FOCUS_OUT => data.extend_from_slice(b"\x1b[O"),
+            other => return Err(format!("unknown event kind {other}")),
+        }
+    }
+    Ok(data)
 }
 
 /// Closest candidate by edit distance; also accepts a prefix match so
@@ -3204,43 +3363,6 @@ fn resolve_capture_palette(
     })
 }
 
-/// Answer a child's OSC 10/11 color query directly from the pane's cached
-/// palette — seeded by the attaching client's probe and by earlier proxied
-/// replies — falling back to any attached client's probed palette (the
-/// same outer-terminal colors are a valid answer for every pane). Returns
-/// false when nothing is known — the caller then proxies to a real client
-/// TTY instead of inventing a color.
-fn answer_osc_color_query(
-    pane: &mut crate::server::pane::Pane,
-    query: &crate::vt::OscColorQuery,
-    clients: &[ClientConn],
-) -> bool {
-    let rgb = match query.code {
-        10 => pane
-            .default_fg
-            .or_else(|| clients.iter().find_map(|c| c.palette.fg)),
-        11 => pane
-            .default_bg
-            .or_else(|| clients.iter().find_map(|c| c.palette.bg)),
-        _ => None,
-    };
-    let Some((r, g, b)) = rgb else { return false };
-    let reply = format_osc_color_reply(query.code, (r, g, b), query.bell_terminated);
-    pane.write_input_tagged("RPL", reply.as_bytes()).is_ok()
-}
-
-/// xterm-style OSC color reply: 16-bit channels (8-bit value replicated),
-/// terminated the same way the child's query was.
-fn format_osc_color_reply(code: u8, (r, g, b): (u8, u8, u8), bell: bool) -> String {
-    format!(
-        "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}{}",
-        r as u16 * 257,
-        g as u16 * 257,
-        b as u16 * 257,
-        if bell { "\x07" } else { "\x1b\\" },
-    )
-}
-
 /// Ask an attached client to query its real TTY for OSC 10/11.
 /// Prefer a viewer of this window; fall back to any attached client
 /// (including control-mode) so we still answer when `active_window` is
@@ -3252,7 +3374,7 @@ fn proxy_osc_color_query(
     window_idx: usize,
     pane_id: u32,
     query: &crate::vt::OscColorQuery,
-) {
+) -> bool {
     let msg = proto::encode_server(&ServerMsg::TermOscQuery {
         pane_id,
         code: query.code,
@@ -3266,27 +3388,28 @@ fn proxy_osc_color_query(
             && c.active_window == window_idx
             && client_send(c, &msg)
         {
-            return;
+            return true;
         }
     }
     // Pass 2: any interactive attached client (same outer palette for a
     // local tty client; better than silence).
     for c in clients.iter_mut() {
         if c.attach && !c.is_control && client_send(c, &msg) {
-            return;
+            return true;
         }
     }
     // Pass 3: control-mode clients — may still have a usable /dev/tty or
     // stdout connected to iTerm.
     for c in clients.iter_mut() {
         if c.attach && c.is_control && client_send(c, &msg) {
-            return;
+            return true;
         }
     }
     crate::log::info(&format!(
         "OSC {} query from pane %{pane_id}: no client to proxy to",
         query.code
     ));
+    false
 }
 
 /// Send dirty rows + cursor to clients viewing a specific window in a specific session.
@@ -3857,6 +3980,87 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
                 session,
                 window,
                 keys,
+            }
+        }
+        0x1f => {
+            // SendEvent: same session/window header as SendKeys, then a
+            // u8 count of 7-byte InputEvent records
+            // (kind, cb, x u16le, y u16le, release).
+            if data.len() < 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SendEvent needs at least 2 bytes",
+                ));
+            }
+            let mut off = 0;
+            let session = if data[off] != 0 {
+                off += 1;
+                if data.len() < off + 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendEvent session name needs 4-byte length",
+                    ));
+                }
+                let len =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                off += 4;
+                if data.len() < off + len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendEvent session name truncated",
+                    ));
+                }
+                let s = String::from_utf8_lossy(&data[off..off + len]).into_owned();
+                off += len;
+                Some(s)
+            } else {
+                off += 1;
+                None
+            };
+            let window = if data.len() > off && data[off] != 0 {
+                off += 1;
+                if data.len() < off + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SendEvent window index truncated",
+                    ));
+                }
+                Some(data[off])
+            } else {
+                None
+            };
+            off += 1;
+            if data.len() < off + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SendEvent event count missing",
+                ));
+            }
+            let count = data[off] as usize;
+            off += 1;
+            if data.len() < off + count * 7 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SendEvent events truncated",
+                ));
+            }
+            let mut events = Vec::with_capacity(count);
+            for _ in 0..count {
+                let e = &data[off..off + 7];
+                events.push(crate::proto::InputEvent {
+                    kind: e[0],
+                    cb: e[1],
+                    x: u16::from_le_bytes([e[2], e[3]]),
+                    y: u16::from_le_bytes([e[4], e[5]]),
+                    release: e[6] != 0,
+                });
+                off += 7;
+            }
+            ClientMsg::SendEvent {
+                session,
+                window,
+                events,
             }
         }
         0x15 => ClientMsg::GetLog,
@@ -5335,6 +5539,31 @@ fn handle_single_control_command(
             }
             respond(client, &[]);
         }
+        "send-event" => {
+            // lrmux extension (tmux has no analog): inject synthetic
+            // mouse/focus events — same arg syntax as the CLI.
+            let args = split_args_shell(args_str);
+            let parsed = crate::cmd::parse_flags(&args);
+            match crate::cmd::build_input_events(&parsed) {
+                Ok(events) => {
+                    let target_str = parsed
+                        .get("t")
+                        .or_else(|| parsed.get("target"))
+                        .map(|s| s.to_string());
+                    if let Some((si, wi)) = resolve_target(sessions, client, target_str.as_deref())
+                    {
+                        let window = &mut sessions[si].windows[wi];
+                        if !window.pane.exited
+                            && let Ok(data) = encode_input_events(&window.pane, &events)
+                        {
+                            let _ = window.pane.write_input(&data);
+                        }
+                    }
+                }
+                Err(e) => crate::log::warn(&format!("control send-event: {e}")),
+            }
+            respond(client, &[]);
+        }
         "kill-server" => {
             respond(client, &[]);
             send_control_notify(client, "%exit");
@@ -5860,7 +6089,7 @@ fn resolve_session_target(
 
 #[cfg(test)]
 mod osc_color_reply_tests {
-    use super::format_osc_color_reply;
+    use crate::term::format_osc_color_reply;
 
     #[test]
     fn preserves_code_and_bell_terminator() {
