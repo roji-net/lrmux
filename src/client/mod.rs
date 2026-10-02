@@ -74,8 +74,13 @@ enum ConfirmState {
 
 /// How an interactive client run ended.
 pub enum ClientExit {
-    /// Normal exit: detach, session ended, server gone, error path.
+    /// Normal exit: explicit detach, stdin gone, error path.
     Done,
+    /// The attached session/server went away under the client — the pane
+    /// exited, the server shut down, or the socket dropped. Carries where
+    /// they were attached so a selector-driven flow can reopen the picker
+    /// (an explicit `lrmux attach` still exits to the prompt).
+    SessionEnded(SelectHint),
     /// The user asked to leave this server and return to the session
     /// selector (`Ctrl-A /`). Carries where they were attached so the
     /// selector can pre-select that row.
@@ -369,6 +374,9 @@ pub fn run(
     // Reason for exiting the relay loop, printed after terminal restoration.
     let mut exit_reason: Option<String> = None;
     let mut want_selector = false;
+    // Set when the exit is the session/server going away (pane exited,
+    // server down, socket dropped) rather than the user leaving.
+    let mut ended = false;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -1227,6 +1235,7 @@ pub fn run(
                         }
                         ServerMsg::PaneExit { .. } => {
                             exit_reason = Some("session ended (last pane exited)".to_string());
+                            ended = true;
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
@@ -1335,6 +1344,7 @@ pub fn run(
                 }
             } else if last == 0 {
                 // Server closed the connection (EOF).
+                ended = true;
                 let sock_path = socket_path.to_string_lossy();
                 if !std::path::Path::new(&*sock_path).exists() {
                     exit_reason = Some("server shut down".to_string());
@@ -1361,6 +1371,7 @@ pub fn run(
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             // Server socket hung up. Check if the server is still alive
             // to give the user a clue about why we disconnected.
+            ended = true;
             let sock_path = socket_path.to_string_lossy();
             if !std::path::Path::new(&*sock_path).exists() {
                 exit_reason = Some("server shut down".to_string());
@@ -1381,9 +1392,9 @@ pub fn run(
     if let Some(reason) = exit_reason {
         eprintln!("lrmux: {reason}");
     }
-    Ok(if want_selector {
+    let hint = || {
         let tcp = crate::ipc::tcp_addr();
-        ClientExit::Selector(SelectHint {
+        SelectHint {
             server: if tcp.is_none() {
                 socket_path
                     .file_name()
@@ -1397,7 +1408,12 @@ pub fn run(
             } else {
                 Some(current_session)
             },
-        })
+        }
+    };
+    Ok(if want_selector {
+        ClientExit::Selector(hint())
+    } else if ended {
+        ClientExit::SessionEnded(hint())
     } else {
         ClientExit::Done
     })
