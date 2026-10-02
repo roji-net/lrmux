@@ -312,6 +312,9 @@ pub fn run(
     let mut flash_msg: Option<String> = None;
     let mut flash_deadline: Option<std::time::Instant> = None;
     let mut pending_session_chooser = false;
+    // Last title written to the outer terminal (dedup — status bar updates
+    // fire on every output burst but the title rarely changes).
+    let mut last_title: Option<String> = None;
 
     // If requested, create a new session on the server right after handshake.
     // Send the client's CWD so the new session opens in the right directory.
@@ -1205,6 +1208,21 @@ pub fn run(
                                     &grid,
                                 )?;
                             }
+                            // Outer-terminal (iTerm tab/window) title:
+                            // "lrmux - server:session:window", ●-prefixed
+                            // while any window has unseen output.
+                            let title = outer_title(
+                                &server,
+                                &session,
+                                &windows,
+                                active as usize,
+                                &activity,
+                            );
+                            if last_title.as_deref() != Some(title.as_str()) {
+                                write!(stdout, "\x1b]0;{title}\x07")?;
+                                stdout.flush()?;
+                                last_title = Some(title);
+                            }
                         }
                         ServerMsg::PaneExit { .. } => {
                             exit_reason = Some("session ended (last pane exited)".to_string());
@@ -1906,6 +1924,33 @@ fn format_status_bar(
             RESET
         ),
         spans,
+    )
+}
+
+/// Compose the outer-terminal (iTerm tab/window) title shown while
+/// attached: `lrmux - server:session:window`, prefixed with `● ` when any
+/// window has unseen output — the same flags that drive the status-bar
+/// bullets. Names are user-controlled (rename-session/window), so control
+/// characters are stripped to keep them out of the OSC payload.
+fn outer_title(
+    server: &str,
+    session: &str,
+    windows: &[String],
+    active: usize,
+    activity: &[bool],
+) -> String {
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+    let window = windows.get(active).map(String::as_str).unwrap_or("?");
+    let dot = if activity.iter().any(|a| *a) {
+        "● "
+    } else {
+        ""
+    };
+    format!(
+        "{dot}lrmux - {}:{}:{}",
+        clean(server),
+        clean(session),
+        clean(window)
     )
 }
 
@@ -2766,6 +2811,41 @@ mod tests {
         let visible = strip_ansi(&text);
         assert!(visible.contains("●1:vim"), "{visible}");
         assert!(!visible.contains("●0:"), "{visible}");
+    }
+
+    #[test]
+    fn outer_title_format_and_activity_dot() {
+        assert_eq!(
+            outer_title(
+                "srv",
+                "work",
+                &["zsh".into(), "vim".into()],
+                1,
+                &[false, false]
+            ),
+            "lrmux - srv:work:vim"
+        );
+        // Unseen output on another window prefixes the bullet.
+        assert_eq!(
+            outer_title(
+                "srv",
+                "work",
+                &["zsh".into(), "vim".into()],
+                0,
+                &[false, true]
+            ),
+            "● lrmux - srv:work:zsh"
+        );
+        // Older servers send no activity flags — plain title.
+        assert_eq!(
+            outer_title("srv", "work", &["zsh".into()], 0, &[]),
+            "lrmux - srv:work:zsh"
+        );
+        // Control characters in names can't smuggle escapes into the OSC.
+        assert_eq!(
+            outer_title("s\x1b]8;;x", "we\x07ird", &["z\x1bsh".into()], 0, &[]),
+            "lrmux - s]8;;x:weird:zsh"
+        );
     }
 
     #[test]
