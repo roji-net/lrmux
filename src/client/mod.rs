@@ -278,7 +278,8 @@ pub fn run(
     // replies won't echo onto the screen. Keystrokes read alongside a
     // reply come back in probe_leftover and re-enter via the filter.
     let mut probe_leftover = Vec::new();
-    report_outer_term_palette(&mut stream, &mut probe_leftover)?;
+    let mut osc_probe = OscProbe::default();
+    report_outer_term_palette(&mut stream, &mut probe_leftover, &mut osc_probe)?;
     input_filter.inject(&probe_leftover);
 
     // Create the local grid + renderer.
@@ -1280,9 +1281,12 @@ pub fn run(
                             // query isn't stuck behind a partial stdout write.
                             let _ = client_stdout().flush();
                             let mut probe_leftover = Vec::new();
-                            if let Some(reply) =
-                                query_outer_osc_color(code, bell_terminated, &mut probe_leftover)
-                            {
+                            if let Some(reply) = query_outer_osc_color(
+                                code,
+                                bell_terminated,
+                                &mut probe_leftover,
+                                &mut osc_probe,
+                            ) {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
                                     data: reply,
@@ -2439,16 +2443,78 @@ fn show_help_overlay(server_version: &str) {
 /// Non-reply bytes picked up while probing (user keystrokes read
 /// alongside the reply) go into `extra_input` for the caller to re-feed
 /// as input instead of dropping them.
+/// How long an OSC probe waits for a reply per channel. Real terminals
+/// answer in a few ms; 300ms still covers laggy SSH links while a silent
+/// terminal costs a fraction of a second instead of the old 2s per
+/// attempt — which stacked across channels and colors into a multi-second
+/// attach freeze (e.g. on tablet terminals that don't answer OSC at all).
+const OSC_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Liveness cache for the outer-TTY query channels. A channel that timed
+/// out once is marked dead: a terminal that doesn't answer OSC won't
+/// start answering on the next probe, and retrying would re-freeze the
+/// input loop for the whole timeout on every subsequent query.
+#[derive(Default)]
+pub(crate) struct OscProbe {
+    /// stdin/stdout channel (interactive attach only).
+    stdio: Option<bool>,
+    /// /dev/tty channel — fallback for the interactive client, and the
+    /// only channel for -CC where stdout is the control-mode stream.
+    dev_tty: Option<bool>,
+}
+
+impl OscProbe {
+    fn alive(known: Option<bool>) -> bool {
+        known != Some(false)
+    }
+}
+
 pub(crate) fn report_outer_term_palette(
     stream: &mut impl Write,
     extra_input: &mut Vec<u8>,
+    probe: &mut OscProbe,
 ) -> io::Result<()> {
-    let fg = query_outer_osc_color(10, true, extra_input)
-        .and_then(|d| crate::term::parse_osc_color_reply(&d))
-        .map(|(_, rgb)| rgb);
-    let bg = query_outer_osc_color(11, true, extra_input)
-        .and_then(|d| crate::term::parse_osc_color_reply(&d))
-        .map(|(_, rgb)| rgb);
+    // Both queries go out in one write per channel — the wait covers both
+    // replies, halving the worst-case block on slow or silent terminals.
+    let mut fg = None;
+    let mut bg = None;
+    let take = |code: u8, res: &mut Vec<Option<Vec<u8>>>| {
+        let i = if code == 10 { 0 } else { 1 };
+        res[i]
+            .take()
+            .and_then(|d| crate::term::parse_osc_color_reply(&d))
+            .map(|(_, rgb)| rgb)
+    };
+    if OscProbe::alive(probe.stdio) {
+        let mut res = query_osc_colors_on_fds(
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            &[10, 11],
+            true,
+            extra_input,
+        );
+        probe.stdio = Some(res.iter().any(Option::is_some));
+        fg = take(10, &mut res);
+        bg = take(11, &mut res);
+    }
+    if (fg.is_none() || bg.is_none()) && OscProbe::alive(probe.dev_tty) {
+        let codes: Vec<u8> = [(fg.is_none()).then_some(10), (bg.is_none()).then_some(11)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut res = query_osc_colors_via_dev_tty(&codes, true, extra_input);
+        probe.dev_tty = Some(res.iter().any(Option::is_some));
+        for (code, r) in codes.iter().zip(res.iter_mut()) {
+            let rgb = r
+                .take()
+                .and_then(|d| crate::term::parse_osc_color_reply(&d))
+                .map(|(_, rgb)| rgb);
+            match code {
+                10 => fg = rgb,
+                _ => bg = rgb,
+            }
+        }
+    }
     if fg.is_none() && bg.is_none() {
         return Ok(());
     }
@@ -2459,35 +2525,39 @@ pub(crate) fn report_outer_term_palette(
 /// Query the outer terminal's OSC 10 (fg) or 11 (bg) color.
 ///
 /// Tries stdout/stdin first (the fds the interactive client already has on
-/// the user's terminal), then `/dev/tty` as a fallback. A failed query
-/// surfaces as vim E1568 and wrong `background` / colorscheme colors.
+/// the user's terminal), then `/dev/tty` as a fallback — unless `probe`
+/// already knows that channel is dead. A failed query surfaces as vim
+/// E1568 and wrong `background` / colorscheme colors.
 pub(crate) fn query_outer_osc_color(
     code: u8,
     bell_terminated: bool,
     extra_input: &mut Vec<u8>,
+    probe: &mut OscProbe,
 ) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
     }
-
-    let mut query = Vec::with_capacity(16);
-    query.extend_from_slice(b"\x1b]");
-    query.extend_from_slice(code.to_string().as_bytes());
-    query.extend_from_slice(b";?");
-    if bell_terminated {
-        query.push(0x07);
-    } else {
-        query.extend_from_slice(b"\x1b\\");
+    if OscProbe::alive(probe.stdio) {
+        let mut res = query_osc_colors_on_fds(
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            &[code],
+            bell_terminated,
+            extra_input,
+        );
+        probe.stdio = Some(res[0].is_some());
+        if let Some(reply) = res[0].take() {
+            return Some(reply);
+        }
     }
-
-    // Prefer the fds we already own; fall back to /dev/tty (needed for -CC
-    // where stdout is the control-mode channel, not a raw terminal).
-    if let Some(reply) =
-        query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query, extra_input)
-    {
-        return Some(reply);
+    if OscProbe::alive(probe.dev_tty) {
+        let mut res = query_osc_colors_via_dev_tty(&[code], bell_terminated, extra_input);
+        probe.dev_tty = Some(res[0].is_some());
+        if let Some(reply) = res[0].take() {
+            return Some(reply);
+        }
     }
-    query_osc_via_dev_tty(&query, extra_input)
+    None
 }
 
 /// Control-mode variant: never write OSC to stdout (that's the tmux control
@@ -2496,26 +2566,24 @@ pub(crate) fn query_outer_osc_color_for_control(
     code: u8,
     bell_terminated: bool,
     extra_input: &mut Vec<u8>,
+    probe: &mut OscProbe,
 ) -> Option<Vec<u8>> {
-    if code != 10 && code != 11 {
+    if code != 10 && code != 11 || !OscProbe::alive(probe.dev_tty) {
         return None;
     }
-    let mut query = Vec::with_capacity(16);
-    query.extend_from_slice(b"\x1b]");
-    query.extend_from_slice(code.to_string().as_bytes());
-    query.extend_from_slice(b";?");
-    if bell_terminated {
-        query.push(0x07);
-    } else {
-        query.extend_from_slice(b"\x1b\\");
-    }
-    query_osc_via_dev_tty(&query, extra_input)
+    let mut res = query_osc_colors_via_dev_tty(&[code], bell_terminated, extra_input);
+    probe.dev_tty = Some(res[0].is_some());
+    res[0].take()
 }
 
-fn query_osc_via_dev_tty(query: &[u8], extra_input: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn query_osc_colors_via_dev_tty(
+    codes: &[u8],
+    bell_terminated: bool,
+    extra_input: &mut Vec<u8>,
+) -> Vec<Option<Vec<u8>>> {
     let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
     if fd < 0 {
-        return None;
+        return vec![None; codes.len()];
     }
     struct TtyFd(i32);
     impl Drop for TtyFd {
@@ -2526,20 +2594,22 @@ fn query_osc_via_dev_tty(query: &[u8], extra_input: &mut Vec<u8>) -> Option<Vec<
         }
     }
     let tty = TtyFd(fd);
-    query_osc_on_fds(tty.0, tty.0, query, extra_input)
+    query_osc_colors_on_fds(tty.0, tty.0, codes, bell_terminated, extra_input)
 }
 
-/// Returns the OSC reply, or None on timeout. Bytes read that are not
-/// part of the reply — pending input drained up front, user keystrokes
-/// arriving mid-wait, trailing bytes after the reply — are appended to
-/// `extra_input` so the caller can re-feed them instead of swallowing
-/// what the user typed while we were blocked probing.
-fn query_osc_on_fds(
+/// Returns one slot per queried code — the OSC reply bytes, or None on
+/// timeout for that code. Bytes read that are not part of a reply —
+/// pending input drained up front, user keystrokes arriving mid-wait,
+/// trailing bytes after the last reply — are appended to `extra_input`
+/// so the caller can re-feed them instead of swallowing what the user
+/// typed while we were blocked probing.
+fn query_osc_colors_on_fds(
     read_fd: i32,
     write_fd: i32,
-    query: &[u8],
+    codes: &[u8],
+    bell_terminated: bool,
     extra_input: &mut Vec<u8>,
-) -> Option<Vec<u8>> {
+) -> Vec<Option<Vec<u8>>> {
     // Disable ECHO while waiting for the reply. Interactive clients are
     // already raw, but control-mode / edge paths can still be cooked — and
     // an echoed OSC reply paints garbage on the user's screen.
@@ -2597,31 +2667,43 @@ fn query_osc_on_fds(
         }
     }
 
+    let mut query = Vec::with_capacity(16 * codes.len());
+    for code in codes {
+        query.extend_from_slice(b"\x1b]");
+        query.extend_from_slice(code.to_string().as_bytes());
+        query.extend_from_slice(b";?");
+        if bell_terminated {
+            query.push(0x07);
+        } else {
+            query.extend_from_slice(b"\x1b\\");
+        }
+    }
     let w = unsafe { libc::write(write_fd, query.as_ptr() as *const _, query.len()) };
-    client_trace("QRY", query);
+    client_trace("QRY", &query);
     if w < 0 {
         if fl >= 0 {
             unsafe {
                 libc::fcntl(read_fd, libc::F_SETFL, fl);
             }
         }
-        return None;
+        return vec![None; codes.len()];
     }
     if write_fd == libc::STDOUT_FILENO {
         let _ = client_stdout().flush();
     }
 
+    let mut replies: Vec<Option<Vec<u8>>> = vec![None; codes.len()];
     let mut buf = Vec::with_capacity(128);
     let mut tmp = [0u8; 256];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    let deadline = std::time::Instant::now() + OSC_REPLY_TIMEOUT;
     if fl >= 0 {
         unsafe {
             libc::fcntl(read_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
     }
-    let result = loop {
-        if std::time::Instant::now() >= deadline {
-            break None;
+    loop {
+        if replies.iter().all(Option::is_some) || std::time::Instant::now() >= deadline {
+            break;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let mut pfd = libc::pollfd {
@@ -2629,7 +2711,7 @@ fn query_osc_on_fds(
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = remaining.as_millis().min(250) as i32;
+        let ms = remaining.as_millis().min(50) as i32;
         let pret = unsafe { libc::poll(&mut pfd, 1, ms) };
         if pret <= 0 {
             continue;
@@ -2640,28 +2722,37 @@ fn query_osc_on_fds(
         }
         buf.extend_from_slice(&tmp[..n as usize]);
         client_trace("KEY", &tmp[..n as usize]);
-        if let Some(end) = osc_reply_end(&buf) {
-            // Anything before/after the reply bytes is user input that
-            // raced the probe — hand it back, don't eat it.
-            let start = buf.windows(2).position(|w| w == b"\x1b]").unwrap_or(0);
+        // Extract every complete reply; map each to its query by OSC code.
+        while let Some(start) = buf.windows(2).position(|w| w == b"\x1b]") {
+            let Some(end) = osc_reply_end(&buf[start..]).map(|e| start + e) else {
+                break;
+            };
             extra_input.extend_from_slice(&buf[..start]);
-            extra_input.extend_from_slice(&buf[end..]);
-            break Some(buf[start..end].to_vec());
+            let reply = buf[start..end].to_vec();
+            if let Some((code, _)) = crate::term::parse_osc_color_reply(&reply)
+                && let Some(slot) = codes
+                    .iter()
+                    .zip(replies.iter_mut())
+                    .find(|(c, r)| **c == code && r.is_none())
+                    .map(|(_, r)| r)
+            {
+                *slot = Some(reply);
+            }
+            buf.drain(..end);
         }
         if buf.len() > 4096 {
-            break None;
+            break;
         }
-    };
-    if result.is_none() {
-        // Timed out mid-reply (or got only input): return what we read.
-        extra_input.extend_from_slice(&buf);
     }
+    // Whatever remains — stray input raced in, or an incomplete reply
+    // tail — is real bytes the caller must not lose.
+    extra_input.extend_from_slice(&buf);
     if fl >= 0 {
         unsafe {
             libc::fcntl(read_fd, libc::F_SETFL, fl);
         }
     }
-    result
+    replies
 }
 
 /// End index (exclusive) of a complete OSC reply in `buf`, or None if incomplete.
@@ -2872,5 +2963,95 @@ mod tests {
         assert_eq!(spans[1], (w1, w1 + "1:vim*".chars().count() as u16, 1));
         assert_eq!(spans[1].0, spans[0].1 + 3); // joined with " | "
         assert!(visible.contains("●0:zsh | 1:vim*"), "{visible}");
+    }
+
+    fn socketpair() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        (fds[0], fds[1])
+    }
+
+    /// Terminal-side helper: read the probe query, then write `response`.
+    fn fake_terminal(fd: i32, response: &'static [u8]) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut q = [0u8; 128];
+            unsafe {
+                libc::read(fd, q.as_mut_ptr() as *mut _, q.len());
+                libc::write(fd, response.as_ptr() as *const _, response.len());
+            }
+        })
+    }
+
+    #[test]
+    fn osc_probe_collects_both_replies_in_one_roundtrip() {
+        let (a, b) = socketpair();
+        let term = fake_terminal(
+            b,
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07\x1b]11;rgb:1111/2222/3333\x07",
+        );
+        let mut extra = Vec::new();
+        let res = query_osc_colors_on_fds(a, a, &[10, 11], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert_eq!(
+            res[0].as_deref(),
+            Some(b"\x1b]10;rgb:aaaa/bbbb/cccc\x07".as_slice())
+        );
+        assert_eq!(
+            res[1].as_deref(),
+            Some(b"\x1b]11;rgb:1111/2222/3333\x07".as_slice())
+        );
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn osc_probe_returns_stray_keystrokes_as_input() {
+        let (a, b) = socketpair();
+        // 'x' arrives before the reply, 'y' after — both are user input.
+        let term = fake_terminal(b, b"x\x1b]10;rgb:aaaa/bbbb/cccc\x07y");
+        let mut extra = Vec::new();
+        let res = query_osc_colors_on_fds(a, a, &[10], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert!(res[0].is_some());
+        assert_eq!(extra, b"xy");
+    }
+
+    #[test]
+    fn osc_probe_times_out_fast_on_silent_terminal() {
+        let (a, b) = socketpair();
+        let term = fake_terminal(b, b"hi"); // input, but no reply
+        let mut extra = Vec::new();
+        let t = std::time::Instant::now();
+        let res = query_osc_colors_on_fds(a, a, &[10, 11], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert!(res.iter().all(Option::is_none));
+        assert_eq!(extra, b"hi");
+        // Must stay well under the old 2s-per-attempt behavior.
+        assert!(t.elapsed() < std::time::Duration::from_millis(900));
+    }
+
+    #[test]
+    fn osc_probe_reports_partial_replies() {
+        let (a, b) = socketpair();
+        let term = fake_terminal(b, b"\x1b]11;rgb:1111/2222/3333\x07");
+        let mut extra = Vec::new();
+        let res = query_osc_colors_on_fds(a, a, &[10, 11], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert!(res[0].is_none());
+        assert!(res[1].is_some());
     }
 }
