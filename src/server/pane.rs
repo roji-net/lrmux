@@ -651,7 +651,7 @@ impl Pane {
             self.trace(
                 "DFR",
                 format!(
-                    "holding {} repl(ies), tty cooked lflag={:#x}",
+                    "holding {} repl(ies), tty cooked lflag={:?}",
                     self.deferred_replies.len(),
                     self.tty_lflag()
                 )
@@ -715,19 +715,22 @@ impl Pane {
     /// True while the pane tty is in cooked mode: canonical input and/or
     /// echo. tcgetattr on the master fd reflects the slave's termios.
     fn tty_cooked(&self) -> bool {
-        self.tty_lflag() & (libc::ICANON | libc::ECHO) != 0
+        use nix::sys::termios::LocalFlags;
+        self.tty_lflag()
+            .intersects(LocalFlags::ICANON | LocalFlags::ECHO)
     }
 
-    /// Raw c_lflag of the pane tty (for trace diagnostics), 0 on error.
-    fn tty_lflag(&self) -> u64 {
+    /// c_lflag of the pane tty (for trace diagnostics), empty on error.
+    fn tty_lflag(&self) -> nix::sys::termios::LocalFlags {
+        use nix::sys::termios::LocalFlags;
         let fd = self.pty_fd();
         if fd < 0 {
-            return 0;
+            return LocalFlags::empty();
         }
         let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         match nix::sys::termios::tcgetattr(borrowed) {
-            Ok(t) => t.local_flags.bits(),
-            Err(_) => 0,
+            Ok(t) => t.local_flags,
+            Err(_) => LocalFlags::empty(),
         }
     }
 
