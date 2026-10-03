@@ -4,7 +4,7 @@ pub mod control;
 pub mod copy_mode;
 mod input_filter;
 pub mod inventory;
-mod mouse;
+pub mod mouse;
 pub mod render;
 pub mod selector;
 pub mod terminal;
@@ -1436,7 +1436,8 @@ pub fn run(
                         ServerMsg::PeerList { .. }
                         | ServerMsg::RegisterAck { .. }
                         | ServerMsg::RelayAck { .. }
-                        | ServerMsg::SendKeysAck { .. } => {}
+                        | ServerMsg::SendKeysAck { .. }
+                        | ServerMsg::SendEventAck { .. } => {}
                     }
                 }
                 // GridUpdate/Snapshot carry the child's mouse flags — keep

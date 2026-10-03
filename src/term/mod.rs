@@ -134,6 +134,18 @@ fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
     Some((r, g, b))
 }
 
+/// xterm-style OSC color reply: 16-bit channels (8-bit value replicated),
+/// terminated the same way the child's query was.
+pub fn format_osc_color_reply(code: u8, (r, g, b): (u8, u8, u8), bell: bool) -> String {
+    format!(
+        "\x1b]{code};rgb:{:04x}/{:04x}/{:04x}{}",
+        r as u16 * 257,
+        g as u16 * 257,
+        b as u16 * 257,
+        if bell { "\x07" } else { "\x1b\\" },
+    )
+}
+
 /// xterm sends 1–4 hex digits per channel; take the high 8 bits of the 16-bit value.
 fn parse_osc_channel(s: &str) -> Option<u8> {
     if s.is_empty() || s.len() > 4 {
