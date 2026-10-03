@@ -254,3 +254,74 @@ pub fn child_cwd(pid: Pid) -> Option<String> {
             .map(|n| n.to_string_lossy().into_owned())
     })
 }
+
+/// Command name of the foreground process on a PTY — the fg process
+/// group's leader (`sleep` in `sleep 5`, `devin` in a devin session).
+/// None when the fd isn't a terminal, has no foreground job, or the
+/// process can't be identified.
+pub fn pty_foreground_command(master_fd: i32) -> Option<String> {
+    if master_fd < 0 {
+        return None;
+    }
+    let pgid = unsafe { libc::tcgetpgrp(master_fd) };
+    if pgid <= 0 {
+        return None;
+    }
+    process_name(pgid)
+}
+
+/// Process command name (comm) for a pid.
+#[cfg(target_os = "macos")]
+fn process_name(pid: i32) -> Option<String> {
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::pid_t,
+            flavor: u32,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: i32,
+        ) -> i32;
+    }
+    const PROC_PIDTBSDINFO: u32 = 3;
+    // struct proc_bsdinfo offsets: 11 u32s (flags..rfu_1) precede the
+    // name fields. pbi_comm is 16 bytes at offset 48, pbi_name 32 bytes
+    // at offset 64 (XNU: MAXCOMLEN=16, pbi_name is 2*MAXCOMLEN).
+    const COMM_OFF: usize = 48;
+    const NAME_OFF: usize = 64;
+    const BSDINFO_SIZE: usize = 648;
+    let mut buf = [0u8; BSDINFO_SIZE];
+    let ret = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            BSDINFO_SIZE as i32,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    // pbi_name holds the untruncated name; fall back to pbi_comm.
+    for off in [NAME_OFF, COMM_OFF] {
+        let cstr = unsafe { std::ffi::CStr::from_ptr(buf[off..].as_ptr() as *const libc::c_char) };
+        let s = cstr.to_string_lossy();
+        if !s.is_empty() {
+            return Some(s.into_owned());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_name(pid: i32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_name(_pid: i32) -> Option<String> {
+    None
+}
