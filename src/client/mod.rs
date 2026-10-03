@@ -74,8 +74,13 @@ enum ConfirmState {
 
 /// How an interactive client run ended.
 pub enum ClientExit {
-    /// Normal exit: detach, session ended, server gone, error path.
+    /// Normal exit: explicit detach, stdin gone, error path.
     Done,
+    /// The attached session/server went away under the client — the pane
+    /// exited, the server shut down, or the socket dropped. Carries where
+    /// they were attached so a selector-driven flow can reopen the picker
+    /// (an explicit `lrmux attach` still exits to the prompt).
+    SessionEnded(SelectHint),
     /// The user asked to leave this server and return to the session
     /// selector (`Ctrl-A /`). Carries where they were attached so the
     /// selector can pre-select that row.
@@ -266,6 +271,13 @@ pub fn run(
     let mut mouse_decoder = mouse::Decoder::new();
     // Tracking mask currently applied to the outer terminal (None = not yet).
     let mut applied_mouse: Option<u8> = None;
+    // Mouse reporting policy: config mode + Ctrl-A m / [M]-click override
+    // + the auto_enable sticky latch.
+    let mut mouse_ctl = MouseCtl {
+        mode: crate::config::global().behavior.mouse,
+        ovr: MouseOverride::Auto,
+        latched: false,
+    };
     // Pending mouse-press position (x, y): arms a local selection — the
     // drag that follows enters copy mode anchored here. A release without
     // motion is a plain click and does nothing.
@@ -278,7 +290,8 @@ pub fn run(
     // replies won't echo onto the screen. Keystrokes read alongside a
     // reply come back in probe_leftover and re-enter via the filter.
     let mut probe_leftover = Vec::new();
-    report_outer_term_palette(&mut stream, &mut probe_leftover)?;
+    let mut osc_probe = OscProbe::default();
+    report_outer_term_palette(&mut stream, &mut probe_leftover, &mut osc_probe)?;
     input_filter.inject(&probe_leftover);
 
     // Create the local grid + renderer.
@@ -312,6 +325,9 @@ pub fn run(
     let mut flash_msg: Option<String> = None;
     let mut flash_deadline: Option<std::time::Instant> = None;
     let mut pending_session_chooser = false;
+    // Last title written to the outer terminal (dedup — status bar updates
+    // fire on every output burst but the title rarely changes).
+    let mut last_title: Option<String> = None;
 
     // If requested, create a new session on the server right after handshake.
     // Send the client's CWD so the new session opens in the right directory.
@@ -365,6 +381,9 @@ pub fn run(
     // Reason for exiting the relay loop, printed after terminal restoration.
     let mut exit_reason: Option<String> = None;
     let mut want_selector = false;
+    // Set when the exit is the session/server going away (pane exited,
+    // server down, socket dropped) rather than the user leaving.
+    let mut ended = false;
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -406,7 +425,14 @@ pub fn run(
                 grid.mark_all_dirty();
                 renderer.render(&mut stdout, &mut grid)?;
                 render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
-                render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                render_status_bar(
+                    &mut stdout,
+                    &status_text,
+                    term_rows,
+                    term_cols,
+                    &grid,
+                    mouse_reporting_on(applied_mouse),
+                )?;
             }
         }
 
@@ -452,13 +478,28 @@ pub fn run(
             flash_deadline = None;
             // Re-render the normal status bar.
             let mut stdout = client_stdout();
-            render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+            render_status_bar(
+                &mut stdout,
+                &status_text,
+                term_rows,
+                term_cols,
+                &grid,
+                mouse_reporting_on(applied_mouse),
+            )?;
         }
 
         // If we have a flash message, render it on the status bar.
         if let Some(ref msg) = flash_msg {
             let mut stdout = client_stdout();
-            render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
+            render_flash_status_bar(
+                &mut stdout,
+                msg,
+                &status_text,
+                term_rows,
+                term_cols,
+                &grid,
+                mouse_reporting_on(applied_mouse),
+            )?;
         }
 
         // stdin → prefix detection → server (as PaneInput or commands).
@@ -514,6 +555,24 @@ pub fn run(
                             };
                             send_cmd(&mut stream, &msg)?;
                         } else if !ev.release && !ev.is_motion() && ev.cb & 3 == 0 {
+                            // The [M] control occupies the last 3 columns —
+                            // a click there forces reporting off (clicks
+                            // then can't reach us; Ctrl-A m re-enables).
+                            if ev.x as usize + 2 >= term_cols && term_cols >= 8 {
+                                mouse_ctl.ovr = MouseOverride::ForceOff;
+                                flash_msg = Some("mouse off — Ctrl-A m to re-enable".to_string());
+                                flash_deadline = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                                );
+                                sync_mouse_modes(
+                                    &mut applied_mouse,
+                                    &grid,
+                                    &mut mouse_decoder,
+                                    copy_mode.is_some(),
+                                    &mut mouse_ctl,
+                                );
+                                continue;
+                            }
                             // Left press on a window entry switches to it.
                             if let Some(&(_, _, idx)) = status_spans
                                 .iter()
@@ -581,11 +640,22 @@ pub fn run(
                             redraw_cm = true;
                             continue;
                         }
-                        // Otherwise the wheel isn't ours to interpret: when
-                        // the child doesn't track the mouse and altscroll
-                        // isn't set, outer-terminal reporting is off and no
-                        // report can reach us — the terminal scrolls its own
-                        // scrollback natively.
+                        // A wheel report still reached us, so reporting is
+                        // on (always_on / auto_enable / forced on) while
+                        // this pane doesn't track the mouse — translate
+                        // wheel-up into copy-mode scrollback, tmux-style.
+                        if ev.is_wheel_up() {
+                            let cm = copy_mode.get_or_insert_with(|| {
+                                copy_mode::CopyMode::new(
+                                    grid.scrollback.len(),
+                                    grid.cursor_row,
+                                    grid.cursor_col,
+                                )
+                            });
+                            cm.vrow = cm.vrow.saturating_sub(3);
+                            cm.ensure_cursor_visible(view_rows);
+                            redraw_cm = true;
+                        }
                         continue;
                     }
                     if ev.is_motion() {
@@ -669,6 +739,7 @@ pub fn run(
                                 &status_text,
                                 term_rows,
                                 term_cols,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         copy_mode::CopyAction::Copy(text) => {
@@ -681,6 +752,7 @@ pub fn run(
                                 &status_text,
                                 term_rows,
                                 term_cols,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         copy_mode::CopyAction::Continue => {}
@@ -814,6 +886,7 @@ pub fn run(
                                     &status_text,
                                     term_rows,
                                     term_cols,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             }
                             copy_mode::CopyAction::Copy(text) => {
@@ -826,6 +899,7 @@ pub fn run(
                                     &status_text,
                                     term_rows,
                                     term_cols,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             }
                             copy_mode::CopyAction::Continue => {}
@@ -840,9 +914,10 @@ pub fn run(
                         remaining,
                         enter_copy_mode,
                         paste,
-                        flash,
+                        mut flash,
                         show_help,
                         request_session_chooser,
+                        toggle_mouse,
                     ) = process_prefix(
                         input,
                         &mut prefix_state,
@@ -851,6 +926,25 @@ pub fn run(
                         session_count,
                         last_window,
                     )?;
+                    if toggle_mouse {
+                        mouse_ctl.ovr = mouse_ctl.ovr.next();
+                        flash = Some(match mouse_ctl.ovr {
+                            MouseOverride::Auto => "mouse: auto (config)".to_string(),
+                            MouseOverride::ForceOn => "mouse: forced ON".to_string(),
+                            MouseOverride::ForceOff => {
+                                "mouse: forced OFF (clicks dead — Ctrl-A m cycles)".to_string()
+                            }
+                        });
+                        // Apply before the flash render below so the [M]
+                        // button repaints in the same pass.
+                        sync_mouse_modes(
+                            &mut applied_mouse,
+                            &grid,
+                            &mut mouse_decoder,
+                            copy_mode.is_some(),
+                            &mut mouse_ctl,
+                        );
+                    }
                     if show_help {
                         show_help_overlay(&server_version);
                         // Invalidate the renderer so the screen is fully redrawn.
@@ -860,7 +954,14 @@ pub fn run(
                         let mut stdout = client_stdout();
                         write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                         renderer.render(&mut stdout, &mut grid)?;
-                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                        render_status_bar(
+                            &mut stdout,
+                            &status_text,
+                            term_rows,
+                            term_cols,
+                            &grid,
+                            mouse_reporting_on(applied_mouse),
+                        )?;
                         // Ask the server for a fresh snapshot too — a plain
                         // re-render can leave stale rows after the overlay
                         // cleared the screen.
@@ -881,6 +982,7 @@ pub fn run(
                             term_rows,
                             term_cols,
                             &grid,
+                            mouse_reporting_on(applied_mouse),
                         )?;
                     }
                     if !passthrough.is_empty() {
@@ -951,6 +1053,7 @@ pub fn run(
                                         term_rows,
                                         term_cols,
                                         &grid,
+                                        mouse_reporting_on(applied_mouse),
                                     )?;
                                 }
                                 ConfirmAction::Continue => {
@@ -978,6 +1081,7 @@ pub fn run(
                                 term_rows,
                                 term_cols,
                                 &grid,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         ConfirmAction::Cancelled => {
@@ -989,6 +1093,7 @@ pub fn run(
                                 term_rows,
                                 term_cols,
                                 &grid,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         ConfirmAction::Continue => {
@@ -1000,12 +1105,36 @@ pub fn run(
         }
         // Copy mode toggles via input — keep outer mouse reporting in
         // sync (it backs drag-select while copy mode is active).
-        sync_mouse_modes(
+        if sync_mouse_modes(
             &mut applied_mouse,
             &grid,
             &mut mouse_decoder,
             copy_mode.is_some(),
-        );
+            &mut mouse_ctl,
+        ) {
+            // The [M] indicator changed state — repaint the bar.
+            let mut stdout = client_stdout();
+            if let Some(ref msg) = flash_msg {
+                render_flash_status_bar(
+                    &mut stdout,
+                    msg,
+                    &status_text,
+                    term_rows,
+                    term_cols,
+                    &grid,
+                    mouse_reporting_on(applied_mouse),
+                )?;
+            } else {
+                render_status_bar(
+                    &mut stdout,
+                    &status_text,
+                    term_rows,
+                    term_cols,
+                    &grid,
+                    mouse_reporting_on(applied_mouse),
+                )?;
+            }
+        }
         if stdin_eof {
             break;
         }
@@ -1157,6 +1286,7 @@ pub fn run(
                                 term_rows,
                                 term_cols,
                                 &grid,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         ServerMsg::StatusBarUpdate {
@@ -1167,6 +1297,7 @@ pub fn run(
                             high_output: h,
                             server,
                             activity,
+                            mouse,
                         } => {
                             // Track last window for Ctrl-A Ctrl-A toggle.
                             let new_active = Some(active as u8);
@@ -1185,6 +1316,7 @@ pub fn run(
                                 h,
                                 &server,
                                 &activity,
+                                &mouse,
                             );
                             let mut stdout = client_stdout();
                             if let Some(ref msg) = flash_msg {
@@ -1195,6 +1327,7 @@ pub fn run(
                                     term_rows,
                                     term_cols,
                                     &grid,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             } else {
                                 render_status_bar(
@@ -1203,11 +1336,28 @@ pub fn run(
                                     term_rows,
                                     term_cols,
                                     &grid,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
+                            }
+                            // Outer-terminal (iTerm tab/window) title:
+                            // "lrmux - server:session:window", ●-prefixed
+                            // while any window has unseen output.
+                            let title = outer_title(
+                                &server,
+                                &session,
+                                &windows,
+                                active as usize,
+                                &activity,
+                            );
+                            if last_title.as_deref() != Some(title.as_str()) {
+                                write!(stdout, "\x1b]0;{title}\x07")?;
+                                stdout.flush()?;
+                                last_title = Some(title);
                             }
                         }
                         ServerMsg::PaneExit { .. } => {
                             exit_reason = Some("session ended (last pane exited)".to_string());
+                            ended = true;
                             break;
                         }
                         ServerMsg::IdentifyAck { .. } => {}
@@ -1262,9 +1412,12 @@ pub fn run(
                             // query isn't stuck behind a partial stdout write.
                             let _ = client_stdout().flush();
                             let mut probe_leftover = Vec::new();
-                            if let Some(reply) =
-                                query_outer_osc_color(code, bell_terminated, &mut probe_leftover)
-                            {
+                            if let Some(reply) = query_outer_osc_color(
+                                code,
+                                bell_terminated,
+                                &mut probe_leftover,
+                                &mut osc_probe,
+                            ) {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
                                     data: reply,
@@ -1294,6 +1447,7 @@ pub fn run(
                     &grid,
                     &mut mouse_decoder,
                     copy_mode.is_some(),
+                    &mut mouse_ctl,
                 );
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
@@ -1309,11 +1463,19 @@ pub fn run(
                     } else {
                         let mut stdout = client_stdout();
                         renderer.render(&mut stdout, &mut grid)?;
-                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                        render_status_bar(
+                            &mut stdout,
+                            &status_text,
+                            term_rows,
+                            term_cols,
+                            &grid,
+                            mouse_reporting_on(applied_mouse),
+                        )?;
                     }
                 }
             } else if last == 0 {
                 // Server closed the connection (EOF).
+                ended = true;
                 let sock_path = socket_path.to_string_lossy();
                 if !std::path::Path::new(&*sock_path).exists() {
                     exit_reason = Some("server shut down".to_string());
@@ -1340,6 +1502,7 @@ pub fn run(
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             // Server socket hung up. Check if the server is still alive
             // to give the user a clue about why we disconnected.
+            ended = true;
             let sock_path = socket_path.to_string_lossy();
             if !std::path::Path::new(&*sock_path).exists() {
                 exit_reason = Some("server shut down".to_string());
@@ -1360,9 +1523,9 @@ pub fn run(
     if let Some(reason) = exit_reason {
         eprintln!("lrmux: {reason}");
     }
-    Ok(if want_selector {
+    let hint = || {
         let tcp = crate::ipc::tcp_addr();
-        ClientExit::Selector(SelectHint {
+        SelectHint {
             server: if tcp.is_none() {
                 socket_path
                     .file_name()
@@ -1376,7 +1539,12 @@ pub fn run(
             } else {
                 Some(current_session)
             },
-        })
+        }
+    };
+    Ok(if want_selector {
+        ClientExit::Selector(hint())
+    } else if ended {
+        ClientExit::SessionEnded(hint())
     } else {
         ClientExit::Done
     })
@@ -1401,7 +1569,8 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
 
 /// Process input bytes through the prefix-key state machine.
 /// Returns (passthrough, detach, to_selector, confirm, remaining,
-/// enter_copy_mode, paste, flash, show_help, request_session_chooser).
+/// enter_copy_mode, paste, flash, show_help, request_session_chooser,
+/// toggle_mouse).
 /// When a confirm dialog is triggered, remaining bytes after the trigger are returned
 /// so the caller can process them with process_confirm.
 #[allow(clippy::type_complexity)]
@@ -1423,6 +1592,7 @@ fn process_prefix(
     Option<String>,
     bool,
     bool,
+    bool,
 )> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
@@ -1433,6 +1603,7 @@ fn process_prefix(
     let mut flash: Option<String> = None;
     let mut show_help = false;
     let mut request_session_chooser = false;
+    let mut toggle_mouse = false;
 
     for (i, &byte) in input.iter().enumerate() {
         if confirm.is_some() {
@@ -1448,6 +1619,7 @@ fn process_prefix(
                 flash,
                 show_help,
                 request_session_chooser,
+                toggle_mouse,
             ));
         }
         match state {
@@ -1561,6 +1733,11 @@ fn process_prefix(
                         let (r, c) = terminal::get_size();
                         send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
                     }
+                    // 'm' → cycle the mouse-reporting override
+                    // (auto → forced on → forced off → auto).
+                    b'm' => {
+                        toggle_mouse = true;
+                    }
                     // '[' → enter copy/scrollback mode.
                     b'[' => {
                         enter_copy_mode = true;
@@ -1609,6 +1786,7 @@ fn process_prefix(
         flash,
         show_help,
         request_session_chooser,
+        toggle_mouse,
     ))
 }
 
@@ -1825,6 +2003,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 /// Identity is `[session]@server`, then the window list.
 /// Also returns each window entry's 1-based column span (start, end,
 /// window index) for mouse hit-testing on the status bar row.
+#[allow(clippy::too_many_arguments)]
 fn format_status_bar(
     session: &str,
     windows: &[String],
@@ -1833,6 +2012,7 @@ fn format_status_bar(
     high_output: bool,
     server: &str,
     activity: &[bool],
+    mouse: &[bool],
 ) -> (String, Vec<(u16, u16, u8)>) {
     // Each sequence starts with `0;` so reverse/underline/italic from the
     // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
@@ -1861,15 +2041,27 @@ fn format_status_bar(
         String::new()
     };
 
+    // Per-window mouse marker: cyan [M] on blue when that window's pane
+    // requested mouse tracking.
+    const MWANT: &str = "\x1b[0;44;96m";
+
     let mut parts: Vec<String> = Vec::new();
     for (i, name) in windows.iter().enumerate() {
         let has_act = activity.get(i).copied().unwrap_or(false);
-        if i == active {
-            parts.push(format!("{}{}:{}*{}{}", ACTIVE, i, name, BAR, burst_marker));
-        } else if has_act {
-            parts.push(format!("{ACTIVITY}●{BAR}{}:{}", i, name));
+        let m = if mouse.get(i).copied().unwrap_or(false) {
+            format!("{MWANT}[M]{BAR}")
         } else {
-            parts.push(format!("{}:{}", i, name));
+            String::new()
+        };
+        if i == active {
+            parts.push(format!(
+                "{}{}:{}*{}{}{}",
+                ACTIVE, i, name, BAR, m, burst_marker
+            ));
+        } else if has_act {
+            parts.push(format!("{ACTIVITY}●{BAR}{}:{}{}", i, name, m));
+        } else {
+            parts.push(format!("{}:{}{}", i, name, m));
         }
     }
     let identity = if server.is_empty() {
@@ -1910,6 +2102,33 @@ fn format_status_bar(
     )
 }
 
+/// Compose the outer-terminal (iTerm tab/window) title shown while
+/// attached: `lrmux - server:session:window`, prefixed with `● ` when any
+/// window has unseen output — the same flags that drive the status-bar
+/// bullets. Names are user-controlled (rename-session/window), so control
+/// characters are stripped to keep them out of the OSC payload.
+fn outer_title(
+    server: &str,
+    session: &str,
+    windows: &[String],
+    active: usize,
+    activity: &[bool],
+) -> String {
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+    let window = windows.get(active).map(String::as_str).unwrap_or("?");
+    let dot = if activity.iter().any(|a| *a) {
+        "● "
+    } else {
+        ""
+    };
+    format!(
+        "{dot}lrmux - {}:{}:{}",
+        clean(server),
+        clean(session),
+        clean(window)
+    )
+}
+
 /// Render the status bar at the bottom of the terminal.
 /// The status bar always occupies the last row of the terminal (term_rows).
 /// After rendering, the cursor is repositioned to the grid cursor location.
@@ -1919,6 +2138,7 @@ fn render_status_bar(
     term_rows: usize,
     term_cols: usize,
     grid: &Grid,
+    mouse_on: bool,
 ) -> io::Result<()> {
     // Position cursor at the last row of the terminal (1-based).
     let row = term_rows;
@@ -1940,6 +2160,8 @@ fn render_status_bar(
     }
     // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
+    // [M] indicator/toggle at the right edge.
+    draw_mouse_button(stdout, term_rows, term_cols, mouse_on)?;
     // Reposition cursor to the grid cursor location so the user sees
     // the cursor in the pane, not on the status bar.
     // Only reposition if the cursor is within the viewport.
@@ -1967,6 +2189,7 @@ fn render_flash_status_bar(
     term_rows: usize,
     term_cols: usize,
     grid: &Grid,
+    mouse_on: bool,
 ) -> io::Result<()> {
     let row = term_rows;
     write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
@@ -2004,6 +2227,7 @@ fn render_flash_status_bar(
         write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - total_visible))?;
     }
     stdout.write_all(b"\x1b[0m")?;
+    draw_mouse_button(stdout, term_rows, term_cols, mouse_on)?;
 
     // Reposition cursor.
     if grid.cursor_visible {
@@ -2061,6 +2285,7 @@ fn restore_normal_view(
     status_text: &str,
     term_rows: usize,
     term_cols: usize,
+    mouse_on: bool,
 ) -> io::Result<()> {
     let mut stdout = client_stdout();
     // Hide cursor (copy mode shows it; normal mode hides it).
@@ -2078,6 +2303,7 @@ fn restore_normal_view(
         term_rows,
         term_cols,
         grid,
+        mouse_on,
     )?;
     Ok(())
 }
@@ -2198,25 +2424,86 @@ fn restore_terminal() {
     let _ = stdout.flush();
 }
 
+/// Runtime mouse override toggled by `Ctrl-A m` or a click on the
+/// status-bar [M] control (which can only disable — when reporting is
+/// off, clicks never reach us).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseOverride {
+    /// Follow the configured `behavior.mouse` policy.
+    Auto,
+    /// Reporting on regardless of pane requests.
+    ForceOn,
+    /// Reporting off regardless of pane requests.
+    ForceOff,
+}
+
+impl MouseOverride {
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::ForceOn,
+            Self::ForceOn => Self::ForceOff,
+            Self::ForceOff => Self::Auto,
+        }
+    }
+}
+
+/// Outer-terminal mouse policy state: config mode + runtime override +
+/// the auto_enable sticky latch.
+struct MouseCtl {
+    mode: crate::config::MouseMode,
+    ovr: MouseOverride,
+    latched: bool,
+}
+
+/// The effective outer-terminal mouse mask.
+///
+/// Base is the child's tracking mask, widened to button-events (1002)
+/// when something local needs reports — copy mode selection or the
+/// altscroll wheel translation. The configured mode can force that on
+/// (`always_on`, or `auto_enable` after the first pane request) or fully
+/// off (`off`); the runtime override always wins last.
+fn desired_mouse_mask(ctl: &mut MouseCtl, grid: &Grid, local: bool) -> u8 {
+    use crate::config::MouseMode;
+    if ctl.mode == MouseMode::AutoEnable && grid.mouse_tracking != 0 {
+        ctl.latched = true;
+    }
+    // Runtime override wins over the configured mode in both directions.
+    if ctl.ovr == MouseOverride::ForceOff {
+        return 0;
+    }
+    if ctl.mode == MouseMode::Off && ctl.ovr != MouseOverride::ForceOn {
+        return 0;
+    }
+    let mut desired = grid.mouse_tracking;
+    if local || (grid.mouse_altscroll && desired == 0) {
+        desired |= 0b010;
+    }
+    if ctl.mode == MouseMode::AlwaysOn
+        || (ctl.mode == MouseMode::AutoEnable && ctl.latched)
+        || ctl.ovr == MouseOverride::ForceOn
+    {
+        desired |= 0b010;
+    }
+    desired
+}
+
 /// Keep the outer terminal's mouse reporting in sync with what can use
 /// reports: the child's tracking mask, alternate-scroll (wheel→arrows
-/// translation needs wheel reports), or copy mode (drag-select). With
-/// none of those, reporting stays off and the terminal keeps its native
-/// wheel scrollback and selection — lrmux never interprets the wheel.
+/// translation needs wheel reports), or copy mode (drag-select) — all
+/// under the configured policy and runtime override. With none of those,
+/// reporting stays off and the terminal keeps its native wheel
+/// scrollback and selection — lrmux never interprets the wheel.
+/// Returns true when the applied mask changed (status bar repaint).
 fn sync_mouse_modes(
     applied: &mut Option<u8>,
     grid: &Grid,
     decoder: &mut mouse::Decoder,
     local: bool,
-) {
-    let mut desired = grid.mouse_tracking;
-    if local || (grid.mouse_altscroll && desired == 0) {
-        // Button-event reporting gives drag + wheel reports for local
-        // copy-mode selection or altscroll translation.
-        desired |= 0b010;
-    }
+    ctl: &mut MouseCtl,
+) -> bool {
+    let desired = desired_mouse_mask(ctl, grid, local);
     if *applied == Some(desired) {
-        return;
+        return false;
     }
     let mut stdout = client_stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
@@ -2226,6 +2513,41 @@ fn sync_mouse_modes(
     let _ = stdout.flush();
     *applied = Some(desired);
     decoder.set_active(desired != 0);
+    true
+}
+
+/// Whether outer-terminal mouse reports can currently reach us.
+fn mouse_reporting_on(applied: Option<u8>) -> bool {
+    applied.unwrap_or(0) != 0
+}
+
+/// Paint the `[M]`/`[m]` mouse-reporting indicator at the status bar's
+/// right edge: bright green while reports reach lrmux (clickable —
+/// disables), dim while off (clicks can't reach us then; `Ctrl-A m`
+/// re-enables).
+fn draw_mouse_button(
+    stdout: &mut TraceStdout,
+    term_rows: usize,
+    term_cols: usize,
+    on: bool,
+) -> io::Result<()> {
+    if term_cols < 8 {
+        return Ok(());
+    }
+    let (style, label) = if on {
+        ("\x1b[0;1;44;92m", "[M]")
+    } else {
+        ("\x1b[0;2;44;37m", "[m]")
+    };
+    write!(
+        stdout,
+        "\x1b[{};{}H{}{}\x1b[0m",
+        term_rows,
+        term_cols - 2,
+        style,
+        label
+    )?;
+    Ok(())
 }
 
 /// Try to parse a complete server frame from the buffer.
@@ -2395,16 +2717,78 @@ fn show_help_overlay(server_version: &str) {
 /// Non-reply bytes picked up while probing (user keystrokes read
 /// alongside the reply) go into `extra_input` for the caller to re-feed
 /// as input instead of dropping them.
+/// How long an OSC probe waits for a reply per channel. Real terminals
+/// answer in a few ms; 300ms still covers laggy SSH links while a silent
+/// terminal costs a fraction of a second instead of the old 2s per
+/// attempt — which stacked across channels and colors into a multi-second
+/// attach freeze (e.g. on tablet terminals that don't answer OSC at all).
+const OSC_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Liveness cache for the outer-TTY query channels. A channel that timed
+/// out once is marked dead: a terminal that doesn't answer OSC won't
+/// start answering on the next probe, and retrying would re-freeze the
+/// input loop for the whole timeout on every subsequent query.
+#[derive(Default)]
+pub(crate) struct OscProbe {
+    /// stdin/stdout channel (interactive attach only).
+    stdio: Option<bool>,
+    /// /dev/tty channel — fallback for the interactive client, and the
+    /// only channel for -CC where stdout is the control-mode stream.
+    dev_tty: Option<bool>,
+}
+
+impl OscProbe {
+    fn alive(known: Option<bool>) -> bool {
+        known != Some(false)
+    }
+}
+
 pub(crate) fn report_outer_term_palette(
     stream: &mut impl Write,
     extra_input: &mut Vec<u8>,
+    probe: &mut OscProbe,
 ) -> io::Result<()> {
-    let fg = query_outer_osc_color(10, true, extra_input)
-        .and_then(|d| crate::term::parse_osc_color_reply(&d))
-        .map(|(_, rgb)| rgb);
-    let bg = query_outer_osc_color(11, true, extra_input)
-        .and_then(|d| crate::term::parse_osc_color_reply(&d))
-        .map(|(_, rgb)| rgb);
+    // Both queries go out in one write per channel — the wait covers both
+    // replies, halving the worst-case block on slow or silent terminals.
+    let mut fg = None;
+    let mut bg = None;
+    let take = |code: u8, res: &mut Vec<Option<Vec<u8>>>| {
+        let i = if code == 10 { 0 } else { 1 };
+        res[i]
+            .take()
+            .and_then(|d| crate::term::parse_osc_color_reply(&d))
+            .map(|(_, rgb)| rgb)
+    };
+    if OscProbe::alive(probe.stdio) {
+        let mut res = query_osc_colors_on_fds(
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            &[10, 11],
+            true,
+            extra_input,
+        );
+        probe.stdio = Some(res.iter().any(Option::is_some));
+        fg = take(10, &mut res);
+        bg = take(11, &mut res);
+    }
+    if (fg.is_none() || bg.is_none()) && OscProbe::alive(probe.dev_tty) {
+        let codes: Vec<u8> = [(fg.is_none()).then_some(10), (bg.is_none()).then_some(11)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut res = query_osc_colors_via_dev_tty(&codes, true, extra_input);
+        probe.dev_tty = Some(res.iter().any(Option::is_some));
+        for (code, r) in codes.iter().zip(res.iter_mut()) {
+            let rgb = r
+                .take()
+                .and_then(|d| crate::term::parse_osc_color_reply(&d))
+                .map(|(_, rgb)| rgb);
+            match code {
+                10 => fg = rgb,
+                _ => bg = rgb,
+            }
+        }
+    }
     if fg.is_none() && bg.is_none() {
         return Ok(());
     }
@@ -2415,35 +2799,39 @@ pub(crate) fn report_outer_term_palette(
 /// Query the outer terminal's OSC 10 (fg) or 11 (bg) color.
 ///
 /// Tries stdout/stdin first (the fds the interactive client already has on
-/// the user's terminal), then `/dev/tty` as a fallback. A failed query
-/// surfaces as vim E1568 and wrong `background` / colorscheme colors.
+/// the user's terminal), then `/dev/tty` as a fallback — unless `probe`
+/// already knows that channel is dead. A failed query surfaces as vim
+/// E1568 and wrong `background` / colorscheme colors.
 pub(crate) fn query_outer_osc_color(
     code: u8,
     bell_terminated: bool,
     extra_input: &mut Vec<u8>,
+    probe: &mut OscProbe,
 ) -> Option<Vec<u8>> {
     if code != 10 && code != 11 {
         return None;
     }
-
-    let mut query = Vec::with_capacity(16);
-    query.extend_from_slice(b"\x1b]");
-    query.extend_from_slice(code.to_string().as_bytes());
-    query.extend_from_slice(b";?");
-    if bell_terminated {
-        query.push(0x07);
-    } else {
-        query.extend_from_slice(b"\x1b\\");
+    if OscProbe::alive(probe.stdio) {
+        let mut res = query_osc_colors_on_fds(
+            libc::STDIN_FILENO,
+            libc::STDOUT_FILENO,
+            &[code],
+            bell_terminated,
+            extra_input,
+        );
+        probe.stdio = Some(res[0].is_some());
+        if let Some(reply) = res[0].take() {
+            return Some(reply);
+        }
     }
-
-    // Prefer the fds we already own; fall back to /dev/tty (needed for -CC
-    // where stdout is the control-mode channel, not a raw terminal).
-    if let Some(reply) =
-        query_osc_on_fds(libc::STDIN_FILENO, libc::STDOUT_FILENO, &query, extra_input)
-    {
-        return Some(reply);
+    if OscProbe::alive(probe.dev_tty) {
+        let mut res = query_osc_colors_via_dev_tty(&[code], bell_terminated, extra_input);
+        probe.dev_tty = Some(res[0].is_some());
+        if let Some(reply) = res[0].take() {
+            return Some(reply);
+        }
     }
-    query_osc_via_dev_tty(&query, extra_input)
+    None
 }
 
 /// Control-mode variant: never write OSC to stdout (that's the tmux control
@@ -2452,26 +2840,24 @@ pub(crate) fn query_outer_osc_color_for_control(
     code: u8,
     bell_terminated: bool,
     extra_input: &mut Vec<u8>,
+    probe: &mut OscProbe,
 ) -> Option<Vec<u8>> {
-    if code != 10 && code != 11 {
+    if code != 10 && code != 11 || !OscProbe::alive(probe.dev_tty) {
         return None;
     }
-    let mut query = Vec::with_capacity(16);
-    query.extend_from_slice(b"\x1b]");
-    query.extend_from_slice(code.to_string().as_bytes());
-    query.extend_from_slice(b";?");
-    if bell_terminated {
-        query.push(0x07);
-    } else {
-        query.extend_from_slice(b"\x1b\\");
-    }
-    query_osc_via_dev_tty(&query, extra_input)
+    let mut res = query_osc_colors_via_dev_tty(&[code], bell_terminated, extra_input);
+    probe.dev_tty = Some(res[0].is_some());
+    res[0].take()
 }
 
-fn query_osc_via_dev_tty(query: &[u8], extra_input: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn query_osc_colors_via_dev_tty(
+    codes: &[u8],
+    bell_terminated: bool,
+    extra_input: &mut Vec<u8>,
+) -> Vec<Option<Vec<u8>>> {
     let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
     if fd < 0 {
-        return None;
+        return vec![None; codes.len()];
     }
     struct TtyFd(i32);
     impl Drop for TtyFd {
@@ -2482,20 +2868,22 @@ fn query_osc_via_dev_tty(query: &[u8], extra_input: &mut Vec<u8>) -> Option<Vec<
         }
     }
     let tty = TtyFd(fd);
-    query_osc_on_fds(tty.0, tty.0, query, extra_input)
+    query_osc_colors_on_fds(tty.0, tty.0, codes, bell_terminated, extra_input)
 }
 
-/// Returns the OSC reply, or None on timeout. Bytes read that are not
-/// part of the reply — pending input drained up front, user keystrokes
-/// arriving mid-wait, trailing bytes after the reply — are appended to
-/// `extra_input` so the caller can re-feed them instead of swallowing
-/// what the user typed while we were blocked probing.
-fn query_osc_on_fds(
+/// Returns one slot per queried code — the OSC reply bytes, or None on
+/// timeout for that code. Bytes read that are not part of a reply —
+/// pending input drained up front, user keystrokes arriving mid-wait,
+/// trailing bytes after the last reply — are appended to `extra_input`
+/// so the caller can re-feed them instead of swallowing what the user
+/// typed while we were blocked probing.
+fn query_osc_colors_on_fds(
     read_fd: i32,
     write_fd: i32,
-    query: &[u8],
+    codes: &[u8],
+    bell_terminated: bool,
     extra_input: &mut Vec<u8>,
-) -> Option<Vec<u8>> {
+) -> Vec<Option<Vec<u8>>> {
     // Disable ECHO while waiting for the reply. Interactive clients are
     // already raw, but control-mode / edge paths can still be cooked — and
     // an echoed OSC reply paints garbage on the user's screen.
@@ -2553,31 +2941,43 @@ fn query_osc_on_fds(
         }
     }
 
+    let mut query = Vec::with_capacity(16 * codes.len());
+    for code in codes {
+        query.extend_from_slice(b"\x1b]");
+        query.extend_from_slice(code.to_string().as_bytes());
+        query.extend_from_slice(b";?");
+        if bell_terminated {
+            query.push(0x07);
+        } else {
+            query.extend_from_slice(b"\x1b\\");
+        }
+    }
     let w = unsafe { libc::write(write_fd, query.as_ptr() as *const _, query.len()) };
-    client_trace("QRY", query);
+    client_trace("QRY", &query);
     if w < 0 {
         if fl >= 0 {
             unsafe {
                 libc::fcntl(read_fd, libc::F_SETFL, fl);
             }
         }
-        return None;
+        return vec![None; codes.len()];
     }
     if write_fd == libc::STDOUT_FILENO {
         let _ = client_stdout().flush();
     }
 
+    let mut replies: Vec<Option<Vec<u8>>> = vec![None; codes.len()];
     let mut buf = Vec::with_capacity(128);
     let mut tmp = [0u8; 256];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    let deadline = std::time::Instant::now() + OSC_REPLY_TIMEOUT;
     if fl >= 0 {
         unsafe {
             libc::fcntl(read_fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
         }
     }
-    let result = loop {
-        if std::time::Instant::now() >= deadline {
-            break None;
+    loop {
+        if replies.iter().all(Option::is_some) || std::time::Instant::now() >= deadline {
+            break;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let mut pfd = libc::pollfd {
@@ -2585,7 +2985,7 @@ fn query_osc_on_fds(
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = remaining.as_millis().min(250) as i32;
+        let ms = remaining.as_millis().min(50) as i32;
         let pret = unsafe { libc::poll(&mut pfd, 1, ms) };
         if pret <= 0 {
             continue;
@@ -2596,28 +2996,37 @@ fn query_osc_on_fds(
         }
         buf.extend_from_slice(&tmp[..n as usize]);
         client_trace("KEY", &tmp[..n as usize]);
-        if let Some(end) = osc_reply_end(&buf) {
-            // Anything before/after the reply bytes is user input that
-            // raced the probe — hand it back, don't eat it.
-            let start = buf.windows(2).position(|w| w == b"\x1b]").unwrap_or(0);
+        // Extract every complete reply; map each to its query by OSC code.
+        while let Some(start) = buf.windows(2).position(|w| w == b"\x1b]") {
+            let Some(end) = osc_reply_end(&buf[start..]).map(|e| start + e) else {
+                break;
+            };
             extra_input.extend_from_slice(&buf[..start]);
-            extra_input.extend_from_slice(&buf[end..]);
-            break Some(buf[start..end].to_vec());
+            let reply = buf[start..end].to_vec();
+            if let Some((code, _)) = crate::term::parse_osc_color_reply(&reply)
+                && let Some(slot) = codes
+                    .iter()
+                    .zip(replies.iter_mut())
+                    .find(|(c, r)| **c == code && r.is_none())
+                    .map(|(_, r)| r)
+            {
+                *slot = Some(reply);
+            }
+            buf.drain(..end);
         }
         if buf.len() > 4096 {
-            break None;
+            break;
         }
-    };
-    if result.is_none() {
-        // Timed out mid-reply (or got only input): return what we read.
-        extra_input.extend_from_slice(&buf);
     }
+    // Whatever remains — stray input raced in, or an incomplete reply
+    // tail — is real bytes the caller must not lose.
+    extra_input.extend_from_slice(&buf);
     if fl >= 0 {
         unsafe {
             libc::fcntl(read_fd, libc::F_SETFL, fl);
         }
     }
-    result
+    replies
 }
 
 /// End index (exclusive) of a complete OSC reply in `buf`, or None if incomplete.
@@ -2737,6 +3146,7 @@ mod tests {
             false,
             "infra-284-letsencrypt",
             &[],
+            &[],
         );
         let visible = strip_ansi(&text);
         assert!(
@@ -2747,7 +3157,7 @@ mod tests {
 
     #[test]
     fn status_bar_omits_empty_server() {
-        let (text, _) = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
+        let (text, _) = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[], &[]);
         let visible = strip_ansi(&text);
         assert!(!visible.contains('@'), "{visible}");
         assert!(visible.contains("lrmux"), "{visible}");
@@ -2763,10 +3173,121 @@ mod tests {
             false,
             "srv",
             &[false, true],
+            &[],
         );
         let visible = strip_ansi(&text);
         assert!(visible.contains("●1:vim"), "{visible}");
         assert!(!visible.contains("●0:"), "{visible}");
+    }
+
+    #[test]
+    fn status_bar_marks_windows_with_mouse_tracking() {
+        let (text, _) = format_status_bar(
+            "lrmux",
+            &["zsh".into(), "vim".into()],
+            0,
+            "abc",
+            false,
+            "srv",
+            &[],
+            &[false, true],
+        );
+        let visible = strip_ansi(&text);
+        assert!(visible.contains("1:vim[M]"), "{visible}");
+        assert!(!visible.contains("0:zsh[M]"), "{visible}");
+    }
+
+    fn ctl(mode: crate::config::MouseMode) -> MouseCtl {
+        MouseCtl {
+            mode,
+            ovr: MouseOverride::Auto,
+            latched: false,
+        }
+    }
+
+    #[test]
+    fn mouse_mask_only_required_follows_the_pane() {
+        use crate::config::MouseMode;
+        let mut c = ctl(MouseMode::OnlyRequired);
+        let mut grid = Grid::new(10, 40, 10);
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0);
+        grid.mouse_tracking = 0b111;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b111);
+        // Copy mode widens the mask to button events.
+        grid.mouse_tracking = 0;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, true), 0b010);
+    }
+
+    #[test]
+    fn mouse_mask_always_on_and_off() {
+        use crate::config::MouseMode;
+        let grid = Grid::new(10, 40, 10);
+        let mut c = ctl(MouseMode::AlwaysOn);
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b010);
+        let mut c = ctl(MouseMode::Off);
+        assert_eq!(desired_mouse_mask(&mut c, &grid, true), 0);
+    }
+
+    #[test]
+    fn mouse_mask_auto_enable_latches_after_pane_request() {
+        use crate::config::MouseMode;
+        let mut c = ctl(MouseMode::AutoEnable);
+        let mut grid = Grid::new(10, 40, 10);
+        // Off until some pane asks for tracking.
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0);
+        grid.mouse_tracking = 0b011;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b011);
+        assert!(c.latched);
+        // Sticky: stays on (button level) after the pane drops tracking.
+        grid.mouse_tracking = 0;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b010);
+    }
+
+    #[test]
+    fn mouse_mask_override_wins_both_ways() {
+        use crate::config::MouseMode;
+        let grid = Grid::new(10, 40, 10);
+        let mut c = ctl(MouseMode::Off);
+        c.ovr = MouseOverride::ForceOn;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b010);
+        let mut c = ctl(MouseMode::AlwaysOn);
+        c.ovr = MouseOverride::ForceOff;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, true), 0);
+    }
+
+    #[test]
+    fn outer_title_format_and_activity_dot() {
+        assert_eq!(
+            outer_title(
+                "srv",
+                "work",
+                &["zsh".into(), "vim".into()],
+                1,
+                &[false, false]
+            ),
+            "lrmux - srv:work:vim"
+        );
+        // Unseen output on another window prefixes the bullet.
+        assert_eq!(
+            outer_title(
+                "srv",
+                "work",
+                &["zsh".into(), "vim".into()],
+                0,
+                &[false, true]
+            ),
+            "● lrmux - srv:work:zsh"
+        );
+        // Older servers send no activity flags — plain title.
+        assert_eq!(
+            outer_title("srv", "work", &["zsh".into()], 0, &[]),
+            "lrmux - srv:work:zsh"
+        );
+        // Control characters in names can't smuggle escapes into the OSC.
+        assert_eq!(
+            outer_title("s\x1b]8;;x", "we\x07ird", &["z\x1bsh".into()], 0, &[]),
+            "lrmux - s]8;;x:weird:zsh"
+        );
     }
 
     #[test]
@@ -2779,6 +3300,7 @@ mod tests {
             false,
             "srv",
             &[true, false],
+            &[],
         );
         let visible = strip_ansi(&text);
         assert_eq!(spans.len(), 2);
@@ -2793,5 +3315,95 @@ mod tests {
         assert_eq!(spans[1], (w1, w1 + "1:vim*".chars().count() as u16, 1));
         assert_eq!(spans[1].0, spans[0].1 + 3); // joined with " | "
         assert!(visible.contains("●0:zsh | 1:vim*"), "{visible}");
+    }
+
+    fn socketpair() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        (fds[0], fds[1])
+    }
+
+    /// Terminal-side helper: read the probe query, then write `response`.
+    fn fake_terminal(fd: i32, response: &'static [u8]) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut q = [0u8; 128];
+            unsafe {
+                libc::read(fd, q.as_mut_ptr() as *mut _, q.len());
+                libc::write(fd, response.as_ptr() as *const _, response.len());
+            }
+        })
+    }
+
+    #[test]
+    fn osc_probe_collects_both_replies_in_one_roundtrip() {
+        let (a, b) = socketpair();
+        let term = fake_terminal(
+            b,
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07\x1b]11;rgb:1111/2222/3333\x07",
+        );
+        let mut extra = Vec::new();
+        let res = query_osc_colors_on_fds(a, a, &[10, 11], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert_eq!(
+            res[0].as_deref(),
+            Some(b"\x1b]10;rgb:aaaa/bbbb/cccc\x07".as_slice())
+        );
+        assert_eq!(
+            res[1].as_deref(),
+            Some(b"\x1b]11;rgb:1111/2222/3333\x07".as_slice())
+        );
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn osc_probe_returns_stray_keystrokes_as_input() {
+        let (a, b) = socketpair();
+        // 'x' arrives before the reply, 'y' after — both are user input.
+        let term = fake_terminal(b, b"x\x1b]10;rgb:aaaa/bbbb/cccc\x07y");
+        let mut extra = Vec::new();
+        let res = query_osc_colors_on_fds(a, a, &[10], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert!(res[0].is_some());
+        assert_eq!(extra, b"xy");
+    }
+
+    #[test]
+    fn osc_probe_times_out_fast_on_silent_terminal() {
+        let (a, b) = socketpair();
+        let term = fake_terminal(b, b"hi"); // input, but no reply
+        let mut extra = Vec::new();
+        let t = std::time::Instant::now();
+        let res = query_osc_colors_on_fds(a, a, &[10, 11], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert!(res.iter().all(Option::is_none));
+        assert_eq!(extra, b"hi");
+        // Must stay well under the old 2s-per-attempt behavior.
+        assert!(t.elapsed() < std::time::Duration::from_millis(900));
+    }
+
+    #[test]
+    fn osc_probe_reports_partial_replies() {
+        let (a, b) = socketpair();
+        let term = fake_terminal(b, b"\x1b]11;rgb:1111/2222/3333\x07");
+        let mut extra = Vec::new();
+        let res = query_osc_colors_on_fds(a, a, &[10, 11], true, &mut extra);
+        unsafe {
+            libc::close(a);
+        }
+        term.join().unwrap();
+        assert!(res[0].is_none());
+        assert!(res[1].is_some());
     }
 }

@@ -655,6 +655,7 @@ pub fn run(
                     fg: clients.iter().find_map(|c| c.palette.fg),
                     bg: clients.iter().find_map(|c| c.palette.bg),
                 };
+                let mouse_before = pane.grid.mouse_flags();
                 match pane.process_pty_output(palette_fallback) {
                     Ok((true, raw, osc_queries)) => {
                         let pane_id = pane.id;
@@ -698,6 +699,11 @@ pub fn run(
                             }),
                         );
                     }
+                }
+                // A pane toggling mouse tracking changes the [M] marker —
+                // refresh status bars.
+                if pane.grid.mouse_flags() != mouse_before {
+                    need_status_bar_all = true;
                 }
             }
         }
@@ -2364,6 +2370,16 @@ fn window_activity_flags(session: &Session) -> Vec<bool> {
     session.windows.iter().map(|w| w.activity).collect()
 }
 
+/// Per-window "pane asked for mouse tracking" flags — the client shows
+/// an [M] marker on those window entries in the status bar.
+fn window_mouse_flags(session: &Session) -> Vec<bool> {
+    session
+        .windows
+        .iter()
+        .map(|w| w.pane.grid.mouse_tracking != 0)
+        .collect()
+}
+
 /// Build SessionList payload from current server state.
 fn build_session_list(sessions: &[Session], clients: &[ClientConn]) -> Vec<SessionInfo> {
     sessions
@@ -2435,6 +2451,7 @@ fn encode_status_bar(
         high_output,
         server: crate::server::server_name().to_string(),
         activity: window_activity_flags(session),
+        mouse: window_mouse_flags(session),
     })
 }
 

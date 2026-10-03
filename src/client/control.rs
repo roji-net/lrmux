@@ -90,14 +90,25 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
     proto::send(&mut stream, &msg)?;
 
     // Probe outer TTY defaults via /dev/tty (stdout is the control channel).
+    let mut osc_probe = crate::client::OscProbe::default();
     {
         let mut probe_leftover = Vec::new();
-        let fg = crate::client::query_outer_osc_color_for_control(10, true, &mut probe_leftover)
-            .and_then(|d| crate::term::parse_osc_color_reply(&d))
-            .map(|(_, rgb)| rgb);
-        let bg = crate::client::query_outer_osc_color_for_control(11, true, &mut probe_leftover)
-            .and_then(|d| crate::term::parse_osc_color_reply(&d))
-            .map(|(_, rgb)| rgb);
+        let fg = crate::client::query_outer_osc_color_for_control(
+            10,
+            true,
+            &mut probe_leftover,
+            &mut osc_probe,
+        )
+        .and_then(|d| crate::term::parse_osc_color_reply(&d))
+        .map(|(_, rgb)| rgb);
+        let bg = crate::client::query_outer_osc_color_for_control(
+            11,
+            true,
+            &mut probe_leftover,
+            &mut osc_probe,
+        )
+        .and_then(|d| crate::term::parse_osc_color_reply(&d))
+        .map(|(_, rgb)| rgb);
         if fg.is_some() || bg.is_some() {
             let msg = proto::encode_client(&ClientMsg::TermPalette { fg, bg });
             proto::send(&mut stream, &msg)?;
@@ -301,6 +312,7 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                                 code,
                                 bell_terminated,
                                 &mut probe_leftover,
+                                &mut osc_probe,
                             ) {
                                 let msg = proto::encode_client(&ClientMsg::TermOscReply {
                                     pane_id,
