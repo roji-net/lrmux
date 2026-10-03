@@ -419,6 +419,11 @@ pub fn run(
     let announce_on = crate::server::network().announce && announce_tcp_port != 0;
     let mut next_announce = announce_on.then(std::time::Instant::now);
 
+    // Automatic-rename cadence: the poll timeout is capped at this
+    // interval so window names track the foreground command even when
+    // nothing else wakes the loop.
+    let mut last_name_sweep = std::time::Instant::now();
+
     // Peer directory: held when this node is a manager, a directory, or
     // accepts registrations. Fed by UDP announces and Register messages,
     // and verified over TCP when [peers] poll = true.
@@ -530,13 +535,17 @@ pub fn run(
             }
         }
 
-        let timeout_ms = match next_announce {
+        let mut timeout_ms = match next_announce {
             Some(t) => t
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
                 .clamp(0, i32::MAX as u128) as i32,
             None => -1,
         };
+        // Bound idle waits by the rename sweep cadence.
+        if timeout_ms < 0 || timeout_ms > NAME_SWEEP_INTERVAL.as_millis() as i32 {
+            timeout_ms = NAME_SWEEP_INTERVAL.as_millis() as i32;
+        }
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -704,6 +713,23 @@ pub fn run(
                 && note_window_output(&mut sessions, &clients, si, wi)
             {
                 need_status_bar_all = true;
+            }
+        }
+
+        // Automatic-rename sweep (bounded cadence): rename unlocked
+        // windows to their pane's foreground command.
+        if last_name_sweep.elapsed() >= NAME_SWEEP_INTERVAL {
+            last_name_sweep = std::time::Instant::now();
+            for session in sessions.iter_mut() {
+                for window in session.windows.iter_mut() {
+                    if let Some(name) = auto_rename_window(window) {
+                        need_status_bar_all = true;
+                        broadcast_control_notify(
+                            &mut clients,
+                            &format!("%window-renamed {} {}", window.id_str(), name),
+                        );
+                    }
+                }
             }
         }
 
@@ -1683,14 +1709,24 @@ pub fn run(
                                             }
                                             // Parse and execute a tmux-style command.
                                             let mut pending_affinities = None;
+                                            let mut pending_notifies = Vec::new();
+                                            let mut pending_status_bar = false;
                                             if handle_control_command(
                                                 &mut clients[client_idx],
                                                 &mut sessions,
                                                 &line,
                                                 socket_path,
                                                 &mut pending_affinities,
+                                                &mut pending_notifies,
+                                                &mut pending_status_bar,
                                             ) {
                                                 shutdown = true;
+                                            }
+                                            for line in &pending_notifies {
+                                                broadcast_control_notify(&mut clients, line);
+                                            }
+                                            if pending_status_bar {
+                                                need_status_bar_all = true;
                                             }
                                             if let Some((si, value)) = pending_affinities
                                                 && migrate_affinity_sessions(
@@ -2043,6 +2079,11 @@ pub fn run(
 /// Announce heartbeat cadence.
 const ANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often the automatic-rename sweep checks each pane's foreground
+/// process. The poll timeout is capped at this so it fires even on an
+/// idle server.
+const NAME_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Send an Announce (v2) to every well-known destination. No-op when
 /// `[network] announce` is off or there is no TCP port to advertise.
 /// `leaving` marks the graceful-shutdown flag.
@@ -2314,6 +2355,21 @@ fn window_mouse_flags(session: &Session) -> Vec<bool> {
         .iter()
         .map(|w| w.pane.grid.mouse_tracking != 0)
         .collect()
+}
+
+/// tmux automatic-rename: rename an unlocked window to its pane's
+/// foreground command when it changed. Returns the new name on rename.
+fn auto_rename_window(window: &mut Window) -> Option<String> {
+    if window.name_locked {
+        return None;
+    }
+    let name = crate::pty::pty_foreground_command(window.pane.pty_fd())?;
+    if name != window.name {
+        window.name = name.clone();
+        Some(name)
+    } else {
+        None
+    }
 }
 
 /// Build SessionList payload from current server state.
@@ -4777,6 +4833,10 @@ fn handle_control_command(
     line: &str,
     socket_path: &std::path::Path,
     pending_affinities: &mut Option<(usize, String)>,
+    // %notify lines to broadcast to all control clients (the handler
+    // only sees one client), and a flag requesting status-bar updates.
+    pending_notifies: &mut Vec<String>,
+    pending_status_bar: &mut bool,
 ) -> bool {
     crate::log::log(crate::log::Level::Info, &format!("control cmd: {}", line));
     let line = line.trim();
@@ -4834,7 +4894,15 @@ fn handle_control_command(
             continue;
         }
 
-        if handle_single_control_command(client, sessions, cmd, socket_path, pending_affinities) {
+        if handle_single_control_command(
+            client,
+            sessions,
+            cmd,
+            socket_path,
+            pending_affinities,
+            pending_notifies,
+            pending_status_bar,
+        ) {
             return true;
         }
         i += 1;
@@ -4848,6 +4916,8 @@ fn handle_single_control_command(
     line: &str,
     socket_path: &std::path::Path,
     pending_affinities: &mut Option<(usize, String)>,
+    pending_notifies: &mut Vec<String>,
+    pending_status_bar: &mut bool,
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -5432,6 +5502,9 @@ fn handle_single_control_command(
                     .map(|w| (w.pane.rows, w.pane.cols))
                     .unwrap_or((24, 80));
                 let command = positional.join(" ");
+                // An explicit -n name is user intent — automatic-rename
+                // must not overwrite it.
+                let name_locked = name.is_some();
                 let wname = name.unwrap_or_else(|| {
                     if command.is_empty() {
                         "shell".to_string()
@@ -5439,7 +5512,7 @@ fn handle_single_control_command(
                         crate::server::session::default_window_name_for_command(&command)
                     }
                 });
-                let win = if command.is_empty() {
+                let mut win = if command.is_empty() {
                     match cwd.as_deref() {
                         Some(c) => Window::new_in_cwd(rows, cols, wname, c, session.id),
                         None => Window::new(rows, cols, wname, session.id),
@@ -5455,6 +5528,7 @@ fn handle_single_control_command(
                         &env,
                     )
                 };
+                win.name_locked = name_locked;
                 wid_str = win.id_str();
                 let wname = win.name.clone();
                 let layout = window_layout_str(&win);
@@ -5530,7 +5604,38 @@ fn handle_single_control_command(
             respond(client, &[]);
         }
         "rename-window" => {
-            // For now, just acknowledge.
+            // rename-window [-t target] <name>. An explicit rename locks
+            // the name: automatic-rename must not overwrite it.
+            let mut name: Option<String> = None;
+            let mut target: Option<String> = None;
+            let rargs: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+            let mut i = 0;
+            while i < rargs.len() {
+                let a = &rargs[i];
+                if a == "-t" {
+                    target = rargs.get(i + 1).cloned();
+                    i += 1;
+                } else if !a.starts_with('-') {
+                    name = Some(a.clone());
+                }
+                i += 1;
+            }
+            if let Some(n) = name {
+                let loc = target
+                    .as_deref()
+                    .map(|t| resolve_target(sessions, client, Some(t)))
+                    .unwrap_or(Some((client.session_idx, client.active_window)));
+                if let Some((si, wi)) = loc
+                    && si < sessions.len()
+                    && wi < sessions[si].windows.len()
+                {
+                    let w = &mut sessions[si].windows[wi];
+                    w.name = n;
+                    w.name_locked = true;
+                    pending_notifies.push(format!("%window-renamed {} {}", w.id_str(), w.name));
+                    *pending_status_bar = true;
+                }
+            }
             respond(client, &[]);
         }
         "detach-client" => {
