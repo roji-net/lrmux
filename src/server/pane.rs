@@ -13,6 +13,51 @@ use std::path::PathBuf;
 /// Global pane ID counter (tmux uses %N format).
 static PANE_ID: AtomicU32 = AtomicU32::new(0);
 
+/// Max time a query reply waits for the pane tty to leave cooked mode
+/// before being dropped. Apps accept query replies only during a short
+/// window after probing (devin ~150-200ms); a reply injected later lands in
+/// the app's main input path and renders as typed garbage, so past the
+/// deadline it's better to stay silent — a terminal that never answers is
+/// something apps already handle via their own timeout.
+const REPLY_DEFER_MAX: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Minimum latency before a locally-generated reply is delivered. Real
+/// terminals answer a query several ms after receiving it; a reply written
+/// back sub-millisecond can land while the app is still reconfiguring
+/// termios or before its reply reader is armed — devin then re-probes or
+/// leaves the tail bytes to its main input path ("c11;rgb:…" in the
+/// prompt). Holding replies for a few ms reproduces realistic timing.
+const REPLY_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// A reply slot in a pane's ordered deferred queue.
+enum ReplySlot {
+    /// Synthesized locally — bytes are final.
+    Ready {
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        bytes: Vec<u8>,
+    },
+    /// OSC color query proxied to a client; `fill_osc_reply` swaps in the
+    /// real-TTY bytes when they arrive, keeping the slot's position.
+    /// `code`/`bell` identify the query so an out-of-order client answer
+    /// lands in the right slot and a late palette seed can synthesize the
+    /// reply with the right terminator.
+    Waiting {
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        code: u8,
+        bell: bool,
+    },
+}
+
+impl ReplySlot {
+    fn deadline(&self) -> std::time::Instant {
+        match self {
+            ReplySlot::Ready { deadline, .. } | ReplySlot::Waiting { deadline, .. } => *deadline,
+        }
+    }
+}
+
 /// A single pane: PTY + grid + VT parser.
 pub struct Pane {
     pub id: u32,
@@ -41,6 +86,14 @@ pub struct Pane {
     trace: Option<std::fs::File>,
     /// Trace clock origin (pane spawn time).
     trace_start: std::time::Instant,
+    /// Replies to child terminal queries (DA/CPR/OSC …) as an ordered
+    /// queue of slots. `Ready` slots carry their bytes; `Waiting` slots
+    /// are OSC queries proxied to a client — the reply is spliced in when
+    /// it arrives so ordering vs. sibling queries is preserved (probe
+    /// libraries like terminal-colorsaurus read responses positionally:
+    /// a DA-first reply means "color query unsupported" and leaves the
+    /// real color replies to render as typed text in the app).
+    deferred_replies: Vec<ReplySlot>,
 }
 
 impl Pane {
@@ -133,6 +186,7 @@ impl Pane {
             default_bg: None,
             trace,
             trace_start: std::time::Instant::now(),
+            deferred_replies: Vec::new(),
         }
     }
 
@@ -210,10 +264,21 @@ impl Pane {
         }
     }
 
-    /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes, osc_queries).
-    /// raw_bytes is the unprocessed output from the PTY (for control mode forwarding).
-    /// osc_queries are OSC 10/11 color probes to proxy to an attached client TTY.
-    pub fn process_pty_output(&mut self) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
+    /// Read PTY output, parse into grid. Returns (still_alive, raw_bytes,
+    /// unanswered_osc_queries). raw_bytes is the unprocessed output from the
+    /// PTY (for control mode forwarding). OSC 10/11 queries we can't answer
+    /// from the pane's or `palette_fallback`'s cached colors come back so the
+    /// caller can proxy them to an attached client TTY.
+    ///
+    /// All replies generated in this pass (DA/CPR + OSC answers) go out in a
+    /// single write at the end: apps typically accept replies only during a
+    /// short raw-mode slice right after querying (devin ~15-25ms), so a flush
+    /// split by a termios flip mid-batch turns the second half into typed
+    /// garbage.
+    pub fn process_pty_output(
+        &mut self,
+        palette_fallback: super::capture::TerminalPalette,
+    ) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
         if self.exited {
             return Ok((false, Vec::new(), Vec::new()));
         }
@@ -227,6 +292,7 @@ impl Pane {
         let mut osc_queries = Vec::new();
         let mut buf = [0u8; 65536];
         let fd = self.pty_fd();
+        let mut alive = true;
         loop {
             let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n > 0 {
@@ -244,28 +310,64 @@ impl Pane {
                     }
                 }
                 let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
-                if !parsed.immediate_replies.is_empty() {
-                    // CPR / DSR / DA — answer from our grid state.
-                    self.write_input_tagged("RPL", &parsed.immediate_replies)?;
+                // Replies must leave in the order the child asked: probe
+                // libraries (terminal-colorsaurus, used by devin) read
+                // responses sequentially and treat a DA-first reply as
+                // "color queries unsupported", leaking the real color
+                // replies into the app's input. OSC queries with no cached
+                // answer get a `Waiting` slot so the proxied reply is
+                // spliced into position rather than appended at the end.
+                for pending in parsed.replies {
+                    match pending {
+                        vt::PendingReply::Bytes(b) => self.queue_ready_reply(b),
+                        vt::PendingReply::Osc(q) => {
+                            match self.osc_color_reply(&q, palette_fallback) {
+                                Some(r) => self.queue_ready_reply(r),
+                                None => {
+                                    self.queue_waiting_reply(&q);
+                                    osc_queries.push(q);
+                                }
+                            }
+                        }
+                    }
                 }
-                osc_queries.extend(parsed.osc_queries);
                 if raw.len() >= MAX_DRAIN {
-                    return Ok((true, raw, osc_queries));
+                    break;
                 }
                 continue;
             }
             if n == 0 {
-                return Ok((false, raw, osc_queries));
+                alive = false;
+                break;
             }
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::WouldBlock {
-                return Ok((true, raw, osc_queries));
+                break;
             } else if err.raw_os_error() == Some(libc::EIO) {
-                return Ok((false, raw, osc_queries));
+                alive = false;
+                break;
             } else {
                 return Err(err);
             }
         }
+        let _ = self.flush_deferred_replies();
+        Ok((alive, raw, osc_queries))
+    }
+
+    /// Synthesize an OSC 10/11 reply from the pane's cached palette or the
+    /// fallback (an attached client's probed colors). None = unknown, the
+    /// caller should proxy the query to a real TTY.
+    fn osc_color_reply(
+        &self,
+        q: &vt::OscColorQuery,
+        fallback: super::capture::TerminalPalette,
+    ) -> Option<Vec<u8>> {
+        let rgb = match q.code {
+            10 => self.default_fg.or(fallback.fg),
+            11 => self.default_bg.or(fallback.bg),
+            _ => None,
+        }?;
+        Some(crate::term::format_osc_color_reply(q.code, rgb, q.bell_terminated).into_bytes())
     }
 
     /// Reap the child process and store the exit code.
@@ -400,6 +502,236 @@ impl Pane {
             }
         }
         Ok(())
+    }
+
+    /// Queue a synthesized reply in FIFO position (same slot queue used by
+    /// `process_pty_output`, so it stays ordered relative to any pending
+    /// OSC answers from the same probe round).
+    fn queue_ready_reply(&mut self, bytes: Vec<u8>) {
+        self.trace("DFR", &bytes);
+        let now = std::time::Instant::now();
+        self.deferred_replies.push(ReplySlot::Ready {
+            earliest: now + REPLY_MIN_DELAY,
+            deadline: now + REPLY_DEFER_MAX,
+            bytes,
+        });
+    }
+
+    /// Queue a placeholder for an OSC query that had no cached palette
+    /// answer — the event loop proxies the query to a client and
+    /// `fill_osc_reply` splices the real bytes into this slot.
+    fn queue_waiting_reply(&mut self, q: &vt::OscColorQuery) {
+        self.trace("DFR", b"waiting for proxied OSC reply");
+        let now = std::time::Instant::now();
+        self.deferred_replies.push(ReplySlot::Waiting {
+            earliest: now + REPLY_MIN_DELAY,
+            deadline: now + REPLY_DEFER_MAX,
+            code: q.code,
+            bell: q.bell_terminated,
+        });
+    }
+
+    /// A palette seed landed while queries were in flight (client's
+    /// TermPalette raced the app's query): synthesize answers for any
+    /// still-waiting slots instead of waiting out the proxied roundtrip.
+    pub fn resolve_waiting_from_palette(
+        &mut self,
+        fallback: super::capture::TerminalPalette,
+    ) -> io::Result<()> {
+        let fg = self.default_fg.or(fallback.fg);
+        let bg = self.default_bg.or(fallback.bg);
+        let mut filled = false;
+        for s in &mut self.deferred_replies {
+            let ReplySlot::Waiting {
+                earliest,
+                deadline,
+                code,
+                bell,
+            } = *s
+            else {
+                continue;
+            };
+            let rgb = match code {
+                10 => fg,
+                11 => bg,
+                _ => None,
+            };
+            if let Some(rgb) = rgb {
+                *s = ReplySlot::Ready {
+                    earliest,
+                    deadline,
+                    bytes: crate::term::format_osc_color_reply(code, rgb, bell).into_bytes(),
+                };
+                filled = true;
+            }
+        }
+        if filled {
+            self.trace("DFR", b"filled waiting reply from seeded palette");
+            self.flush_deferred_replies()?;
+        }
+        Ok(())
+    }
+
+    /// Write a reply to a child terminal query (DA/CPR/OSC …).
+    ///
+    /// The reply is queued and flushed by `flush_deferred_replies` once it
+    /// has aged past REPLY_MIN_DELAY and the pane tty is no longer cooked.
+    /// A cooked tty (ICANON or ECHO) echoes the reply as "^[…" garbage and
+    /// canonical-buffers it past the app's read window, so it resurfaces as
+    /// literal input once the app goes raw (devin's prompt showing
+    /// "10;rgb:…"). Replies that outlive REPLY_DEFER_MAX are dropped — a
+    /// terminal that never answers is safer than one that answers late.
+    pub fn write_reply(&mut self, data: &[u8]) -> io::Result<()> {
+        self.queue_ready_reply(data.to_vec());
+        self.flush_deferred_replies()
+    }
+
+    /// A client sent the real-TTY answer to a proxied OSC color query:
+    /// fill the waiting slot for that query code so the batch flushes in
+    /// query order. A reply with no waiting slot is too old to matter —
+    /// drop it rather than inject an out-of-order/late reply.
+    pub fn fill_osc_reply(&mut self, data: &[u8]) -> io::Result<()> {
+        let now = std::time::Instant::now();
+        // The reply carries its code ("\x1b]10;rgb:…"); match by code so a
+        // client answering out of order still lands in the right slot.
+        let code = data
+            .get(2..4)
+            .and_then(|s| std::str::from_utf8(s).ok())
+            .and_then(|s| s.parse::<u8>().ok());
+        let Some(i) = self
+            .deferred_replies
+            .iter()
+            .position(|s| matches!(s, ReplySlot::Waiting { code: c, .. } if Some(*c) == code))
+        else {
+            self.trace("DFR", b"dropping stray proxied reply");
+            return self.flush_deferred_replies();
+        };
+        let ReplySlot::Waiting {
+            earliest, deadline, ..
+        } = self.deferred_replies[i]
+        else {
+            unreachable!()
+        };
+        if now < deadline {
+            self.trace("DFR", b"proxied reply arrived");
+            self.deferred_replies[i] = ReplySlot::Ready {
+                earliest,
+                deadline,
+                bytes: data.to_vec(),
+            };
+        } else {
+            self.trace("DFR", b"dropping late proxied reply");
+            // leave the slot; the flush pass below expires it
+        }
+        self.flush_deferred_replies()
+    }
+
+    /// Inject deferred replies once they are old enough (REPLY_MIN_DELAY),
+    /// ordered, and the tty has left cooked mode. Slots that outlived their
+    /// deadline are dropped. Called every event-loop pass — the child's
+    /// tcsetattr produces no poll event, so the loop clamps its timeout
+    /// while `has_deferred_replies()`.
+    pub fn flush_deferred_replies(&mut self) -> io::Result<()> {
+        let now = std::time::Instant::now();
+        // Expired slots are never written — cooked or not. A reply that
+        // couldn't be delivered within REPLY_DEFER_MAX would land after the
+        // child's read window and echo back as typed text.
+        while self
+            .deferred_replies
+            .first()
+            .is_some_and(|s| now >= s.deadline())
+        {
+            self.trace("DFR", b"dropping reply: deadline expired");
+            self.deferred_replies.remove(0);
+        }
+        if self.deferred_replies.is_empty() {
+            return Ok(());
+        }
+        if self.tty_cooked() {
+            self.trace(
+                "DFR",
+                format!(
+                    "holding {} repl(ies), tty cooked lflag={:?}",
+                    self.deferred_replies.len(),
+                    self.tty_lflag()
+                )
+                .as_bytes(),
+            );
+            return Ok(());
+        }
+        // Deliver the contiguous run of aged, ready slots as ONE write —
+        // a Waiting slot (proxied OSC) is an order barrier: replies after
+        // it must not overtake it.
+        let mut batch = Vec::new();
+        let mut n = 0;
+        for slot in &self.deferred_replies {
+            match slot {
+                ReplySlot::Ready {
+                    earliest, bytes, ..
+                } if now >= *earliest => {
+                    batch.extend_from_slice(bytes);
+                    n += 1;
+                }
+                _ => break,
+            }
+        }
+        if n == 0 {
+            self.trace(
+                "DFR",
+                format!(
+                    "holding {} repl(ies), waiting on proxy/min-delay",
+                    self.deferred_replies.len()
+                )
+                .as_bytes(),
+            );
+            return Ok(());
+        }
+        self.trace("DFR", format!("flushing {n} repl(ies)").as_bytes());
+        self.deferred_replies.drain(..n);
+        self.write_input_tagged("RPL", &batch)?;
+        Ok(())
+    }
+
+    /// The event loop had no client to proxy a queued OSC query to —
+    /// drop the oldest waiting slot so trailing replies aren't held
+    /// hostage for the full deadline.
+    pub fn drop_waiting_reply(&mut self) {
+        if let Some(i) = self
+            .deferred_replies
+            .iter()
+            .position(|s| matches!(s, ReplySlot::Waiting { .. }))
+        {
+            self.trace("DFR", b"dropping waiting slot: no proxy target");
+            self.deferred_replies.remove(i);
+        }
+        let _ = self.flush_deferred_replies();
+    }
+
+    /// Replies still waiting for the tty to leave cooked mode.
+    pub fn has_deferred_replies(&self) -> bool {
+        !self.deferred_replies.is_empty()
+    }
+
+    /// True while the pane tty is in cooked mode: canonical input and/or
+    /// echo. tcgetattr on the master fd reflects the slave's termios.
+    fn tty_cooked(&self) -> bool {
+        use nix::sys::termios::LocalFlags;
+        self.tty_lflag()
+            .intersects(LocalFlags::ICANON | LocalFlags::ECHO)
+    }
+
+    /// c_lflag of the pane tty (for trace diagnostics), empty on error.
+    fn tty_lflag(&self) -> nix::sys::termios::LocalFlags {
+        use nix::sys::termios::LocalFlags;
+        let fd = self.pty_fd();
+        if fd < 0 {
+            return LocalFlags::empty();
+        }
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        match nix::sys::termios::tcgetattr(borrowed) {
+            Ok(t) => t.local_flags,
+            Err(_) => LocalFlags::empty(),
+        }
     }
 
     /// Resize the pane (PTY + grid).
@@ -692,6 +1024,163 @@ mod tests {
         // Invalid UTF-8 byte -> hex escape; C1 control -> \u{..}
         assert_eq!(vis_bytes(&[0xff]), "\\xff");
         assert_eq!(vis_bytes(&[0xc2, 0x9b]), "\\u{9b}");
+    }
+
+    fn osc_q(code: u8) -> vt::OscColorQuery {
+        vt::OscColorQuery {
+            code,
+            bell_terminated: true,
+        }
+    }
+
+    /// /bin/cat echoes replies back, so the test can observe the exact
+    /// byte order written to the pty. The slave is forced raw via the
+    /// master fd so the cooked check doesn't hold replies.
+    fn cat_pane() -> Pane {
+        let argv = [CString::new("/bin/cat").unwrap()];
+        let pane = Pane::new_with_argv(24, 80, &argv, None, 0, &[]);
+        let fd = pane.pty.master_fd();
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut t), 0);
+            t.c_lflag &= !(libc::ICANON | libc::ECHO);
+            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &t), 0);
+        }
+        pane
+    }
+
+    /// Bytes echoed back by cat after replies were written to the master.
+    fn read_master(pane: &Pane) -> Vec<u8> {
+        let fd = pane.pty.master_fd();
+        let mut out = Vec::new();
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 1000) } <= 0 {
+            return out;
+        }
+        loop {
+            let mut buf = [0u8; 4096];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+            pfd.revents = 0;
+            if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Backdate `earliest` so slots are flushable without sleeping.
+    fn age_all(pane: &mut Pane) {
+        for s in &mut pane.deferred_replies {
+            match s {
+                ReplySlot::Ready { earliest, .. } | ReplySlot::Waiting { earliest, .. } => {
+                    *earliest = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replies_flush_in_query_order() {
+        // The app asked OSC 10, OSC 11, DA — answers must go out in that
+        // order even though the proxied colors resolve asynchronously and
+        // may arrive out of order (11 before 10).
+        let mut pane = cat_pane();
+        pane.queue_waiting_reply(&osc_q(10));
+        pane.queue_waiting_reply(&osc_q(11));
+        pane.queue_ready_reply(b"\x1b[?62;1;2c".to_vec());
+        pane.fill_osc_reply(b"\x1b]11;rgb:1111/2222/3333\x07")
+            .unwrap();
+        pane.fill_osc_reply(b"\x1b]10;rgb:aaaa/bbbb/cccc\x07")
+            .unwrap();
+        age_all(&mut pane);
+        pane.flush_deferred_replies().unwrap();
+        assert!(pane.deferred_replies.is_empty());
+        assert_eq!(
+            read_master(&pane),
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07\x1b]11;rgb:1111/2222/3333\x07\x1b[?62;1;2c"
+        );
+    }
+
+    #[test]
+    fn waiting_slot_blocks_trailing_replies() {
+        // While a proxied OSC is unanswered, later ready replies must not
+        // overtake it — the whole contiguous prefix flushes together.
+        let mut pane = cat_pane();
+        pane.queue_waiting_reply(&osc_q(10));
+        pane.queue_ready_reply(b"\x1b[?62c".to_vec());
+        age_all(&mut pane);
+        pane.flush_deferred_replies().unwrap();
+        assert_eq!(read_master(&pane), b"", "DA overtook the waiting OSC");
+        assert_eq!(pane.deferred_replies.len(), 2);
+    }
+
+    #[test]
+    fn stray_proxied_reply_dropped() {
+        // An OSC reply with no waiting slot is stale — never injected.
+        let mut pane = cat_pane();
+        pane.fill_osc_reply(b"\x1b]10;rgb:aaaa/bbbb/cccc\x07")
+            .unwrap();
+        assert!(pane.deferred_replies.is_empty());
+        assert_eq!(read_master(&pane), b"");
+    }
+
+    #[test]
+    fn drop_waiting_reply_unblocks_queue() {
+        // No client to proxy to: the waiting slot is removed so the
+        // trailing DA flushes instead of waiting out the deadline.
+        let mut pane = cat_pane();
+        pane.queue_waiting_reply(&osc_q(10));
+        pane.queue_ready_reply(b"\x1b[?62c".to_vec());
+        age_all(&mut pane);
+        pane.drop_waiting_reply();
+        assert!(pane.deferred_replies.is_empty());
+        assert_eq!(read_master(&pane), b"\x1b[?62c");
+    }
+
+    #[test]
+    fn palette_seed_resolves_waiting_replies() {
+        // Cold-start: the app's queries landed before the client's
+        // TermPalette. Seeding the palette resolves the waiting slots in
+        // place — no client roundtrip needed.
+        let mut pane = cat_pane();
+        pane.queue_waiting_reply(&osc_q(10));
+        pane.queue_waiting_reply(&osc_q(11));
+        pane.queue_ready_reply(b"\x1b[?62;1;2c".to_vec());
+        pane.default_fg = Some((0xaa, 0xbb, 0xcc));
+        pane.default_bg = Some((0x11, 0x22, 0x33));
+        age_all(&mut pane);
+        pane.resolve_waiting_from_palette(crate::server::capture::TerminalPalette::default())
+            .unwrap();
+        assert!(pane.deferred_replies.is_empty());
+        assert_eq!(
+            read_master(&pane),
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07\x1b]11;rgb:1111/2222/3333\x07\x1b[?62;1;2c"
+        );
+    }
+
+    #[test]
+    fn expired_reply_dropped_not_written() {
+        // A reply that outlived its deadline is discarded — injecting it
+        // late would echo back as typed text in the app.
+        let mut pane = cat_pane();
+        pane.queue_ready_reply(b"\x1b]11;rgb:0000/0000/0000\x07".to_vec());
+        match &mut pane.deferred_replies[0] {
+            ReplySlot::Ready { deadline, .. } => {
+                *deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            }
+            _ => unreachable!(),
+        }
+        pane.flush_deferred_replies().unwrap();
+        assert!(pane.deferred_replies.is_empty());
+        assert_eq!(read_master(&pane), b"");
     }
 
     #[test]

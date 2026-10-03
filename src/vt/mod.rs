@@ -15,13 +15,24 @@ pub struct OscColorQuery {
     pub bell_terminated: bool,
 }
 
-/// Output of one `parse_bytes` pass: local replies + OSC queries to proxy.
+/// One reply-able item from a `parse_bytes` pass.
+#[derive(Debug)]
+pub enum PendingReply {
+    /// CPR / DSR / Primary DA — fully synthesized bytes.
+    Bytes(Vec<u8>),
+    /// OSC 10/11 — needs the outer palette (cached or proxied to a client).
+    Osc(OscColorQuery),
+}
+
+/// Output of one `parse_bytes` pass: replies to the child's terminal
+/// queries **in the order the child emitted them**. Order matters:
+/// probing libraries like terminal-colorsaurus treat a DA-first reply as
+/// proof that the terminal skipped the color query (they write
+/// `OSC 10;? OSC 11;? DA1` and read replies sequentially — the same bug
+/// that got GNU Screen blacklisted).
 #[derive(Debug, Default)]
 pub struct ParseResult {
-    /// CPR / DSR / Primary DA — written straight back into the PTY.
-    pub immediate_replies: Vec<u8>,
-    /// OSC 10/11 — forwarded to an attached client for a real TTY answer.
-    pub osc_queries: Vec<OscColorQuery>,
+    pub replies: Vec<PendingReply>,
 }
 
 /// A VT terminal handler that updates a Grid as it parses escape sequences.
@@ -58,10 +69,10 @@ impl Perform for VtHandler<'_> {
             b"11" => 11u8,
             _ => return,
         };
-        self.result.osc_queries.push(OscColorQuery {
+        self.result.replies.push(PendingReply::Osc(OscColorQuery {
             code,
             bell_terminated,
-        });
+        }));
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
@@ -262,7 +273,9 @@ impl Perform for VtHandler<'_> {
             // kitty keyboard flags query — answer 0 (no progressive
             // enhancements) so the child falls back to legacy keys.
             'u' if intermediates == b"?" => {
-                self.result.immediate_replies.extend_from_slice(b"\x1b[?0u");
+                self.result
+                    .replies
+                    .push(PendingReply::Bytes(b"\x1b[?0u".to_vec()));
             }
 
             // Repeat preceding character (REP)
@@ -287,15 +300,17 @@ impl Perform for VtHandler<'_> {
                     match param(0, 0) {
                         5 => {
                             // Status: terminal OK
-                            self.result.immediate_replies.extend_from_slice(b"\x1b[0n");
+                            self.result
+                                .replies
+                                .push(PendingReply::Bytes(b"\x1b[0n".to_vec()));
                         }
                         6 => {
                             // CPR - cursor position (1-based)
                             let row = self.grid.cursor_row + 1;
                             let col = self.grid.cursor_col + 1;
-                            self.result
-                                .immediate_replies
-                                .extend_from_slice(format!("\x1b[{row};{col}R").as_bytes());
+                            self.result.replies.push(PendingReply::Bytes(
+                                format!("\x1b[{row};{col}R").into_bytes(),
+                            ));
                         }
                         _ => {}
                     }
@@ -306,8 +321,8 @@ impl Perform for VtHandler<'_> {
             'c' if intermediates.is_empty() => {
                 // Claim VT220-ish capabilities (same class as xterm defaults).
                 self.result
-                    .immediate_replies
-                    .extend_from_slice(b"\x1b[?62;1;2c");
+                    .replies
+                    .push(PendingReply::Bytes(b"\x1b[?62;1;2c".to_vec()));
             }
 
             _ => {}
@@ -381,9 +396,12 @@ mod tests {
             let mut parser = vte::Parser::new();
             let result = parse_bytes(&mut parser, &mut grid, bytes);
             assert!(
-                result.osc_queries.iter().any(|q| q.code == *code),
+                result
+                    .replies
+                    .iter()
+                    .any(|r| matches!(r, PendingReply::Osc(q) if q.code == *code)),
                 "failed to detect OSC {code} in {bytes:?}, got {:?}",
-                result.osc_queries
+                result.replies
             );
         }
     }
@@ -398,15 +416,27 @@ mod tests {
             &mut grid,
             b"\x1b]11;?\x07\x1b]10;?\x07\x1b[6n\x1b[5n",
         );
-        assert_eq!(result.osc_queries.len(), 2);
-        assert_eq!(result.osc_queries[0].code, 11);
-        assert_eq!(result.osc_queries[1].code, 10);
-        let s = String::from_utf8_lossy(&result.immediate_replies);
-        assert!(s.contains("\x1b[4;8R"), "missing CPR reply: {s:?}");
-        assert!(s.contains("\x1b[0n"), "missing DSR status reply: {s:?}");
+        assert_eq!(result.replies.len(), 4);
+        // Order preserved: the two OSC queries came before CPR and DSR.
         assert!(
-            !s.contains("rgb:"),
-            "must not invent OSC color replies: {s:?}"
+            matches!(&result.replies[0], PendingReply::Osc(q) if q.code == 11),
+            "replies: {:?}",
+            result.replies
+        );
+        assert!(
+            matches!(&result.replies[1], PendingReply::Osc(q) if q.code == 10),
+            "replies: {:?}",
+            result.replies
+        );
+        assert!(
+            matches!(&result.replies[2], PendingReply::Bytes(b) if b == b"\x1b[4;8R"),
+            "missing CPR reply: {:?}",
+            result.replies
+        );
+        assert!(
+            matches!(&result.replies[3], PendingReply::Bytes(b) if b == b"\x1b[0n"),
+            "missing DSR status reply: {:?}",
+            result.replies
         );
     }
 
@@ -466,8 +496,11 @@ mod tests {
         );
         // The query gets an answer: 0 = no progressive enhancements.
         assert!(
-            String::from_utf8_lossy(&r.immediate_replies).contains("\x1b[?0u"),
-            "kitty flags query should be answered"
+            r.replies
+                .iter()
+                .any(|x| matches!(x, PendingReply::Bytes(b) if b == b"\x1b[?0u")),
+            "kitty flags query should be answered: {:?}",
+            r.replies
         );
 
         // Push/pop forms (\x1b[>1u / \x1b[<u) are ignored, not cursor ops.
