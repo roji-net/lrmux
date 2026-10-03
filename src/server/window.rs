@@ -19,6 +19,9 @@ pub struct Window {
     /// tmux `remain-on-exit`: keep the pane after the child exits on ANY
     /// exit code, instead of auto-closing on success codes.
     pub remain_on_exit: bool,
+    /// Name was set explicitly (rename-window or `new-window -n`) —
+    /// automatic-rename must not overwrite it.
+    pub name_locked: bool,
 }
 
 impl Window {
@@ -31,6 +34,7 @@ impl Window {
             name,
             activity: false,
             remain_on_exit: false,
+            name_locked: false,
         }
     }
 
@@ -41,6 +45,7 @@ impl Window {
             name,
             activity: false,
             remain_on_exit: false,
+            name_locked: false,
         }
     }
 
@@ -59,6 +64,7 @@ impl Window {
             name,
             activity: false,
             remain_on_exit: false,
+            name_locked: false,
         }
     }
 
