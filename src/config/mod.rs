@@ -86,6 +86,48 @@ pub struct BehaviorConfig {
     /// children so tools that detect a multiplexer by env keep working.
     #[serde(default)]
     pub tmux_compat: bool,
+    /// Outer-terminal mouse reporting policy.
+    #[serde(default)]
+    pub mouse: MouseMode,
+}
+
+/// When to enable mouse reporting on the outer terminal.
+///
+/// Reporting on means the terminal sends lrmux every click/drag/wheel —
+/// its native scrollback wheel and drag-select stop working (lrmux
+/// re-implements them: wheel → copy-mode scroll, drag → copy-mode
+/// select). Reporting off keeps the terminal fully native but pane apps
+/// get no mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    /// Reporting always on — pane apps get the mouse, lrmux handles
+    /// wheel/drag locally for panes that don't track it.
+    AlwaysOn,
+    /// Sticky: off until some pane first requests mouse tracking, then
+    /// on for the rest of the attach (fixes "clicked a window entry in a
+    /// mouse app and couldn't click back").
+    AutoEnable,
+    /// On only while the focused window's pane asked for it (plus copy
+    /// mode / altscroll). The historical behavior.
+    #[default]
+    OnlyRequired,
+    /// Never enable reporting — the mouse is the terminal's own.
+    Off,
+}
+
+impl<'de> Deserialize<'de> for MouseMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "always_on" | "always" | "on" => Ok(MouseMode::AlwaysOn),
+            "auto_enable" | "auto" => Ok(MouseMode::AutoEnable),
+            "only_required" | "required" | "" => Ok(MouseMode::OnlyRequired),
+            "off" | "false" | "0" | "no" => Ok(MouseMode::Off),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid mouse mode '{other}', expected always_on|auto_enable|only_required|off"
+            ))),
+        }
+    }
 }
 
 impl Default for PrefixConfig {

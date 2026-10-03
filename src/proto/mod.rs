@@ -228,6 +228,9 @@ pub enum ServerMsg {
         /// Per-window pending-activity flags (same length as `windows`).
         /// Empty on messages from an older server.
         activity: Vec<bool>,
+        /// Per-window "pane wants mouse" flags (same length as `windows`).
+        /// Empty on messages from an older server.
+        mouse: Vec<bool>,
     },
     /// List of sessions + server address (response to ListSessions).
     SessionList {
@@ -678,6 +681,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             high_output,
             server,
             activity,
+            mouse,
         } => {
             payload.push(S_STATUS_BAR);
             payload.extend_from_slice(&(session.len() as u32).to_le_bytes());
@@ -693,6 +697,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&(server.len() as u32).to_le_bytes());
             payload.extend_from_slice(server.as_bytes());
             for &flag in activity {
+                payload.push(flag as u8);
+            }
+            for &flag in mouse {
                 payload.push(flag as u8);
             }
         }
@@ -1289,6 +1296,17 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             while activity.len() < windows.len() {
                 activity.push(false);
             }
+            // Optional: per-window mouse-request flags (one byte each).
+            let mut mouse = Vec::with_capacity(windows.len());
+            for _ in 0..windows.len() {
+                if r.is_empty() {
+                    break;
+                }
+                mouse.push(read_u8(&mut r)? != 0);
+            }
+            while mouse.len() < windows.len() {
+                mouse.push(false);
+            }
             Ok(ServerMsg::StatusBarUpdate {
                 session,
                 windows,
@@ -1297,6 +1315,7 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 high_output,
                 server,
                 activity,
+                mouse,
             })
         }
         S_SESSION_LIST => {
@@ -1569,6 +1588,7 @@ mod tests {
             high_output: false,
             server: "infra".into(),
             activity: vec![false, true],
+            mouse: vec![true, false],
         };
         let bytes = encode_server(&msg);
         match decode_server(&mut &bytes[..]).unwrap() {
@@ -1576,11 +1596,13 @@ mod tests {
                 session,
                 server,
                 activity,
+                mouse,
                 ..
             } => {
                 assert_eq!(session, "lrmux");
                 assert_eq!(server, "infra");
                 assert_eq!(activity, vec![false, true]);
+                assert_eq!(mouse, vec![true, false]);
             }
             other => panic!("unexpected {other:?}"),
         }

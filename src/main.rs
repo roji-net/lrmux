@@ -1313,7 +1313,10 @@ fn then_selector(r: io::Result<client::ClientExit>) -> io::Result<()> {
         Ok(client::ClientExit::Selector(hint)) => {
             dispatch_selector(client::selector::run_selector_forced_hint(hint))
         }
-        Ok(client::ClientExit::Done) => Ok(()),
+        // Direct attach/new-session: even if the session died under the
+        // client, exit to the prompt — only selector-driven flows reopen
+        // the picker (handled inside dispatch_selector).
+        Ok(client::ClientExit::Done) | Ok(client::ClientExit::SessionEnded(_)) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -1332,8 +1335,10 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                 }
                 let sock = socket_path(&server);
                 match client::run(&sock, None, Some(session), None, None) {
-                    // Attached, then detached back to the selector — reopen it.
-                    Ok(client::ClientExit::Selector(hint)) => {
+                    // Detached back to the selector, or the session ended
+                    // under us — reopen the picker.
+                    Ok(client::ClientExit::Selector(hint))
+                    | Ok(client::ClientExit::SessionEnded(hint)) => {
                         result = client::selector::run_selector_forced_hint(hint);
                     }
                     Ok(_) => return Ok(()),
@@ -1347,7 +1352,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                     crate::ipc::set_tcp_addr(Some(addr));
                     let sock = socket_path(&server);
                     match client::run(&sock, Some(name), None, None, None) {
-                        Ok(client::ClientExit::Selector(hint)) => {
+                        Ok(client::ClientExit::Selector(hint))
+                        | Ok(client::ClientExit::SessionEnded(hint)) => {
                             result = client::selector::run_selector_forced_hint(hint);
                         }
                         Ok(_) => return Ok(()),
@@ -1358,7 +1364,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                 let sock = socket_path(&server);
                 if !ipc::server_exists(&sock) {
                     match start_new_server(&server, None, None, None, None, None) {
-                        Ok(client::ClientExit::Selector(hint)) => {
+                        Ok(client::ClientExit::Selector(hint))
+                        | Ok(client::ClientExit::SessionEnded(hint)) => {
                             result = client::selector::run_selector_forced_hint(hint);
                             continue;
                         }
@@ -1367,7 +1374,8 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                     }
                 }
                 match client::run(&sock, Some(name), None, None, None) {
-                    Ok(client::ClientExit::Selector(hint)) => {
+                    Ok(client::ClientExit::Selector(hint))
+                    | Ok(client::ClientExit::SessionEnded(hint)) => {
                         result = client::selector::run_selector_forced_hint(hint);
                     }
                     Ok(_) => return Ok(()),
@@ -1375,7 +1383,14 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
                 }
             }
             Ok(SelectorResult::NewServer { name }) => {
-                return then_selector(start_new_server(&name, None, None, None, None, Some(&name)));
+                match start_new_server(&name, None, None, None, None, Some(&name)) {
+                    Ok(client::ClientExit::Selector(hint))
+                    | Ok(client::ClientExit::SessionEnded(hint)) => {
+                        result = client::selector::run_selector_forced_hint(hint);
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => return Err(e),
+                }
             }
             Ok(SelectorResult::Quit) => return Ok(()),
             Err(e) => {
