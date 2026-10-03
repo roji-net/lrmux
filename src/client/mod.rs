@@ -271,6 +271,13 @@ pub fn run(
     let mut mouse_decoder = mouse::Decoder::new();
     // Tracking mask currently applied to the outer terminal (None = not yet).
     let mut applied_mouse: Option<u8> = None;
+    // Mouse reporting policy: config mode + Ctrl-A m / [M]-click override
+    // + the auto_enable sticky latch.
+    let mut mouse_ctl = MouseCtl {
+        mode: crate::config::global().behavior.mouse,
+        ovr: MouseOverride::Auto,
+        latched: false,
+    };
     // Pending mouse-press position (x, y): arms a local selection — the
     // drag that follows enters copy mode anchored here. A release without
     // motion is a plain click and does nothing.
@@ -418,7 +425,14 @@ pub fn run(
                 grid.mark_all_dirty();
                 renderer.render(&mut stdout, &mut grid)?;
                 render_filler(&mut stdout, grid.rows(), grid.cols(), term_rows, term_cols)?;
-                render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                render_status_bar(
+                    &mut stdout,
+                    &status_text,
+                    term_rows,
+                    term_cols,
+                    &grid,
+                    mouse_reporting_on(applied_mouse),
+                )?;
             }
         }
 
@@ -464,13 +478,28 @@ pub fn run(
             flash_deadline = None;
             // Re-render the normal status bar.
             let mut stdout = client_stdout();
-            render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+            render_status_bar(
+                &mut stdout,
+                &status_text,
+                term_rows,
+                term_cols,
+                &grid,
+                mouse_reporting_on(applied_mouse),
+            )?;
         }
 
         // If we have a flash message, render it on the status bar.
         if let Some(ref msg) = flash_msg {
             let mut stdout = client_stdout();
-            render_flash_status_bar(&mut stdout, msg, &status_text, term_rows, term_cols, &grid)?;
+            render_flash_status_bar(
+                &mut stdout,
+                msg,
+                &status_text,
+                term_rows,
+                term_cols,
+                &grid,
+                mouse_reporting_on(applied_mouse),
+            )?;
         }
 
         // stdin → prefix detection → server (as PaneInput or commands).
@@ -526,6 +555,24 @@ pub fn run(
                             };
                             send_cmd(&mut stream, &msg)?;
                         } else if !ev.release && !ev.is_motion() && ev.cb & 3 == 0 {
+                            // The [M] control occupies the last 3 columns —
+                            // a click there forces reporting off (clicks
+                            // then can't reach us; Ctrl-A m re-enables).
+                            if ev.x as usize + 2 >= term_cols && term_cols >= 8 {
+                                mouse_ctl.ovr = MouseOverride::ForceOff;
+                                flash_msg = Some("mouse off — Ctrl-A m to re-enable".to_string());
+                                flash_deadline = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(3),
+                                );
+                                sync_mouse_modes(
+                                    &mut applied_mouse,
+                                    &grid,
+                                    &mut mouse_decoder,
+                                    copy_mode.is_some(),
+                                    &mut mouse_ctl,
+                                );
+                                continue;
+                            }
                             // Left press on a window entry switches to it.
                             if let Some(&(_, _, idx)) = status_spans
                                 .iter()
@@ -593,11 +640,22 @@ pub fn run(
                             redraw_cm = true;
                             continue;
                         }
-                        // Otherwise the wheel isn't ours to interpret: when
-                        // the child doesn't track the mouse and altscroll
-                        // isn't set, outer-terminal reporting is off and no
-                        // report can reach us — the terminal scrolls its own
-                        // scrollback natively.
+                        // A wheel report still reached us, so reporting is
+                        // on (always_on / auto_enable / forced on) while
+                        // this pane doesn't track the mouse — translate
+                        // wheel-up into copy-mode scrollback, tmux-style.
+                        if ev.is_wheel_up() {
+                            let cm = copy_mode.get_or_insert_with(|| {
+                                copy_mode::CopyMode::new(
+                                    grid.scrollback.len(),
+                                    grid.cursor_row,
+                                    grid.cursor_col,
+                                )
+                            });
+                            cm.vrow = cm.vrow.saturating_sub(3);
+                            cm.ensure_cursor_visible(view_rows);
+                            redraw_cm = true;
+                        }
                         continue;
                     }
                     if ev.is_motion() {
@@ -681,6 +739,7 @@ pub fn run(
                                 &status_text,
                                 term_rows,
                                 term_cols,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         copy_mode::CopyAction::Copy(text) => {
@@ -693,6 +752,7 @@ pub fn run(
                                 &status_text,
                                 term_rows,
                                 term_cols,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         copy_mode::CopyAction::Continue => {}
@@ -826,6 +886,7 @@ pub fn run(
                                     &status_text,
                                     term_rows,
                                     term_cols,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             }
                             copy_mode::CopyAction::Copy(text) => {
@@ -838,6 +899,7 @@ pub fn run(
                                     &status_text,
                                     term_rows,
                                     term_cols,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             }
                             copy_mode::CopyAction::Continue => {}
@@ -852,9 +914,10 @@ pub fn run(
                         remaining,
                         enter_copy_mode,
                         paste,
-                        flash,
+                        mut flash,
                         show_help,
                         request_session_chooser,
+                        toggle_mouse,
                     ) = process_prefix(
                         input,
                         &mut prefix_state,
@@ -863,6 +926,25 @@ pub fn run(
                         session_count,
                         last_window,
                     )?;
+                    if toggle_mouse {
+                        mouse_ctl.ovr = mouse_ctl.ovr.next();
+                        flash = Some(match mouse_ctl.ovr {
+                            MouseOverride::Auto => "mouse: auto (config)".to_string(),
+                            MouseOverride::ForceOn => "mouse: forced ON".to_string(),
+                            MouseOverride::ForceOff => {
+                                "mouse: forced OFF (clicks dead — Ctrl-A m cycles)".to_string()
+                            }
+                        });
+                        // Apply before the flash render below so the [M]
+                        // button repaints in the same pass.
+                        sync_mouse_modes(
+                            &mut applied_mouse,
+                            &grid,
+                            &mut mouse_decoder,
+                            copy_mode.is_some(),
+                            &mut mouse_ctl,
+                        );
+                    }
                     if show_help {
                         show_help_overlay(&server_version);
                         // Invalidate the renderer so the screen is fully redrawn.
@@ -872,7 +954,14 @@ pub fn run(
                         let mut stdout = client_stdout();
                         write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
                         renderer.render(&mut stdout, &mut grid)?;
-                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                        render_status_bar(
+                            &mut stdout,
+                            &status_text,
+                            term_rows,
+                            term_cols,
+                            &grid,
+                            mouse_reporting_on(applied_mouse),
+                        )?;
                         // Ask the server for a fresh snapshot too — a plain
                         // re-render can leave stale rows after the overlay
                         // cleared the screen.
@@ -893,6 +982,7 @@ pub fn run(
                             term_rows,
                             term_cols,
                             &grid,
+                            mouse_reporting_on(applied_mouse),
                         )?;
                     }
                     if !passthrough.is_empty() {
@@ -963,6 +1053,7 @@ pub fn run(
                                         term_rows,
                                         term_cols,
                                         &grid,
+                                        mouse_reporting_on(applied_mouse),
                                     )?;
                                 }
                                 ConfirmAction::Continue => {
@@ -990,6 +1081,7 @@ pub fn run(
                                 term_rows,
                                 term_cols,
                                 &grid,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         ConfirmAction::Cancelled => {
@@ -1001,6 +1093,7 @@ pub fn run(
                                 term_rows,
                                 term_cols,
                                 &grid,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         ConfirmAction::Continue => {
@@ -1012,12 +1105,36 @@ pub fn run(
         }
         // Copy mode toggles via input — keep outer mouse reporting in
         // sync (it backs drag-select while copy mode is active).
-        sync_mouse_modes(
+        if sync_mouse_modes(
             &mut applied_mouse,
             &grid,
             &mut mouse_decoder,
             copy_mode.is_some(),
-        );
+            &mut mouse_ctl,
+        ) {
+            // The [M] indicator changed state — repaint the bar.
+            let mut stdout = client_stdout();
+            if let Some(ref msg) = flash_msg {
+                render_flash_status_bar(
+                    &mut stdout,
+                    msg,
+                    &status_text,
+                    term_rows,
+                    term_cols,
+                    &grid,
+                    mouse_reporting_on(applied_mouse),
+                )?;
+            } else {
+                render_status_bar(
+                    &mut stdout,
+                    &status_text,
+                    term_rows,
+                    term_cols,
+                    &grid,
+                    mouse_reporting_on(applied_mouse),
+                )?;
+            }
+        }
         if stdin_eof {
             break;
         }
@@ -1169,6 +1286,7 @@ pub fn run(
                                 term_rows,
                                 term_cols,
                                 &grid,
+                                mouse_reporting_on(applied_mouse),
                             )?;
                         }
                         ServerMsg::StatusBarUpdate {
@@ -1179,6 +1297,7 @@ pub fn run(
                             high_output: h,
                             server,
                             activity,
+                            mouse,
                         } => {
                             // Track last window for Ctrl-A Ctrl-A toggle.
                             let new_active = Some(active as u8);
@@ -1197,6 +1316,7 @@ pub fn run(
                                 h,
                                 &server,
                                 &activity,
+                                &mouse,
                             );
                             let mut stdout = client_stdout();
                             if let Some(ref msg) = flash_msg {
@@ -1207,6 +1327,7 @@ pub fn run(
                                     term_rows,
                                     term_cols,
                                     &grid,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             } else {
                                 render_status_bar(
@@ -1215,6 +1336,7 @@ pub fn run(
                                     term_rows,
                                     term_cols,
                                     &grid,
+                                    mouse_reporting_on(applied_mouse),
                                 )?;
                             }
                             // Outer-terminal (iTerm tab/window) title:
@@ -1324,6 +1446,7 @@ pub fn run(
                     &grid,
                     &mut mouse_decoder,
                     copy_mode.is_some(),
+                    &mut mouse_ctl,
                 );
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
@@ -1339,7 +1462,14 @@ pub fn run(
                     } else {
                         let mut stdout = client_stdout();
                         renderer.render(&mut stdout, &mut grid)?;
-                        render_status_bar(&mut stdout, &status_text, term_rows, term_cols, &grid)?;
+                        render_status_bar(
+                            &mut stdout,
+                            &status_text,
+                            term_rows,
+                            term_cols,
+                            &grid,
+                            mouse_reporting_on(applied_mouse),
+                        )?;
                     }
                 }
             } else if last == 0 {
@@ -1438,7 +1568,8 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
 
 /// Process input bytes through the prefix-key state machine.
 /// Returns (passthrough, detach, to_selector, confirm, remaining,
-/// enter_copy_mode, paste, flash, show_help, request_session_chooser).
+/// enter_copy_mode, paste, flash, show_help, request_session_chooser,
+/// toggle_mouse).
 /// When a confirm dialog is triggered, remaining bytes after the trigger are returned
 /// so the caller can process them with process_confirm.
 #[allow(clippy::type_complexity)]
@@ -1460,6 +1591,7 @@ fn process_prefix(
     Option<String>,
     bool,
     bool,
+    bool,
 )> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
@@ -1470,6 +1602,7 @@ fn process_prefix(
     let mut flash: Option<String> = None;
     let mut show_help = false;
     let mut request_session_chooser = false;
+    let mut toggle_mouse = false;
 
     for (i, &byte) in input.iter().enumerate() {
         if confirm.is_some() {
@@ -1485,6 +1618,7 @@ fn process_prefix(
                 flash,
                 show_help,
                 request_session_chooser,
+                toggle_mouse,
             ));
         }
         match state {
@@ -1598,6 +1732,11 @@ fn process_prefix(
                         let (r, c) = terminal::get_size();
                         send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
                     }
+                    // 'm' → cycle the mouse-reporting override
+                    // (auto → forced on → forced off → auto).
+                    b'm' => {
+                        toggle_mouse = true;
+                    }
                     // '[' → enter copy/scrollback mode.
                     b'[' => {
                         enter_copy_mode = true;
@@ -1646,6 +1785,7 @@ fn process_prefix(
         flash,
         show_help,
         request_session_chooser,
+        toggle_mouse,
     ))
 }
 
@@ -1862,6 +2002,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 /// Identity is `[session]@server`, then the window list.
 /// Also returns each window entry's 1-based column span (start, end,
 /// window index) for mouse hit-testing on the status bar row.
+#[allow(clippy::too_many_arguments)]
 fn format_status_bar(
     session: &str,
     windows: &[String],
@@ -1870,6 +2011,7 @@ fn format_status_bar(
     high_output: bool,
     server: &str,
     activity: &[bool],
+    mouse: &[bool],
 ) -> (String, Vec<(u16, u16, u8)>) {
     // Each sequence starts with `0;` so reverse/underline/italic from the
     // pane cannot leak into the bar (AI TUIs often leave SGR 4/7 active).
@@ -1898,15 +2040,27 @@ fn format_status_bar(
         String::new()
     };
 
+    // Per-window mouse marker: cyan [M] on blue when that window's pane
+    // requested mouse tracking.
+    const MWANT: &str = "\x1b[0;44;96m";
+
     let mut parts: Vec<String> = Vec::new();
     for (i, name) in windows.iter().enumerate() {
         let has_act = activity.get(i).copied().unwrap_or(false);
-        if i == active {
-            parts.push(format!("{}{}:{}*{}{}", ACTIVE, i, name, BAR, burst_marker));
-        } else if has_act {
-            parts.push(format!("{ACTIVITY}●{BAR}{}:{}", i, name));
+        let m = if mouse.get(i).copied().unwrap_or(false) {
+            format!("{MWANT}[M]{BAR}")
         } else {
-            parts.push(format!("{}:{}", i, name));
+            String::new()
+        };
+        if i == active {
+            parts.push(format!(
+                "{}{}:{}*{}{}{}",
+                ACTIVE, i, name, BAR, m, burst_marker
+            ));
+        } else if has_act {
+            parts.push(format!("{ACTIVITY}●{BAR}{}:{}{}", i, name, m));
+        } else {
+            parts.push(format!("{}:{}{}", i, name, m));
         }
     }
     let identity = if server.is_empty() {
@@ -1983,6 +2137,7 @@ fn render_status_bar(
     term_rows: usize,
     term_cols: usize,
     grid: &Grid,
+    mouse_on: bool,
 ) -> io::Result<()> {
     // Position cursor at the last row of the terminal (1-based).
     let row = term_rows;
@@ -2004,6 +2159,8 @@ fn render_status_bar(
     }
     // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
+    // [M] indicator/toggle at the right edge.
+    draw_mouse_button(stdout, term_rows, term_cols, mouse_on)?;
     // Reposition cursor to the grid cursor location so the user sees
     // the cursor in the pane, not on the status bar.
     // Only reposition if the cursor is within the viewport.
@@ -2031,6 +2188,7 @@ fn render_flash_status_bar(
     term_rows: usize,
     term_cols: usize,
     grid: &Grid,
+    mouse_on: bool,
 ) -> io::Result<()> {
     let row = term_rows;
     write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
@@ -2068,6 +2226,7 @@ fn render_flash_status_bar(
         write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - total_visible))?;
     }
     stdout.write_all(b"\x1b[0m")?;
+    draw_mouse_button(stdout, term_rows, term_cols, mouse_on)?;
 
     // Reposition cursor.
     if grid.cursor_visible {
@@ -2125,6 +2284,7 @@ fn restore_normal_view(
     status_text: &str,
     term_rows: usize,
     term_cols: usize,
+    mouse_on: bool,
 ) -> io::Result<()> {
     let mut stdout = client_stdout();
     // Hide cursor (copy mode shows it; normal mode hides it).
@@ -2142,6 +2302,7 @@ fn restore_normal_view(
         term_rows,
         term_cols,
         grid,
+        mouse_on,
     )?;
     Ok(())
 }
@@ -2262,25 +2423,86 @@ fn restore_terminal() {
     let _ = stdout.flush();
 }
 
+/// Runtime mouse override toggled by `Ctrl-A m` or a click on the
+/// status-bar [M] control (which can only disable — when reporting is
+/// off, clicks never reach us).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseOverride {
+    /// Follow the configured `behavior.mouse` policy.
+    Auto,
+    /// Reporting on regardless of pane requests.
+    ForceOn,
+    /// Reporting off regardless of pane requests.
+    ForceOff,
+}
+
+impl MouseOverride {
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::ForceOn,
+            Self::ForceOn => Self::ForceOff,
+            Self::ForceOff => Self::Auto,
+        }
+    }
+}
+
+/// Outer-terminal mouse policy state: config mode + runtime override +
+/// the auto_enable sticky latch.
+struct MouseCtl {
+    mode: crate::config::MouseMode,
+    ovr: MouseOverride,
+    latched: bool,
+}
+
+/// The effective outer-terminal mouse mask.
+///
+/// Base is the child's tracking mask, widened to button-events (1002)
+/// when something local needs reports — copy mode selection or the
+/// altscroll wheel translation. The configured mode can force that on
+/// (`always_on`, or `auto_enable` after the first pane request) or fully
+/// off (`off`); the runtime override always wins last.
+fn desired_mouse_mask(ctl: &mut MouseCtl, grid: &Grid, local: bool) -> u8 {
+    use crate::config::MouseMode;
+    if ctl.mode == MouseMode::AutoEnable && grid.mouse_tracking != 0 {
+        ctl.latched = true;
+    }
+    // Runtime override wins over the configured mode in both directions.
+    if ctl.ovr == MouseOverride::ForceOff {
+        return 0;
+    }
+    if ctl.mode == MouseMode::Off && ctl.ovr != MouseOverride::ForceOn {
+        return 0;
+    }
+    let mut desired = grid.mouse_tracking;
+    if local || (grid.mouse_altscroll && desired == 0) {
+        desired |= 0b010;
+    }
+    if ctl.mode == MouseMode::AlwaysOn
+        || (ctl.mode == MouseMode::AutoEnable && ctl.latched)
+        || ctl.ovr == MouseOverride::ForceOn
+    {
+        desired |= 0b010;
+    }
+    desired
+}
+
 /// Keep the outer terminal's mouse reporting in sync with what can use
 /// reports: the child's tracking mask, alternate-scroll (wheel→arrows
-/// translation needs wheel reports), or copy mode (drag-select). With
-/// none of those, reporting stays off and the terminal keeps its native
-/// wheel scrollback and selection — lrmux never interprets the wheel.
+/// translation needs wheel reports), or copy mode (drag-select) — all
+/// under the configured policy and runtime override. With none of those,
+/// reporting stays off and the terminal keeps its native wheel
+/// scrollback and selection — lrmux never interprets the wheel.
+/// Returns true when the applied mask changed (status bar repaint).
 fn sync_mouse_modes(
     applied: &mut Option<u8>,
     grid: &Grid,
     decoder: &mut mouse::Decoder,
     local: bool,
-) {
-    let mut desired = grid.mouse_tracking;
-    if local || (grid.mouse_altscroll && desired == 0) {
-        // Button-event reporting gives drag + wheel reports for local
-        // copy-mode selection or altscroll translation.
-        desired |= 0b010;
-    }
+    ctl: &mut MouseCtl,
+) -> bool {
+    let desired = desired_mouse_mask(ctl, grid, local);
     if *applied == Some(desired) {
-        return;
+        return false;
     }
     let mut stdout = client_stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
@@ -2290,6 +2512,41 @@ fn sync_mouse_modes(
     let _ = stdout.flush();
     *applied = Some(desired);
     decoder.set_active(desired != 0);
+    true
+}
+
+/// Whether outer-terminal mouse reports can currently reach us.
+fn mouse_reporting_on(applied: Option<u8>) -> bool {
+    applied.unwrap_or(0) != 0
+}
+
+/// Paint the `[M]`/`[m]` mouse-reporting indicator at the status bar's
+/// right edge: bright green while reports reach lrmux (clickable —
+/// disables), dim while off (clicks can't reach us then; `Ctrl-A m`
+/// re-enables).
+fn draw_mouse_button(
+    stdout: &mut TraceStdout,
+    term_rows: usize,
+    term_cols: usize,
+    on: bool,
+) -> io::Result<()> {
+    if term_cols < 8 {
+        return Ok(());
+    }
+    let (style, label) = if on {
+        ("\x1b[0;1;44;92m", "[M]")
+    } else {
+        ("\x1b[0;2;44;37m", "[m]")
+    };
+    write!(
+        stdout,
+        "\x1b[{};{}H{}{}\x1b[0m",
+        term_rows,
+        term_cols - 2,
+        style,
+        label
+    )?;
+    Ok(())
 }
 
 /// Try to parse a complete server frame from the buffer.
@@ -2888,6 +3145,7 @@ mod tests {
             false,
             "infra-284-letsencrypt",
             &[],
+            &[],
         );
         let visible = strip_ansi(&text);
         assert!(
@@ -2898,7 +3156,7 @@ mod tests {
 
     #[test]
     fn status_bar_omits_empty_server() {
-        let (text, _) = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[]);
+        let (text, _) = format_status_bar("lrmux", &["zsh".into()], 0, "abc", false, "", &[], &[]);
         let visible = strip_ansi(&text);
         assert!(!visible.contains('@'), "{visible}");
         assert!(visible.contains("lrmux"), "{visible}");
@@ -2914,10 +3172,86 @@ mod tests {
             false,
             "srv",
             &[false, true],
+            &[],
         );
         let visible = strip_ansi(&text);
         assert!(visible.contains("●1:vim"), "{visible}");
         assert!(!visible.contains("●0:"), "{visible}");
+    }
+
+    #[test]
+    fn status_bar_marks_windows_with_mouse_tracking() {
+        let (text, _) = format_status_bar(
+            "lrmux",
+            &["zsh".into(), "vim".into()],
+            0,
+            "abc",
+            false,
+            "srv",
+            &[],
+            &[false, true],
+        );
+        let visible = strip_ansi(&text);
+        assert!(visible.contains("1:vim[M]"), "{visible}");
+        assert!(!visible.contains("0:zsh[M]"), "{visible}");
+    }
+
+    fn ctl(mode: crate::config::MouseMode) -> MouseCtl {
+        MouseCtl {
+            mode,
+            ovr: MouseOverride::Auto,
+            latched: false,
+        }
+    }
+
+    #[test]
+    fn mouse_mask_only_required_follows_the_pane() {
+        use crate::config::MouseMode;
+        let mut c = ctl(MouseMode::OnlyRequired);
+        let mut grid = Grid::new(10, 40, 10);
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0);
+        grid.mouse_tracking = 0b111;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b111);
+        // Copy mode widens the mask to button events.
+        grid.mouse_tracking = 0;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, true), 0b010);
+    }
+
+    #[test]
+    fn mouse_mask_always_on_and_off() {
+        use crate::config::MouseMode;
+        let grid = Grid::new(10, 40, 10);
+        let mut c = ctl(MouseMode::AlwaysOn);
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b010);
+        let mut c = ctl(MouseMode::Off);
+        assert_eq!(desired_mouse_mask(&mut c, &grid, true), 0);
+    }
+
+    #[test]
+    fn mouse_mask_auto_enable_latches_after_pane_request() {
+        use crate::config::MouseMode;
+        let mut c = ctl(MouseMode::AutoEnable);
+        let mut grid = Grid::new(10, 40, 10);
+        // Off until some pane asks for tracking.
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0);
+        grid.mouse_tracking = 0b011;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b011);
+        assert!(c.latched);
+        // Sticky: stays on (button level) after the pane drops tracking.
+        grid.mouse_tracking = 0;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b010);
+    }
+
+    #[test]
+    fn mouse_mask_override_wins_both_ways() {
+        use crate::config::MouseMode;
+        let grid = Grid::new(10, 40, 10);
+        let mut c = ctl(MouseMode::Off);
+        c.ovr = MouseOverride::ForceOn;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, false), 0b010);
+        let mut c = ctl(MouseMode::AlwaysOn);
+        c.ovr = MouseOverride::ForceOff;
+        assert_eq!(desired_mouse_mask(&mut c, &grid, true), 0);
     }
 
     #[test]
@@ -2965,6 +3299,7 @@ mod tests {
             false,
             "srv",
             &[true, false],
+            &[],
         );
         let visible = strip_ansi(&text);
         assert_eq!(spans.len(), 2);
