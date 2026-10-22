@@ -1559,19 +1559,9 @@ pub fn run(
                                             term_fg,
                                             term_bg,
                                         } => {
-                                            // Find the target session by name, or use the first.
-                                            let si = match session {
-                                                Some(ref name) => {
-                                                    sessions.iter().position(|s| &s.name == name)
-                                                }
-                                                None => {
-                                                    if sessions.is_empty() {
-                                                        None
-                                                    } else {
-                                                        Some(0)
-                                                    }
-                                                }
-                                            };
+                                            // Name, "$id", or first session when unset.
+                                            let si = find_session(&sessions, &session)
+                                                .filter(|&i| i < sessions.len());
                                             let fmt =
                                                 super::capture::CaptureFormat::from_u8(format);
                                             let reply: Result<String, String> = if let Some(si) = si
@@ -3232,17 +3222,9 @@ fn resolve_send_target(
     session: &Option<String>,
     window: Option<u8>,
 ) -> Result<(usize, usize), String> {
-    let si = match session {
-        Some(name) => match sessions.iter().position(|s| &s.name == name) {
-            Some(i) => i,
-            None => return Err(no_session_error(session, sessions)),
-        },
-        None => {
-            if sessions.is_empty() {
-                return Err("no sessions".into());
-            }
-            0
-        }
+    let si = match find_session(sessions, session).filter(|&i| i < sessions.len()) {
+        Some(i) => i,
+        None => return Err(no_session_error(session, sessions)),
     };
     let wi = match window {
         Some(w) => w as usize,
