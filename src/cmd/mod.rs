@@ -10,46 +10,130 @@
 
 use std::collections::HashMap;
 
-/// A parsed target: [session]:[window] (tmux-style).
-/// Session and window are optional — empty means "current".
-#[derive(Clone, Debug, Default)]
+/// A parsed target: `[server:][session][:window]` (tmux-style + optional server).
+/// Empty parts mean "current" / resolve from context (`LRMUX_*`, unique server).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Target {
+    pub server: Option<String>,
     pub session: Option<String>,
     pub window: Option<String>,
 }
 
 impl Target {
-    /// Parse a target string like "session", "session:0", ":0", "0", or "".
-    /// A bare number is treated as a window index (tmux convention).
+    /// Parse without probing live servers. Two-part forms are always
+    /// `session:window`. Three-part forms are `server:session:window`.
+    /// A bare number is a window index (tmux convention).
     pub fn parse(s: &str) -> Self {
+        Self::parse_with(s, |_| false)
+    }
+
+    /// Like [`parse`], but when `server_exists` reports a live local server
+    /// for the first component, prefer `server` / `server:session` over
+    /// treating that component as a session name (matches `capture-pane`).
+    pub fn parse_with(s: &str, server_exists: impl Fn(&str) -> bool) -> Self {
         if s.is_empty() {
             return Self::default();
         }
-        if let Some((sess, win)) = s.split_once(':') {
-            Self {
-                session: if sess.is_empty() {
-                    None
+        let parts: Vec<&str> = s.split(':').collect();
+        match parts.as_slice() {
+            [a] => {
+                if a.chars().all(|c| c.is_ascii_digit()) {
+                    Self {
+                        window: Some((*a).to_string()),
+                        ..Self::default()
+                    }
+                } else if server_exists(a) {
+                    Self {
+                        server: Some((*a).to_string()),
+                        ..Self::default()
+                    }
                 } else {
-                    Some(sess.to_string())
-                },
-                window: if win.is_empty() {
-                    None
+                    Self {
+                        session: Some((*a).to_string()),
+                        ..Self::default()
+                    }
+                }
+            }
+            [a, b] => {
+                let b_is_index =
+                    !b.is_empty() && (b.chars().all(|c| c.is_ascii_digit()) || b.starts_with('@'));
+                if a.is_empty() {
+                    // ":N" → window in current session
+                    Self {
+                        window: if b.is_empty() {
+                            None
+                        } else {
+                            Some((*b).to_string())
+                        },
+                        ..Self::default()
+                    }
+                } else if !b_is_index && !b.is_empty() && server_exists(a) {
+                    Self {
+                        server: Some((*a).to_string()),
+                        session: Some((*b).to_string()),
+                        ..Self::default()
+                    }
                 } else {
-                    Some(win.to_string())
-                },
+                    Self {
+                        session: Some((*a).to_string()),
+                        window: if b.is_empty() {
+                            None
+                        } else {
+                            Some((*b).to_string())
+                        },
+                        ..Self::default()
+                    }
+                }
             }
-        } else if s.chars().all(|c| c.is_ascii_digit()) {
-            // Bare number → window index in current session.
-            Self {
-                session: None,
-                window: Some(s.to_string()),
-            }
-        } else {
-            Self {
-                session: Some(s.to_string()),
-                window: None,
-            }
+            [a, b, c, ..] => Self {
+                server: Some((*a).to_string()),
+                session: Some((*b).to_string()),
+                window: Some((*c).to_string()),
+            },
+            [] => Self::default(),
         }
+    }
+}
+
+/// Pick the server for a CLI command that takes `-s` / a target with an
+/// optional server component.
+///
+/// Order: explicit `-s` or `target.server` → nested `LRMUX_SERVER` →
+/// test harness `LRMUX_CLI_SERVER` → the sole local server → error when
+/// zero or multiple locals (ambiguity).
+pub fn resolve_cli_server(
+    flag_server: Option<&str>,
+    target_server: Option<&str>,
+    nested_server: Option<&str>,
+    cli_server_override: Option<&str>,
+    local_servers: &[String],
+) -> Result<String, String> {
+    if let Some(s) = flag_server.filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    if let Some(s) = target_server.filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    if let Some(s) = nested_server.filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    if let Some(s) = cli_server_override.filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    match local_servers {
+        [] => Err(
+            "no lrmux servers running; start one with `lrmux new-server` \
+             or pass `-s <server>`"
+                .into(),
+        ),
+        [only] => Ok(only.clone()),
+        many => Err(format!(
+            "ambiguous server — {} running ({}); pass `-s <server>`, \
+             use `-t server:session:window`, or run from inside a pane \
+             (uses $LRMUX_SERVER)",
+            many.len(),
+            many.join(", ")
+        )),
     }
 }
 
@@ -314,14 +398,21 @@ with [peers] directory = true.",
         name: "send-keys",
         aliases: &["send"],
         summary: "Send keys to a pane",
-        usage: "    lrmux send-keys -t <target> <keys> [-q]",
+        usage: "    lrmux send-keys [-s <server>] -t <target> <keys> [-q]",
         body: "\
--t, --target <target>   Pane to write\n\
+-s, --server <server|host:port>  Server (required when several are running\n\
+                                 and you are not inside a pane)\n\
+-t, --target <target>   session, session:N, server:session, or\n\
+                        server:session:N (bare N = window index)\n\
 -q, --quiet             Suppress stderr\n\
 \n\
 Special keys: C-c, C-a, F1-F12, Enter, Tab, Escape, Space, BS,\n\
 Up, Down, Left, Right, Home, End, PageUp, PageDown, M-x.\n\
-Anything else is sent as literal text.",
+Anything else is sent as literal text.\n\
+\n\
+To type a command and press Enter, pass Enter as its own argument:\n\
+  lrmux send-keys -t sess:0 ls Enter\n\
+(A quoted \"ls\\n\" sends the two characters \\\\ and n, not a newline.)",
     },
     CommandSpec {
         name: "send-event",
@@ -356,9 +447,12 @@ mouse tracking. Useful for driving and debugging TUI apps.",
         usage: "    \
 lrmux capture-pane [-s <server|host:port>] -t <target> [-p] [-c|--colors] [--format ascii|ansi|html|markdown] [--clipboard] [--file <path>]",
         body: "\
--s, --server <server|host:port>  Server to query (name or TCP address)\n\
--t, --target <target>          Target pane: session, session:N,\n\
+-s, --server <server|host:port>  Server to query (name or TCP address).\n\
+                                 With several servers and no -s / nested\n\
+                                 $LRMUX_SERVER, the command errors (ambiguous).\n\
+-t, --target <target>          Target pane: N, session, session:N,\n\
                                server:session or server:session:N\n\
+                               (positional target also accepted)\n\
 -p, --print                    Print to stdout\n\
 -c, --colors                   Include cell styles\n\
 --format <ascii|ansi|html|markdown>\n\
@@ -938,6 +1032,82 @@ mod tests {
         assert_eq!(canonical_name("send"), "send-keys");
         assert_eq!(canonical_name("show"), "show-option");
         assert_eq!(canonical_name("new"), "new-session");
+    }
+
+    #[test]
+    fn target_parse_three_part_and_bare_window() {
+        let t = Target::parse("rabbitmq:rabbitmq:1");
+        assert_eq!(t.server.as_deref(), Some("rabbitmq"));
+        assert_eq!(t.session.as_deref(), Some("rabbitmq"));
+        assert_eq!(t.window.as_deref(), Some("1"));
+
+        let t = Target::parse("1");
+        assert_eq!(t.server, None);
+        assert_eq!(t.session, None);
+        assert_eq!(t.window.as_deref(), Some("1"));
+
+        let t = Target::parse("sess:2");
+        assert_eq!(t.server, None);
+        assert_eq!(t.session.as_deref(), Some("sess"));
+        assert_eq!(t.window.as_deref(), Some("2"));
+
+        // Without a live-server probe, two non-index parts stay session:window
+        // (window may be a name — CLI parse_with reclassifies when needed).
+        let t = Target::parse("srv:sess");
+        assert_eq!(t.server, None);
+        assert_eq!(t.session.as_deref(), Some("srv"));
+        assert_eq!(t.window.as_deref(), Some("sess"));
+    }
+
+    #[test]
+    fn target_parse_with_live_server() {
+        let exists = |n: &str| n == "rabbitmq";
+        let t = Target::parse_with("rabbitmq:work", exists);
+        assert_eq!(t.server.as_deref(), Some("rabbitmq"));
+        assert_eq!(t.session.as_deref(), Some("work"));
+        assert_eq!(t.window, None);
+
+        // Digit second part stays session:window even if first is a server.
+        let t = Target::parse_with("rabbitmq:1", exists);
+        assert_eq!(t.server, None);
+        assert_eq!(t.session.as_deref(), Some("rabbitmq"));
+        assert_eq!(t.window.as_deref(), Some("1"));
+
+        let t = Target::parse_with("rabbitmq", exists);
+        assert_eq!(t.server.as_deref(), Some("rabbitmq"));
+        assert_eq!(t.session, None);
+    }
+
+    #[test]
+    fn resolve_cli_server_nested_unique_and_ambiguous() {
+        let locals = vec!["default".into(), "rabbitmq".into()];
+        assert_eq!(
+            resolve_cli_server(Some("x"), None, None, None, &locals).unwrap(),
+            "x"
+        );
+        assert_eq!(
+            resolve_cli_server(None, Some("from-t"), None, None, &locals).unwrap(),
+            "from-t"
+        );
+        assert_eq!(
+            resolve_cli_server(None, None, Some("nested"), None, &locals).unwrap(),
+            "nested"
+        );
+        assert_eq!(
+            resolve_cli_server(None, None, None, Some("cli"), &locals).unwrap(),
+            "cli"
+        );
+        let err = resolve_cli_server(None, None, None, None, &locals).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("rabbitmq"), "{err}");
+
+        let one = vec!["only".into()];
+        assert_eq!(
+            resolve_cli_server(None, None, None, None, &one).unwrap(),
+            "only"
+        );
+        let err = resolve_cli_server(None, None, None, None, &[]).unwrap_err();
+        assert!(err.contains("no lrmux servers"), "{err}");
     }
 
     #[test]

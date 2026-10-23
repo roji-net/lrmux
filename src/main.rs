@@ -31,19 +31,16 @@ use crate::ipc::socket_path;
 use crate::proto::{ClientMsg, ServerMsg};
 
 /// Connect to a server. Uses TCP if --tcp was set, otherwise Unix socket.
-/// `LRMUX_CLI_SERVER` overrides the default server name for CLI helpers
-/// (capture-pane, send-keys, …) so tests can target a throwaway server
-/// without touching the user's `default`.
 fn connect_to_server(server: &str) -> io::Result<crate::ipc::ConnStream> {
     if let Some(addr) = crate::ipc::tcp_addr() {
         return crate::ipc::connect_tcp(&addr);
     }
-    let server = if server == "default" {
-        std::env::var("LRMUX_CLI_SERVER").unwrap_or_else(|_| server.to_string())
-    } else {
-        server.to_string()
-    };
-    let sock = socket_path(&server);
+    // TCP-shaped `-s host:port` (no live Unix socket of that name).
+    if server.contains(':') && !local_server_exists(server) {
+        crate::ipc::set_tcp_addr(Some(server.to_string()));
+        return crate::ipc::connect_tcp(server);
+    }
+    let sock = socket_path(server);
     if !crate::ipc::server_exists(&sock) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -51,6 +48,55 @@ fn connect_to_server(server: &str) -> io::Result<crate::ipc::ConnStream> {
         ));
     }
     crate::ipc::connect(&sock).map(crate::ipc::ConnStream::Unix)
+}
+
+/// Live local Unix-socket server names under `/tmp/lrmux-<uid>/`.
+fn list_local_server_names() -> Vec<String> {
+    let uid = unsafe { libc::getuid() };
+    let dir = format!("/tmp/lrmux-{uid}");
+    let mut names = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name == "logs" || name == "bin" {
+                    continue;
+                }
+                if crate::ipc::server_exists(&path) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Resolve which server a targeting CLI command should use.
+/// See [`cmd::resolve_cli_server`]. Errors on multi-server ambiguity.
+fn resolve_cli_server(
+    flag_server: Option<&str>,
+    target_server: Option<&str>,
+) -> io::Result<String> {
+    let nested = std::env::var("LRMUX_SERVER").ok();
+    let cli_override = std::env::var("LRMUX_CLI_SERVER").ok();
+    let locals = list_local_server_names();
+    cmd::resolve_cli_server(
+        flag_server,
+        target_server,
+        nested.as_deref(),
+        cli_override.as_deref(),
+        &locals,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+/// Parse `-t` / positional target with live-server awareness.
+fn parse_cli_target(raw: Option<&str>) -> cmd::Target {
+    match raw {
+        None | Some("") => cmd::Target::default(),
+        Some(s) => cmd::Target::parse_with(s, local_server_exists),
+    }
 }
 
 fn main() {
@@ -433,6 +479,7 @@ fn parse_args() -> CliAction {
                 target: parsed
                     .get("t")
                     .or_else(|| parsed.get("target"))
+                    .or_else(|| parsed.positional.first().map(|s| s.as_str()))
                     .map(|s| s.to_string()),
                 print: parsed.has("p") || parsed.has("print"),
                 colors,
@@ -598,12 +645,13 @@ fn parse_new_window(args: &[String]) -> CliAction {
         .or_else(|| parsed.get("cwd"))
         .map(|s| s.to_string());
     let command = shell_command_from_parsed(&parsed);
+    let raw_target = parsed.get("t").or_else(|| parsed.get("target"));
     CliAction::NewWindow {
         server: parsed
             .get("s")
             .or_else(|| parsed.get("server"))
             .map(|s| s.to_string()),
-        target: parsed.target(),
+        target: parse_cli_target(raw_target),
         name,
         cwd,
         command,
@@ -616,12 +664,13 @@ fn parse_send_keys(args: &[String]) -> CliAction {
     let parsed = cmd::parse_flags(args);
     let quiet = parsed.has("q") || parsed.has("quiet");
     let keys = parse_tmux_keys(&parsed.positional);
+    let raw_target = parsed.get("t").or_else(|| parsed.get("target"));
     CliAction::SendKeys {
         server: parsed
             .get("s")
             .or_else(|| parsed.get("server"))
             .map(|s| s.to_string()),
-        target: parsed.target(),
+        target: parse_cli_target(raw_target),
         keys,
         quiet,
     }
@@ -639,12 +688,13 @@ fn parse_send_event(args: &[String]) -> CliAction {
             std::process::exit(2);
         }
     };
+    let raw_target = parsed.get("t").or_else(|| parsed.get("target"));
     CliAction::SendEvent {
         server: parsed
             .get("s")
             .or_else(|| parsed.get("server"))
             .map(|s| s.to_string()),
-        target: parsed.target(),
+        target: parse_cli_target(raw_target),
         events,
         quiet,
     }
@@ -1676,7 +1726,8 @@ fn query_session_names(server: &str) -> io::Result<(String, Vec<String>)> {
 /// Query a directory/manager's peer cache. With `--tcp` (or `-t <name>`)
 /// queries that endpoint; otherwise the default local server.
 fn list_peers(server: Option<&str>) -> io::Result<()> {
-    let mut stream = connect_to_server(server.unwrap_or("default"))?;
+    let server = resolve_cli_server(server, None)?;
+    let mut stream = connect_to_server(&server)?;
     let ident = proto::encode_client(&ClientMsg::Identify {
         rows: 0,
         cols: 0,
@@ -1996,13 +2047,7 @@ fn cli_new_window(
     target: &cmd::Target,
     command: Option<String>,
 ) -> io::Result<()> {
-    // Inside a pane, default to the pane's server (LRMUX_SERVER) and
-    // session (LRMUX_SESSION, "$id" form) — otherwise the window lands
-    // on server "default"/session 0 regardless of where lrmux ran.
-    let server = server_flag
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("LRMUX_SERVER").ok())
-        .unwrap_or_else(|| "default".to_string());
+    let server = resolve_cli_server(server_flag, target.server.as_deref())?;
     let session = target
         .session
         .clone()
@@ -2041,86 +2086,29 @@ fn local_server_exists(name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', ':']) && ipc::server_exists(&ipc::socket_path(name))
 }
 
-/// Resolved `capture-pane` target: optional server override, session
-/// name and window index (index only — names error out).
-#[derive(Default)]
-struct CaptureTarget {
-    server: Option<String>,
-    session: Option<String>,
-    window: Option<u8>,
-}
-
-/// Resolve `-t` into a `CaptureTarget`. Forms: `sess` (session on the
-/// selected/default server), `sess:win` (tmux-style session:index),
-/// `srv` (a bare running-server name → first session), `srv:sess`
-/// (when `srv` is a running local server and the second part is not a
-/// bare index), and the explicit `srv:sess:win` three-part form.
-fn resolve_capture_target(
-    server_flag: Option<&str>,
-    raw: Option<&str>,
-) -> Result<CaptureTarget, String> {
-    let mut server = server_flag.map(|s| s.to_string());
-    let mut session = None;
-    let mut window: Option<String> = None;
-    let t = raw.unwrap_or("");
-    if !t.is_empty() {
-        let parts: Vec<&str> = t.split(':').collect();
-        match parts.as_slice() {
-            [a] => {
-                if server.is_none() && local_server_exists(a) {
-                    server = Some(a.to_string());
-                } else {
-                    session = Some(a.to_string());
-                }
-            }
-            [a, b] => {
-                if server.is_none()
-                    && !b.is_empty()
-                    && !b.chars().all(|c| c.is_ascii_digit())
-                    && !b.starts_with('@')
-                    && local_server_exists(a)
-                {
-                    server = Some(a.to_string());
-                    session = Some(b.to_string());
-                } else if !b.is_empty() {
-                    session = Some(a.to_string());
-                    window = Some(b.to_string());
-                } else {
-                    session = Some(a.to_string());
-                }
-            }
-            [a, b, c, ..] => {
-                if server.is_none() {
-                    server = Some(a.to_string());
-                    session = Some(b.to_string());
-                    window = Some(c.to_string());
-                } else {
-                    session = Some(parts[..parts.len() - 1].join(":"));
-                    window = Some(c.to_string());
-                }
-            }
-            [] => {}
+/// Parse a window index from a target component (`N` or `@N`).
+fn parse_window_index(window: &Option<String>) -> io::Result<Option<u8>> {
+    match window {
+        None => Ok(None),
+        Some(w) => {
+            let w = w.strip_prefix('@').unwrap_or(w);
+            w.parse::<u8>().map(Some).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid window target '{w}' — use a window index (e.g. -t session:0)"),
+                )
+            })
         }
     }
-    let window = match window {
-        None => None,
-        Some(w) => {
-            let w = w.strip_prefix('@').unwrap_or(&w);
-            match w.parse::<u8>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    return Err(format!(
-                        "invalid window target '{w}' — use a window index (e.g. -t session:0)"
-                    ));
-                }
-            }
-        }
-    };
-    Ok(CaptureTarget {
-        server,
-        session,
-        window,
-    })
+}
+
+/// Session for a targeting CLI command: explicit `-t` session, else the
+/// nested pane's `LRMUX_SESSION` (`$id` form).
+fn resolve_cli_session(target: &cmd::Target) -> Option<String> {
+    target
+        .session
+        .clone()
+        .or_else(|| std::env::var("LRMUX_SESSION").ok())
 }
 
 /// CLI: capture the content of a pane.
@@ -2138,28 +2126,26 @@ fn cli_capture_window(
     clipboard: bool,
     file: Option<&str>,
 ) -> io::Result<()> {
-    let target = match resolve_capture_target(server_flag, raw_target) {
-        Ok(t) => t,
-        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+    let target = parse_cli_target(raw_target);
+    let server_name = resolve_cli_server(server_flag, target.server.as_deref())?;
+    let session = resolve_cli_session(&target);
+    let window = parse_window_index(&target.window)?;
+    // `-s host:port` / three-part TCP targets connect over TCP.
+    let tcp = if server_name.contains(':') && !local_server_exists(&server_name) {
+        Some(server_name.as_str())
+    } else {
+        None
     };
-    // `-s host:port` connects over TCP; a bare name is a local socket.
-    let (server_name, tcp) = match target.server.as_deref() {
-        Some(s) if s.contains(':') => (s.to_string(), Some(s)),
-        Some(s) => (s.to_string(), None),
-        None => ("default".to_string(), None),
-    };
-    let session = target.session;
     let content = client::capture_pane(
         &server_name,
         tcp,
         session.clone(),
-        target.window,
+        window,
         format.as_u8(),
         colors,
     )
     .map_err(|e| {
-        // Session miss on the default server while the name matches a
-        // running server → point at the server syntax.
+        // Session miss while the name matches a running server → hint `-s`.
         if let Some(s) = &session
             && e.to_string().contains("no session")
             && local_server_exists(s)
@@ -2198,12 +2184,9 @@ fn cli_send_keys(
     keys: &[u8],
     quiet: bool,
 ) -> io::Result<()> {
-    // Inside a pane, default to the pane's server (LRMUX_SERVER), like
-    // cli_new_window — otherwise send-keys always lands on "default".
-    let server = server
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("LRMUX_SERVER").ok())
-        .unwrap_or_else(|| "default".to_string());
+    let server = resolve_cli_server(server, target.server.as_deref())?;
+    let session = resolve_cli_session(target);
+    let window = parse_window_index(&target.window)?;
     let mut stream = connect_to_server(&server)?;
     let (rows, cols) = (24u16, 80u16);
     let msg = proto::encode_client(&ClientMsg::Identify {
@@ -2226,15 +2209,13 @@ fn cli_send_keys(
     }
     if !quiet {
         eprintln!(
-            "lrmux: send-keys: target={:?} keys={:?} ({} bytes)",
-            target,
+            "lrmux: send-keys: server={server} session={session:?} window={window:?} keys={:?} ({} bytes)",
             String::from_utf8_lossy(keys),
             keys.len()
         );
     }
-    let window = target.window.as_ref().and_then(|w| w.parse::<u8>().ok());
     let msg = proto::encode_client(&ClientMsg::SendKeys {
-        session: target.session.clone(),
+        session,
         window,
         keys: keys.to_vec(),
     });
@@ -2283,10 +2264,9 @@ fn cli_send_event(
     events: &[proto::InputEvent],
     quiet: bool,
 ) -> io::Result<()> {
-    let server = server
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("LRMUX_SERVER").ok())
-        .unwrap_or_else(|| "default".to_string());
+    let server = resolve_cli_server(server, target.server.as_deref())?;
+    let session = resolve_cli_session(target);
+    let window = parse_window_index(&target.window)?;
     let mut stream = connect_to_server(&server)?;
     let msg = proto::encode_client(&ClientMsg::Identify {
         rows: 24,
@@ -2307,11 +2287,12 @@ fn cli_send_event(
         Err(e) => return Err(e),
     }
     if !quiet {
-        eprintln!("lrmux: send-event: target={:?} events={:?}", target, events);
+        eprintln!(
+            "lrmux: send-event: server={server} session={session:?} window={window:?} events={events:?}"
+        );
     }
-    let window = target.window.as_ref().and_then(|w| w.parse::<u8>().ok());
     let msg = proto::encode_client(&ClientMsg::SendEvent {
-        session: target.session.clone(),
+        session,
         window,
         events: events.to_vec(),
     });

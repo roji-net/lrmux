@@ -694,23 +694,31 @@ describes lrmux's own emulation, not the outer terminal's. This is not
 gated on `tmux_compat`; it benefits all panes. `set-environment`
 /`unset-environment` edit the same env manually.
 
-#### `capture-pane` targeting
+#### CLI targeting (`capture-pane`, `send-keys`, `send-event`, …)
 
-`lrmux capture-pane` accepts `-s <server|host:port>` to pick the server
-(local Unix-socket name or a TCP address) and `-t <target>` with these
-forms:
+Commands that take `-s` / `-t` share one resolver:
 
-- `sess` — session on the chosen server (`-s` or `default`).
-- `sess:N` — tmux-style session:window-index (`@N` also accepted).
-- `srv` — a bare running-server name captures its first session.
-- `srv:sess` — when `srv` names a running local server and the second
-  part is not a bare index, the first part is read as the server.
-- `srv:sess:N` — explicit three-part form.
+1. Explicit `-s` or a `server:` component in `-t`
+2. Nested `$LRMUX_SERVER` (set inside panes)
+3. `$LRMUX_CLI_SERVER` (test harness override)
+4. The sole local Unix-socket server
+5. Otherwise error — multiple (or zero) servers is ambiguous; never
+   silently pick `default` or a random socket
 
-Lookups that miss return an error instead of an empty capture: the
-server replies with the available session/window names and a "did you
-mean …" suggestion for near matches (edit distance or prefix). If the
-missed session name is also a running server, the CLI hints at `-s`.
+`-t` forms:
+
+- `N` — window index in the current/nested session
+- `sess` — session on the resolved server
+- `sess:N` — tmux-style session:window-index (`@N` also accepted)
+- `srv` — a bare running-server name (first session)
+- `srv:sess` — when `srv` is a live local server and the second part is
+  not a bare index
+- `srv:sess:N` — explicit three-part form (also used by `send-keys`)
+
+Inside a pane, omitted session defaults to `$LRMUX_SESSION` (`$id`).
+Lookups that miss return an error with available names and a "did you
+mean …" suggestion. If the missed session name is also a running
+server, the CLI hints at `-s`.
 
 #### Diagnostics and byte tracing
 
