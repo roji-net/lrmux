@@ -1556,7 +1556,7 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
     let name = socket_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("default");
+        .unwrap_or("server");
     match socket_path.parent() {
         Some(dir) => dir
             .join("logs")
@@ -2000,7 +2000,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
 /// Format the status bar text with colors.
 /// The bar uses a blue background; the active window is highlighted in bold yellow.
 /// Inactive windows with pending activity get a red bullet prefix.
-/// Identity is `[session]@server`, then the window list.
+/// Identity is `server:session` (CLI target form), then the window list.
 /// Also returns each window entry's 1-based column span (start, end,
 /// window index) for mouse hit-testing on the status bar row.
 #[allow(clippy::too_many_arguments)]
@@ -2067,7 +2067,7 @@ fn format_status_bar(
     let identity = if server.is_empty() {
         format!("{SESSION}{session}{BAR}")
     } else {
-        format!("[{SESSION}{session}{BAR}]@{server}")
+        format!("{server}:{SESSION}{session}{BAR}")
     };
 
     // Visible layout: "lrmux <hash><marker> | <identity> | <parts…>".
@@ -3149,10 +3149,7 @@ mod tests {
             &[],
         );
         let visible = strip_ansi(&text);
-        assert!(
-            visible.contains("[lrmux]@infra-284-letsencrypt"),
-            "{visible}"
-        );
+        assert!(visible.contains("infra-284-letsencrypt:lrmux"), "{visible}");
     }
 
     #[test]

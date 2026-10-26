@@ -15,7 +15,7 @@ pub fn state_file_path(socket_path: &Path) -> std::path::PathBuf {
     let server_name = socket_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("default");
+        .unwrap_or("server");
     std::path::PathBuf::from(format!("/tmp/lrmux-{uid}/logs/{server_name}.state"))
 }
 

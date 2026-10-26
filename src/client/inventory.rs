@@ -267,6 +267,42 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
         }
     }
 
+    // Direct TCP ListSessions for `network.scan` host / host:port entries.
+    // Works without UDP (iSH, AP client isolation, off-LAN). CIDRs stay
+    // UDP-only — we do not TCP-probe every address in a /24.
+    for addr in scan_tcp_targets(&net.scan, net.discovery_port) {
+        let already = entries
+            .iter()
+            .any(|e| e.tcp_addr() == Some(addr.as_str()) || e.address == addr);
+        if already {
+            continue;
+        }
+        match query_sessions_tcp(&addr) {
+            Ok((address, sessions)) => {
+                // Inventory key: hostname, or full host:port on collision.
+                let mut name = host_of_addr(&addr);
+                if entries.iter().any(|e| e.name == name) {
+                    name = addr.clone();
+                }
+                entries.push(ServerEntry {
+                    name,
+                    source: ServerSource::Lan {
+                        tcp_addr: addr.clone(),
+                        tls: false,
+                        version: String::new(),
+                        fingerprint: String::new(),
+                    },
+                    sessions,
+                    address,
+                    probe_error: None,
+                });
+            }
+            Err(e) => {
+                eprintln!("lrmux: warning: scan TCP {addr} ListSessions failed ({e})");
+            }
+        }
+    }
+
     // Configured managers report their cached peers. This is the path
     // that works without any UDP/broadcast at all: a constrained client
     // only needs TCP to the manager to see the whole fleet.
@@ -376,7 +412,7 @@ fn query_sessions_unix(sock: &std::path::Path) -> io::Result<(String, Vec<Sessio
 }
 
 fn query_sessions_tcp(addr: &str) -> io::Result<(String, Vec<SessionInfo>)> {
-    let mut stream = ipc::connect_tcp(addr)?;
+    let mut stream = ipc::connect_tcp_timeout(addr, Duration::from_secs(2))?;
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
     let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
@@ -393,6 +429,39 @@ fn query_sessions_tcp(addr: &str) -> io::Result<(String, Vec<SessionInfo>)> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// `network.scan` entries that are a single host (optional `:port`), not a CIDR.
+/// Used for direct TCP ListSessions when UDP discovery is unavailable.
+fn scan_tcp_targets(scan: &[String], default_port: u16) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in scan {
+        let s = raw.trim();
+        if s.is_empty() || s.contains('/') {
+            continue;
+        }
+        // `[ipv6]:port`
+        if let Some(rest) = s.strip_prefix('[')
+            && let Some((host, port)) = rest.split_once("]:")
+            && port.parse::<u16>().is_ok()
+            && !host.is_empty()
+        {
+            out.push(s.to_string());
+            continue;
+        }
+        if let Some((host, port)) = s.rsplit_once(':')
+            && port.parse::<u16>().is_ok()
+            && !host.is_empty()
+            && !host.contains(':')
+        {
+            // host:port (reject bare IPv6 without brackets)
+            out.push(s.to_string());
+            continue;
+        }
+        // Bare hostname / IPv4 / bracketed IPv6 → append default discovery port.
+        out.push(format!("{s}:{default_port}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -413,5 +482,25 @@ mod tests {
         assert_eq!(port_of_addr("10.0.0.1:9999").as_deref(), Some("9999"));
         assert_eq!(host_of_addr("[::1]:17281"), "[::1]");
         assert_eq!(port_of_addr("[::1]:17281").as_deref(), Some("17281"));
+    }
+
+    #[test]
+    fn scan_tcp_targets_skips_cidrs_and_fills_port() {
+        let t = scan_tcp_targets(
+            &[
+                "10.0.0.5".into(),
+                "casa.example:17281".into(),
+                "10.0.0.0/24".into(),
+                "".into(),
+            ],
+            17280,
+        );
+        assert_eq!(
+            t,
+            vec![
+                "10.0.0.5:17280".to_string(),
+                "casa.example:17281".to_string(),
+            ]
+        );
     }
 }

@@ -261,7 +261,8 @@ reaching a peer behind NAT that registered to the manager.
 discovery       = true      # answer UDP Discover probes (existing)
 discovery_port  = 17280
 announce        = true      # active announces (broadcast + unicast gossip)
-scan            = []        # extra CIDRs/hosts to unicast-probe, e.g.
+scan            = []        # UDP unicast + TCP ListSessions for host/host:port
+                            # (e.g. ["10.17.17.16:17281"]); CIDRs are UDP-only
                             # ["10.17.17.0/24", "192.168.1.5"]
 
 [peers]

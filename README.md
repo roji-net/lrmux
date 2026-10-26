@@ -115,6 +115,9 @@ tcp_listen = "auto"             # empty = no TCP. "auto" = 0.0.0.0, first free p
 ws_listen = "127.0.0.1:17282"  # empty = no WebSocket listener (browser client)
 discovery = true                 # optional; also auto-enabled when TCP/WS is on
 discovery_port = 17280
+# Extra UDP unicast targets, and (for host/host:port, not CIDRs) direct
+# TCP ListSessions — useful when UDP broadcast fails (e.g. iSH on iPad):
+# scan = ["10.17.17.16:17281", "casa.example.com:17281"]
 tls = "auto"                     # off | on | auto (TCP only; use a proxy for WSS)
 # safe_networks is empty by default (safe): under tls=auto every TCP peer
 # requires TLS. Add CIDRs only where you deliberately allow plaintext, e.g.:
@@ -151,11 +154,14 @@ For remote/HTTPS, terminate TLS at a reverse proxy and expose `wss://`. A Rust/W
 client can reuse this transport later; the MVP is plain JS in `web/`.
 
 `lrmux ls`, `ls-servers`, `discover`, and the session selector share one inventory
-(local Unix sockets + LAN UDP discovery). LAN rows are tagged `[lan]`.
+(local Unix sockets + LAN UDP discovery + TCP probes of `network.scan`
+hosts + `[peers] managers`). LAN/scan rows are tagged `[lan]`.
 
 Unix sockets stay FS-permission gated (no PSK). TCP uses the PSK for auth and
-TLS for encryption when required by `tls` / `safe_networks`. WebSocket uses the
-same PSK; encrypt with WSS via a proxy.
+TLS for encryption when required by `tls` / `safe_networks`. Under `tls=auto`,
+peers in `safe_networks` may use plaintext, but a client that offers TLS
+(ClientHello) is still accepted with TLS. WebSocket uses the same PSK;
+encrypt with WSS via a proxy.
 
 ## Build & develop
 

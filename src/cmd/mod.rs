@@ -481,7 +481,10 @@ lrmux capture-pane [-s <server|host:port>] -t <target> [-p] [-c|--colors] [--for
         aliases: &["ls-servers"],
         summary: "List running servers",
         usage: "    lrmux list-servers",
-        body: "Local Unix sockets plus LAN servers that answer UDP discovery.",
+        body: "\
+Local Unix sockets, LAN UDP discovery, TCP ListSessions to each\n    \
+`network.scan` host/host:port (no UDP needed), and peers from\n    \
+`[peers] managers`.",
     },
     CommandSpec {
         name: "list-peers",
@@ -491,8 +494,8 @@ lrmux capture-pane [-s <server|host:port>] -t <target> [-p] [-c|--colors] [--for
         body: "\
 Queries a manager (or a server with [peers] directory = true) for its\n    \
 peer cache: known lrmux servers, their addresses, trust state, and\n    \
-session names. Defaults to the local 'default' server; use --tcp to\n    \
-query a remote manager.",
+session names. With no -s, uses the nested/$LRMUX_SERVER or the sole\n    \
+local server (errors if ambiguous); use --tcp for a remote manager.",
     },
     CommandSpec {
         name: "kill-server",
@@ -1080,7 +1083,7 @@ mod tests {
 
     #[test]
     fn resolve_cli_server_nested_unique_and_ambiguous() {
-        let locals = vec!["default".into(), "rabbitmq".into()];
+        let locals = vec!["lrmux".into(), "rabbitmq".into()];
         assert_eq!(
             resolve_cli_server(Some("x"), None, None, None, &locals).unwrap(),
             "x"

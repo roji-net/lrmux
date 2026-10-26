@@ -3,6 +3,8 @@
 // Policy (TlsMode::Auto): require TLS unless the peer IP is listed in
 // `network.safe_networks` (CIDR). Empty safe_networks (default) ⇒ always TLS.
 // TlsMode::On always; TlsMode::Off never.
+// Accept path: if the client starts with a TLS ClientHello (0x16), wrap
+// TLS even when the peer is in safe_networks — prefer encryption when offered.
 
 use std::fs;
 use std::io;
@@ -260,12 +262,50 @@ fn drive_handshake<D: rustls::SideData>(
 /// and the server would drop the client (lrmux or telnet) immediately,
 /// so the handshake runs nonblocking with poll() waits and a deadline.
 pub fn wrap_server(
+    tcp: TcpStream,
+    config: Arc<ServerConfig>,
+) -> io::Result<StreamOwned<ServerConnection, TcpStream>> {
+    wrap_server_with_prefix(tcp, &[], config)
+}
+
+/// Like [`wrap_server`], but feeds `prefix` (already read from the socket —
+/// typically a sniffed TLS ClientHello starting with `0x16`) into rustls
+/// before reading more from `tcp`.
+pub fn wrap_server_with_prefix(
     mut tcp: TcpStream,
+    prefix: &[u8],
     config: Arc<ServerConfig>,
 ) -> io::Result<StreamOwned<ServerConnection, TcpStream>> {
     tcp.set_nonblocking(true)?;
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::other(format!("tls server conn: {e}")))?;
+    if !prefix.is_empty() {
+        let mut cursor = std::io::Cursor::new(prefix);
+        while (cursor.position() as usize) < prefix.len() && conn.is_handshaking() {
+            match conn.read_tls(&mut cursor) {
+                Ok(0) => break,
+                Ok(_) => {
+                    conn.process_new_packets()
+                        .map_err(|e| io::Error::other(format!("tls process: {e}")))?;
+                }
+                Err(e) => return Err(handshake_io_error(e)),
+            }
+            while conn.wants_write() {
+                match conn.write_tls(&mut tcp) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        let _ = super::stream::wait_io(
+                            tcp.as_raw_fd(),
+                            libc::POLLOUT,
+                            std::time::Duration::from_secs(5),
+                        )?;
+                    }
+                    Err(e) => return Err(handshake_io_error(e)),
+                }
+            }
+        }
+    }
     drive_handshake(&mut conn, &mut tcp, std::time::Duration::from_secs(5))?;
     tcp.set_nonblocking(false)?;
     Ok(StreamOwned::new(conn, tcp))
