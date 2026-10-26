@@ -141,14 +141,14 @@ fn run_selector_impl(
     }
 
     // No servers running:
-    // - Default (non-forced): auto-create "default" server (no prompt).
+    // - Default (non-forced): auto-create a CWD-based server name (no prompt).
     // - Forced: show interactive name prompt.
     if entries.is_empty() {
         if force {
             return no_servers_prompt();
         }
         return Ok(SelectorResult::NewServer {
-            name: "default".to_string(),
+            name: ipc::auto_server_name(),
         });
     }
 
@@ -736,7 +736,7 @@ fn interactive_selector(
                 let (server, tcp) = filt
                     .get(selected)
                     .map(|&i| (entries[i].server.clone(), entries[i].tcp.clone()))
-                    .unwrap_or_else(|| ("default".to_string(), None));
+                    .unwrap_or_else(|| (ipc::auto_server_name(), None));
                 if let Some(err) = filt
                     .get(selected)
                     .and_then(|&i| entries[i].unreachable.clone())

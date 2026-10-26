@@ -267,53 +267,117 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
         }
     }
 
-    // Configured managers report their cached peers. This is the path
-    // that works without any UDP/broadcast at all: a constrained client
-    // only needs TCP to the manager to see the whole fleet.
-    for m in &crate::config::global().peers.managers {
-        match query_peers_tcp(m) {
-            Ok(peers) => {
-                for p in peers {
-                    if p.addr.is_empty() || p.state == "stale" {
-                        continue;
-                    }
-                    let dup = entries
-                        .iter()
-                        .any(|e| e.name == p.name || e.tcp_addr() == Some(p.addr.as_str()));
-                    if dup {
-                        continue;
-                    }
-                    entries.push(ServerEntry {
-                        name: p.name,
-                        source: ServerSource::Lan {
-                            tcp_addr: p.addr.clone(),
-                            tls: p.tls,
-                            version: String::new(),
-                            fingerprint: p.fingerprint,
-                        },
-                        sessions: p
-                            .sessions
-                            .iter()
-                            .map(|s| SessionInfo {
-                                name: s.clone(),
-                                attached: 0,
-                                created: 0,
-                                last_activity: 0,
-                                has_activity: false,
-                            })
-                            .collect(),
-                        address: p.addr,
-                        probe_error: None,
-                    });
+    // Direct TCP ListSessions for `network.scan` host / host:port entries.
+    // Works without UDP (iSH, AP client isolation, off-LAN). CIDRs stay
+    // UDP-only — we do not TCP-probe every address in a /24.
+    let scan_addrs = scan_tcp_targets(&net.scan, net.discovery_port);
+    for addr in &scan_addrs {
+        let already = entries
+            .iter()
+            .any(|e| e.tcp_addr() == Some(addr.as_str()) || e.address == *addr);
+        if already {
+            continue;
+        }
+        match query_sessions_tcp(addr) {
+            Ok((address, sessions)) => {
+                // Inventory key: hostname, or full host:port on collision.
+                let mut name = host_of_addr(addr);
+                if entries.iter().any(|e| e.name == name) {
+                    name = addr.clone();
                 }
+                entries.push(ServerEntry {
+                    name,
+                    source: ServerSource::Lan {
+                        tcp_addr: addr.clone(),
+                        tls: false,
+                        version: String::new(),
+                        fingerprint: String::new(),
+                    },
+                    sessions,
+                    address,
+                    probe_error: None,
+                });
             }
             Err(e) => {
-                eprintln!("lrmux: warning: peer query to manager {m} failed ({e})");
+                eprintln!("lrmux: warning: scan TCP {addr} ListSessions failed ({e})");
+            }
+        }
+    }
+
+    // Mesh pivot without UDP: ListPeers on scan seeds and configured
+    // managers. A seed that isn't a directory returns an empty PeerList
+    // (harmless). Seeds with `[peers] directory = true` expand the fleet.
+    let mut peer_seeds: Vec<String> = scan_addrs.clone();
+    let managers = &crate::config::global().peers.managers;
+    for m in managers {
+        if !peer_seeds.iter().any(|s| s == m) {
+            peer_seeds.push(m.clone());
+        }
+    }
+    for m in &peer_seeds {
+        let is_manager = managers.iter().any(|x| x == m);
+        let from_scan = scan_addrs.iter().any(|s| s == m);
+        match query_peers_tcp(m) {
+            Ok(peers) => {
+                if peers.is_empty() && from_scan {
+                    // Common misconfig: scan points at a normal session
+                    // host. Without a peer cache there is nothing to pivot.
+                    eprintln!(
+                        "lrmux: scan seed {m} has no peer directory \
+                         (ListPeers empty). On that host set \
+                         [peers] directory = true (and let others \
+                         announce/Register), or point scan/managers at \
+                         `lrmux manager`."
+                    );
+                }
+                merge_peer_list(&mut entries, peers);
+            }
+            Err(e) => {
+                if is_manager || from_scan {
+                    eprintln!("lrmux: warning: ListPeers to {m} failed ({e})");
+                }
             }
         }
     }
 
     Ok(entries)
+}
+
+/// Merge a `PeerList` into inventory, skipping stale/empty/duplicate rows.
+fn merge_peer_list(entries: &mut Vec<ServerEntry>, peers: Vec<proto::PeerInfo>) {
+    for p in peers {
+        if p.addr.is_empty() || p.state == "stale" {
+            continue;
+        }
+        let dup = entries
+            .iter()
+            .any(|e| e.name == p.name || e.tcp_addr() == Some(p.addr.as_str()));
+        if dup {
+            continue;
+        }
+        entries.push(ServerEntry {
+            name: p.name,
+            source: ServerSource::Lan {
+                tcp_addr: p.addr.clone(),
+                tls: p.tls,
+                version: String::new(),
+                fingerprint: p.fingerprint,
+            },
+            sessions: p
+                .sessions
+                .iter()
+                .map(|s| SessionInfo {
+                    name: s.clone(),
+                    attached: 0,
+                    created: 0,
+                    last_activity: 0,
+                    has_activity: false,
+                })
+                .collect(),
+            address: p.addr,
+            probe_error: None,
+        });
+    }
 }
 
 /// Ask a directory/manager for its peer cache: Identify (auth) then
@@ -376,7 +440,7 @@ fn query_sessions_unix(sock: &std::path::Path) -> io::Result<(String, Vec<Sessio
 }
 
 fn query_sessions_tcp(addr: &str) -> io::Result<(String, Vec<SessionInfo>)> {
-    let mut stream = ipc::connect_tcp(addr)?;
+    let mut stream = ipc::connect_tcp_timeout(addr, Duration::from_secs(2))?;
     let msg = proto::encode_client(&ClientMsg::ListSessions);
     proto::send(&mut stream, &msg)?;
     let res = ipc::stream::decode_with_deadline(&mut stream, Duration::from_secs(2), |r| {
@@ -393,6 +457,39 @@ fn query_sessions_tcp(addr: &str) -> io::Result<(String, Vec<SessionInfo>)> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// `network.scan` entries that are a single host (optional `:port`), not a CIDR.
+/// Used for direct TCP ListSessions when UDP discovery is unavailable.
+fn scan_tcp_targets(scan: &[String], default_port: u16) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in scan {
+        let s = raw.trim();
+        if s.is_empty() || s.contains('/') {
+            continue;
+        }
+        // `[ipv6]:port`
+        if let Some(rest) = s.strip_prefix('[')
+            && let Some((host, port)) = rest.split_once("]:")
+            && port.parse::<u16>().is_ok()
+            && !host.is_empty()
+        {
+            out.push(s.to_string());
+            continue;
+        }
+        if let Some((host, port)) = s.rsplit_once(':')
+            && port.parse::<u16>().is_ok()
+            && !host.is_empty()
+            && !host.contains(':')
+        {
+            // host:port (reject bare IPv6 without brackets)
+            out.push(s.to_string());
+            continue;
+        }
+        // Bare hostname / IPv4 / bracketed IPv6 → append default discovery port.
+        out.push(format!("{s}:{default_port}"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -413,5 +510,25 @@ mod tests {
         assert_eq!(port_of_addr("10.0.0.1:9999").as_deref(), Some("9999"));
         assert_eq!(host_of_addr("[::1]:17281"), "[::1]");
         assert_eq!(port_of_addr("[::1]:17281").as_deref(), Some("17281"));
+    }
+
+    #[test]
+    fn scan_tcp_targets_skips_cidrs_and_fills_port() {
+        let t = scan_tcp_targets(
+            &[
+                "10.0.0.5".into(),
+                "casa.example:17281".into(),
+                "10.0.0.0/24".into(),
+                "".into(),
+            ],
+            17280,
+        );
+        assert_eq!(
+            t,
+            vec![
+                "10.0.0.5:17280".to_string(),
+                "casa.example:17281".to_string(),
+            ]
+        );
     }
 }

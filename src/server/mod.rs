@@ -40,7 +40,7 @@ static TLS_FINGERPRINT: OnceLock<String> = OnceLock::new();
 
 /// Get the server name (for child process env vars).
 pub fn server_name() -> &'static str {
-    SERVER_NAME.get().map(|s| s.as_str()).unwrap_or("default")
+    SERVER_NAME.get().map(|s| s.as_str()).unwrap_or("?")
 }
 
 /// Get the server primary address (TCP or Unix socket).
@@ -195,7 +195,7 @@ pub fn run(
     let server_name = socket_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("default");
+        .unwrap_or("server");
     let _ = SERVER_NAME.set(server_name.to_string());
     let _ =
         SERVER_ADDRESS.set(tcp_bound.unwrap_or_else(|| socket_path.to_string_lossy().into_owned()));

@@ -7,6 +7,7 @@
 
 mod client;
 mod cmd;
+mod compat;
 mod config;
 mod grid;
 mod ipc;
@@ -96,6 +97,25 @@ fn parse_cli_target(raw: Option<&str>) -> cmd::Target {
     match raw {
         None | Some("") => cmd::Target::default(),
         Some(s) => cmd::Target::parse_with(s, local_server_exists),
+    }
+}
+
+/// Resolve a local server for connect, or pick a fresh CWD-based name when
+/// none are running (for create paths). Ambiguity among multiple locals
+/// still errors.
+fn resolve_or_create_server_name() -> io::Result<(String, bool)> {
+    match resolve_cli_server(None, None) {
+        Ok(s) => Ok((s, false)),
+        Err(e) => {
+            if list_local_server_names().is_empty()
+                && std::env::var("LRMUX_SERVER").is_err()
+                && std::env::var("LRMUX_CLI_SERVER").is_err()
+            {
+                Ok((ipc::auto_server_name(), true))
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -418,7 +438,9 @@ fn parse_args() -> CliAction {
                 .or_else(|| parsed.get("server"))
                 .map(|s| s.to_string())
                 .or_else(|| parsed.positional.first().cloned())
-                .unwrap_or_else(|| "default".to_string());
+                .unwrap_or_else(|| {
+                    resolve_cli_server(None, None).unwrap_or_else(|_| ipc::auto_server_name())
+                });
             note_tcp_server(&name);
             CliAction::KillServer(name)
         }
@@ -796,7 +818,7 @@ fn run() -> io::Result<()> {
     //   lrmux new-server  → still blocked (can't start a new server from inside)
     //   lrmux ss          → still blocked (needs interactive TTY)
     let nested = std::env::var("LRMUX").is_ok();
-    let nested_server = std::env::var("LRMUX_SERVER").unwrap_or_else(|_| "default".to_string());
+    let nested_server = std::env::var("LRMUX_SERVER").unwrap_or_default();
     if nested {
         match &action {
             CliAction::AttachSession {
@@ -864,7 +886,7 @@ fn run() -> io::Result<()> {
                 }
                 let msg = proto::encode_client(&ClientMsg::SelectSession { name: sess.clone() });
                 proto::send(&mut stream, &msg)?;
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: switched to session '{sess}'");
                 return Ok(());
             }
@@ -908,7 +930,7 @@ fn run() -> io::Result<()> {
                 let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
                 proto::send(&mut stream, &msg)?;
                 // Give the server time to process the message before closing.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new window created (use Ctrl-A n/p to switch)");
                 return Ok(());
             }
@@ -958,7 +980,7 @@ fn run() -> io::Result<()> {
                     proto::send(&mut stream, &msg)?;
                 }
                 // Give the server time to process the messages before closing.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new session created (use Ctrl-A N/P to switch)");
                 return Ok(());
             }
@@ -987,7 +1009,7 @@ fn run() -> io::Result<()> {
                 }
                 let msg = proto::encode_client(&ClientMsg::SelectSession { name: name.clone() });
                 proto::send(&mut stream, &msg)?;
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: switched to session '{name}'");
                 return Ok(());
             }
@@ -1090,13 +1112,14 @@ fn run() -> io::Result<()> {
             command,
             detached,
         } => {
-            let sock = socket_path("default");
+            let (server, creating) = resolve_or_create_server_name()?;
+            let sock = socket_path(&server);
             // No server yet — start one, bootstrapping the first session with
             // the requested name/cwd/command so we don't leave an empty shell
             // session behind.
-            let started_fresh = !ipc::server_exists(&sock);
+            let started_fresh = creating || !ipc::server_exists(&sock);
             if started_fresh {
-                eprintln!("lrmux: no server running; starting default server...");
+                eprintln!("lrmux: no server running; starting '{server}'...");
                 fork_server(
                     &sock,
                     None,
@@ -1136,7 +1159,7 @@ fn run() -> io::Result<()> {
                     }
                     let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd, command });
                     proto::send(&mut stream, &msg)?;
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    crate::compat::sleep(std::time::Duration::from_millis(100));
                 }
                 eprintln!("lrmux: session created (detached)");
                 Ok(())
@@ -1169,10 +1192,11 @@ fn run() -> io::Result<()> {
             }
             // The parser already resolved [server][:][session] or host:port.
             let via_tcp = crate::ipc::tcp_addr().is_some();
-            let label = crate::ipc::tcp_addr()
-                .or(server.clone())
-                .unwrap_or_else(|| "default".to_string());
-            let server = server.unwrap_or_else(|| "default".to_string());
+            let server = match server {
+                Some(s) => s,
+                None => resolve_cli_server(None, None)?,
+            };
+            let label = crate::ipc::tcp_addr().unwrap_or_else(|| server.clone());
             let sock = socket_path(&server);
             if !via_tcp && !ipc::server_exists(&sock) {
                 return Err(io::Error::new(
@@ -1211,8 +1235,9 @@ fn run() -> io::Result<()> {
             then_selector(client::run(&sock, new_session, session, None, None))
         }
         CliAction::SelectSession(name) => {
-            // Non-interactive: send SelectSession to the default server.
-            let sock = socket_path("default");
+            // Non-interactive: send SelectSession to the resolved local server.
+            let server = resolve_cli_server(None, None)?;
+            let sock = socket_path(&server);
             if !ipc::server_exists(&sock) {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "no server running"));
             }
@@ -1236,7 +1261,7 @@ fn run() -> io::Result<()> {
             }
             let msg = proto::encode_client(&ClientMsg::SelectSession { name });
             proto::send(&mut stream, &msg)?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::compat::sleep(std::time::Duration::from_millis(100));
             eprintln!("lrmux: switched to session");
             Ok(())
         }
@@ -1247,10 +1272,11 @@ fn run() -> io::Result<()> {
         }
         CliAction::RunCommand(cmd) => {
             // Outside lrmux: start a new server if needed, create a window with the command, attach.
-            let sock = socket_path("default");
-            if !ipc::server_exists(&sock) {
+            let (server, creating) = resolve_or_create_server_name()?;
+            let sock = socket_path(&server);
+            if creating || !ipc::server_exists(&sock) {
                 return then_selector(start_new_server(
-                    "default",
+                    &server,
                     Some(None),
                     None,
                     None,
@@ -1482,10 +1508,14 @@ fn dispatch_selector(result: io::Result<SelectorResult>) -> io::Result<()> {
             }
             Ok(SelectorResult::Quit) => return Ok(()),
             Err(e) => {
-                // Selector failed (e.g. no raw mode) — fall back to default server.
-                eprintln!("lrmux: selector unavailable ({e}), starting default server...");
-                let sock = socket_path("default");
-                if !ipc::server_exists(&sock) {
+                // Selector failed (e.g. no raw mode) — fall back to a local server.
+                let (server, creating) = resolve_or_create_server_name()?;
+                eprintln!(
+                    "lrmux: selector unavailable ({e}), {} server '{server}'...",
+                    if creating { "starting" } else { "attaching to" }
+                );
+                let sock = socket_path(&server);
+                if creating || !ipc::server_exists(&sock) {
                     fork_server(&sock, None, None, false, false, ServerInit::default())?;
                     wait_for_server(&sock)?;
                     eprintln!("lrmux: server ready.");
@@ -1547,7 +1577,14 @@ fn start_new_server(
     // `new_session` is only used when the caller explicitly wants a *second*
     // session on a server that already has one; here the server is fresh.
     let _ = new_session;
-    client::run(&sock, None, None, None, None)
+    client::run(&sock, None, None, None, None).map_err(|e| {
+        // On constrained platforms (iSH) the client can die after the
+        // server is already listening — leave a clear retry hint.
+        io::Error::new(
+            e.kind(),
+            format!("{e} (server '{name}' is still running — retry with `lrmux attach -s {name}`)"),
+        )
+    })
 }
 
 /// Start a headless server (no TTY needed). Used for testing and remote management.
@@ -1609,7 +1646,8 @@ fn start_manager(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
 }
 
 /// Run iTerm2 control mode against a target server.
-/// Default target means the default server (auto-start a headless one if missing).
+/// With no `-t`, resolve like other CLI commands; auto-start a headless
+/// CWD-named server only when no local servers are running.
 fn run_control_mode(target: Option<&str>) -> io::Result<()> {
     // Resolve the target and validate the server before silencing stderr,
     // so that real errors (unknown server) are still visible to the user.
@@ -1617,8 +1655,10 @@ fn run_control_mode(target: Option<&str>) -> io::Result<()> {
     let sock = socket_path(&server);
     let via_tcp = crate::ipc::tcp_addr().is_some();
     if !via_tcp && !ipc::server_exists(&sock) {
-        if server == "default" {
-            // Start a headless default server silently.
+        // Auto-start only when this is a freshly chosen create name (no
+        // locals yet). Named targets that aren't running stay hard errors.
+        let creating = list_local_server_names().is_empty();
+        if creating {
             fork_server(&sock, None, None, true, false, ServerInit::default())?;
             wait_for_server(&sock)?;
         } else {
@@ -1646,16 +1686,21 @@ fn run_control_mode(target: Option<&str>) -> io::Result<()> {
 }
 
 /// Resolve a -t target string to a server name for control mode.
-/// `foo` → `foo` if it is a running server, otherwise error.
-/// `foo:bar` or `foo:` → `foo`; `:bar` or empty → `default`.
+/// `foo` → `foo`; `foo:bar` or `foo:` → `foo`; `:bar` or empty →
+/// [`resolve_or_create_server_name`].
 fn resolve_control_target(target: Option<&str>) -> io::Result<String> {
-    let t = target.unwrap_or("default");
+    let t = target.unwrap_or("");
+    if t.is_empty() || t == ":" {
+        return Ok(resolve_or_create_server_name()?.0);
+    }
     if cmd::is_tcp_connect_target(t, |n| ipc::server_exists(&socket_path(n))) {
         crate::ipc::set_tcp_addr(Some(t.to_string()));
         return Ok(t.to_string());
     }
     let (srv, _) = t.split_once(':').unwrap_or((t, ""));
-    let srv = if srv.is_empty() { "default" } else { srv };
+    if srv.is_empty() {
+        return Ok(resolve_or_create_server_name()?.0);
+    }
     Ok(srv.to_string())
 }
 
@@ -1895,7 +1940,10 @@ fn cmd_psk(args: &[String]) -> io::Result<()> {
 }
 
 fn push_psk_to_running_server(psk: &str) -> io::Result<()> {
-    let sock = socket_path("default");
+    let Ok(server) = resolve_cli_server(None, None) else {
+        return Ok(());
+    };
+    let sock = socket_path(&server);
     if !ipc::server_exists(&sock) {
         return Ok(());
     }
@@ -2005,7 +2053,7 @@ fn kill_server(name: &str) -> io::Result<()> {
         let msg = proto::encode_client(&ClientMsg::KillServer);
         proto::send(&mut stream, &msg)?;
         eprintln!("lrmux: sent KillServer via TCP.");
-        std::thread::sleep(Duration::from_millis(100));
+        crate::compat::sleep(Duration::from_millis(100));
         eprintln!("lrmux: killed server '{name}'.");
         return Ok(());
     }
@@ -2025,7 +2073,7 @@ fn kill_server(name: &str) -> io::Result<()> {
             if proto::send(&mut stream, &msg).is_ok() {
                 eprintln!("lrmux: sent KillServer to '{name}'.");
                 // Give the server a moment to clean up.
-                std::thread::sleep(Duration::from_millis(100));
+                crate::compat::sleep(Duration::from_millis(100));
             }
             // Also remove the socket file in case the server didn't clean up.
             let _ = std::fs::remove_file(&sock);
@@ -2413,7 +2461,7 @@ fn wait_for_server(sock: &Path) -> io::Result<()> {
         if ipc::server_exists(sock) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        crate::compat::sleep(Duration::from_millis(10));
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,

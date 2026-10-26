@@ -370,6 +370,30 @@ impl Pane {
         Some(crate::term::format_osc_color_reply(q.code, rgb, q.bell_terminated).into_bytes())
     }
 
+    /// Single non-blocking `waitpid`. Used by the ~1s sweep when the PTY
+    /// master never signals hangup (seen on iSH). Returns `None` if the
+    /// child is still alive or was already reaped (so callers don't
+    /// double-report).
+    pub fn try_reap_child(&mut self) -> Option<i32> {
+        if self.exited {
+            return None;
+        }
+        match waitpid(self.pty.child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => {
+                self.exited = true;
+                self.exit_code = Some(code);
+                Some(code)
+            }
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                let code = -(sig as i32);
+                self.exited = true;
+                self.exit_code = Some(code);
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+
     /// Reap the child process and store the exit code.
     /// Should be called after `process_pty_output` returns `Ok(false)`.
     /// Returns the exit code if the child was reaped, or None if still alive.
@@ -395,8 +419,7 @@ impl Pane {
                     return Some(code);
                 }
                 Ok(WaitStatus::StillAlive) => {
-                    // Child hasn't been reaped yet — wait briefly and retry.
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    crate::compat::sleep(std::time::Duration::from_millis(5));
                 }
                 _ => return None,
             }

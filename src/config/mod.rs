@@ -179,9 +179,10 @@ pub struct NetworkConfig {
     /// UDP discovery port (clients broadcast here; servers listen).
     #[serde(default = "default_discovery_port")]
     pub discovery_port: u16,
-    /// Extra discovery targets: "a.b.c.d" or "a.b.c.d:port" probe one host,
-    /// "a.b.c.d/n" unicast-probes every host in the subnet. Needed where
-    /// broadcast is unavailable (constrained platforms, AP client isolation) or off-subnet.
+    /// Extra discovery targets: "a.b.c.d" / "host:port" / hostname (UDP
+    /// unicast + TCP ListSessions for inventory), or "a.b.c.d/n" (UDP subnet
+    /// scan only). Needed where broadcast is unavailable (iSH, AP client
+    /// isolation) or off-subnet.
     #[serde(default)]
     pub scan: Vec<String>,
     /// Actively announce this server on startup, periodically, and on

@@ -343,7 +343,50 @@ fn parse_port(port: &str) -> io::Result<u16> {
     })
 }
 
-/// Wrap an accepted plain TCP stream in TLS if required by policy/config.
+/// Wrap an accepted TCP stream after sniffing the first bytes.
+///
+/// - Leading `0x16` (TLS ClientHello) → always TLS when a cert is configured
+///   (even if the peer is in `safe_networks`). Prefer encryption when offered.
+/// - Otherwise plaintext is allowed only when policy permits (`tls=off` or
+///   `tls=auto` + peer in `safe_networks`); else reject.
+///
+/// Returns `(stream, leftover_prefix)`. After a TLS wrap the prefix was
+/// consumed by the handshake and the leftover is empty.
+pub fn wrap_accepted_tcp_after_sniff(
+    stream: ConnStream,
+    prefix: Vec<u8>,
+    net: &NetworkConfig,
+    server_tls: Option<&std::sync::Arc<rustls::ServerConfig>>,
+) -> io::Result<(ConnStream, Vec<u8>)> {
+    let ConnStream::Tcp(tcp) = stream else {
+        return Ok((stream, prefix));
+    };
+    let peer = tcp.peer_addr()?;
+    let client_offers_tls = prefix.first() == Some(&0x16);
+    if client_offers_tls {
+        let Some(cfg) = server_tls else {
+            return Err(io::Error::other(
+                "client offered TLS but server has no TLS cert configured",
+            ));
+        };
+        if matches!(net.tls, TlsMode::Off) {
+            return Err(io::Error::other("client offered TLS but network.tls = off"));
+        }
+        let tls_stream = tls::wrap_server_with_prefix(tcp, &prefix, cfg.clone())?;
+        return Ok((ConnStream::TlsServer(Box::new(tls_stream)), Vec::new()));
+    }
+    let want_tls = tls::tls_required(net, peer) || matches!(net.tls, TlsMode::On);
+    if want_tls {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS required for this peer but client did not start a TLS handshake",
+        ));
+    }
+    Ok((ConnStream::Tcp(tcp), prefix))
+}
+
+/// Legacy helper: wrap immediately when policy requires TLS (no sniff).
+/// Prefer [`wrap_accepted_tcp_after_sniff`] on the accept path.
 pub fn maybe_wrap_accepted_tcp(
     stream: ConnStream,
     net: &NetworkConfig,
@@ -376,8 +419,10 @@ pub fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Generate a unique server name by scanning existing sockets.
-/// Returns "default" if free, otherwise "server-2", "server-3", etc.
+/// Generate a unique server name from the process CWD basename.
+/// First free name is `<cwd>` (e.g. `lrmux`); collisions get `-2`, `-3`, …
+/// There is no magic `default` name — existing `default` sockets still work
+/// if already running, but new servers are not created under that name.
 pub fn auto_server_name() -> String {
     let uid = unsafe { libc::getuid() };
     let dir = format!("/tmp/lrmux-{uid}");
@@ -388,18 +433,42 @@ pub fn auto_server_name() -> String {
                 .collect()
         })
         .unwrap_or_default();
-    let base = "default";
-    if !existing.iter().any(|n| n == base) {
-        return base.to_string();
+    let base = cwd_server_basename();
+    if !existing.iter().any(|n| n == &base) && !server_exists(&socket_path(&base)) {
+        return base;
     }
-    let mut n = 2;
+    let mut n = 2u32;
     loop {
-        let candidate = format!("server-{n}");
-        if !existing.iter().any(|name| name == &candidate) {
+        let candidate = format!("{base}-{n}");
+        if !existing.iter().any(|name| name == &candidate)
+            && !server_exists(&socket_path(&candidate))
+        {
             return candidate;
         }
         n += 1;
     }
+}
+
+/// Sanitize `current_dir()`'s basename for use as a Unix-socket server name.
+fn cwd_server_basename() -> String {
+    let raw = std::env::current_dir()
+        .ok()
+        .and_then(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    let mut out = String::with_capacity(raw.len().max(1));
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
+        // drop '/', ':', and other socket-hostile chars
+    }
+    if out.is_empty() { "server".into() } else { out }
 }
 
 #[cfg(test)]

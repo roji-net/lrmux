@@ -644,7 +644,10 @@ pub fn run(
         let mut need_status_bar_all = false;
         for pty_i in 0..num_pty_fds {
             let pf = &fds[pty_base + pty_i];
-            if pf.revents & libc::POLLIN != 0 {
+            // POLLIN = data. POLLHUP/POLLERR = slave closed / child gone —
+            // on some platforms (iSH) hangup arrives *without* POLLIN, and
+            // skipping it leaves the pane hung until an explicit kill.
+            if pf.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 let (si, wi) = pty_map[pty_i];
                 // Bounds-check against current sessions/windows (safety: a
                 // previous exit in this same poll iteration may have removed
@@ -728,11 +731,19 @@ pub fn run(
         }
 
         // Automatic-rename sweep (bounded cadence): rename unlocked
-        // windows to their pane's foreground command.
+        // windows to their pane's foreground command. Same tick does an
+        // opportunistic waitpid — defense when PTY poll never reports
+        // hangup after the child exits (iSH).
         if last_name_sweep.elapsed() >= NAME_SWEEP_INTERVAL {
             last_name_sweep = std::time::Instant::now();
-            for session in sessions.iter_mut() {
-                for window in session.windows.iter_mut() {
+            for (si, session) in sessions.iter_mut().enumerate() {
+                for (wi, window) in session.windows.iter_mut().enumerate() {
+                    if let Some(code) = window.pane.try_reap_child() {
+                        window
+                            .pane
+                            .trace_event(&format!("child exited (waitpid sweep), code {code}"));
+                        pty_exits.push((si, wi, code));
+                    }
                     if let Some(name) = auto_rename_window(window) {
                         need_status_bar_all = true;
                         broadcast_control_notify(
@@ -2658,16 +2669,37 @@ fn handshake_first_client(
     stream: crate::ipc::ConnStream,
     boot: &Bootstrap,
 ) -> io::Result<(u16, u16, Vec<Session>, Vec<ClientConn>)> {
-    let mut client = wrap_accepted_stream(stream)?;
+    let mut client = passthrough_non_tcp(stream);
+    let is_tcp = client.is_tcp();
+    // Same sniff-then-TLS policy as accept_new_client.
+    let first = if is_tcp {
+        let sniffed = sniff_prefix(&mut client, std::time::Duration::from_secs(5))?;
+        let (wrapped, prefix) = ipc::wrap_accepted_tcp_after_sniff(
+            client,
+            sniffed,
+            crate::server::network(),
+            crate::server::tls_server_config(),
+        )?;
+        client = wrapped;
+        if prefix.is_empty() {
+            crate::ipc::stream::decode_with_deadline(
+                &mut client,
+                std::time::Duration::from_secs(5),
+                |r| proto::decode_client(r),
+            )
+        } else {
+            decode_client_prefixed(&mut client, prefix, std::time::Duration::from_secs(5))
+        }
+    } else {
+        crate::ipc::stream::decode_with_deadline(
+            &mut client,
+            std::time::Duration::from_secs(5),
+            |r| proto::decode_client(r),
+        )
+    };
     // Bound the handshake read: a client that connects and stays silent
     // must not stall server startup forever. decode_with_deadline polls
     // the fd, which works where SO_RCVTIMEO is unavailable.
-    let is_tcp = client.is_tcp();
-    let first = crate::ipc::stream::decode_with_deadline(
-        &mut client,
-        std::time::Duration::from_secs(5),
-        |r| proto::decode_client(r),
-    );
     let (client_rows, client_cols, auth_token) = match first {
         Ok(ClientMsg::Identify {
             rows,
@@ -2773,17 +2805,10 @@ fn handshake_first_client(
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
 
-fn wrap_accepted_stream(stream: crate::ipc::ConnStream) -> io::Result<crate::ipc::ConnStream> {
-    // Unix and WebSocket skip TCP TLS wrapping (WS is already a framed transport;
-    // put a TLS-terminating proxy in front for WSS).
-    if !matches!(stream, crate::ipc::ConnStream::Tcp(_)) {
-        return Ok(stream);
-    }
-    ipc::maybe_wrap_accepted_tcp(
-        stream,
-        crate::server::network(),
-        crate::server::tls_server_config(),
-    )
+/// Non-TCP listeners (Unix / WebSocket) need no TLS wrap. TCP is left plain
+/// until [`accept_new_client`] sniffs the first bytes and decides.
+fn passthrough_non_tcp(stream: crate::ipc::ConnStream) -> crate::ipc::ConnStream {
+    stream
 }
 
 fn tcp_auth_ok(is_tcp: bool, token: &str) -> bool {
@@ -2992,31 +3017,57 @@ fn accept_new_client(
 ) -> io::Result<()> {
     match listener.accept() {
         Ok(stream) => {
-            let mut stream = match wrap_accepted_stream(stream) {
-                Ok(s) => s,
-                Err(e) => {
-                    let line = format!("{e}");
-                    crate::log::warn(&format!("TCP accept: {line}"));
-                    eprintln!("lrmux: {line}");
-                    return Ok(());
-                }
-            };
+            let mut stream = passthrough_non_tcp(stream);
             let is_tcp = stream.is_tcp();
-            // Sniff the first bytes: binary client frames start with a
-            // u32-LE length under 16 MiB (top byte always 0x00); anything
-            // else is the ASCII line protocol (telnet/nc). The sniffed
-            // bytes are replayed ahead of the stream on the binary path.
+            // Sniff the first bytes before any TLS wrap so a ClientHello
+            // (0x16) from a client that wants encryption is honoured even
+            // when the peer IP is in safe_networks (plaintext otherwise OK).
             let sniffed = match sniff_prefix(&mut stream, std::time::Duration::from_secs(2)) {
                 Ok(s) => s,
                 Err(_) => return Ok(()),
             };
-            if sniffed.len() < 4 || sniffed[3] != 0 {
+            let sniffed = if matches!(stream, crate::ipc::ConnStream::Tcp(_)) {
+                match ipc::wrap_accepted_tcp_after_sniff(
+                    stream,
+                    sniffed,
+                    crate::server::network(),
+                    crate::server::tls_server_config(),
+                ) {
+                    Ok((s, prefix)) => {
+                        stream = s;
+                        prefix
+                    }
+                    Err(e) => {
+                        let line = format!("{e}");
+                        crate::log::warn(&format!("TCP accept: {line}"));
+                        eprintln!("lrmux: {line}");
+                        return Ok(());
+                    }
+                }
+            } else {
+                sniffed
+            };
+            // Binary client frames start with a u32-LE length under 16 MiB
+            // (top byte always 0x00); anything else is the ASCII line
+            // protocol (telnet/nc). After a TLS wrap, prefix is empty and
+            // the first frame is read from the decrypted stream.
+            if !sniffed.is_empty() && (sniffed.len() < 4 || sniffed[3] != 0) {
                 return ascii_session(&mut stream, sniffed, sessions, clients, peer_cache);
             }
             // Bound the handshake read: a client that connects and stays
             // silent must not freeze the whole event loop.
-            let first =
-                decode_client_prefixed(&mut stream, sniffed, std::time::Duration::from_secs(2));
+            let first = if sniffed.is_empty() {
+                stream.set_nonblocking(true).ok();
+                let r = ipc::stream::decode_with_deadline(
+                    &mut stream,
+                    std::time::Duration::from_secs(2),
+                    |r| proto::decode_client(r),
+                );
+                let _ = stream.set_nonblocking(false);
+                r
+            } else {
+                decode_client_prefixed(&mut stream, sniffed, std::time::Duration::from_secs(2))
+            };
             let (attach, is_control, auth_token) = match first {
                 Ok(ClientMsg::Identify {
                     attach: a,
@@ -4373,7 +4424,7 @@ fn shutdown_flush(clients: &mut [ClientConn]) {
         if !pending || std::time::Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        crate::compat::sleep(std::time::Duration::from_millis(5));
     }
 }
 
