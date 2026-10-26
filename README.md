@@ -155,7 +155,8 @@ client can reuse this transport later; the MVP is plain JS in `web/`.
 
 `lrmux ls`, `ls-servers`, `discover`, and the session selector share one inventory
 (local Unix sockets + LAN UDP discovery + TCP probes of `network.scan`
-hosts + `[peers] managers`). LAN/scan rows are tagged `[lan]`.
+hosts, with ListPeers pivot on scan seeds and `[peers] managers`).
+LAN/scan rows are tagged `[lan]`.
 
 Unix sockets stay FS-permission gated (no PSK). TCP uses the PSK for auth and
 TLS for encryption when required by `tls` / `safe_networks`. Under `tls=auto`,

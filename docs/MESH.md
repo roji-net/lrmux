@@ -188,14 +188,21 @@ Lifecycle:
 
 ### 6.1 Client bootstrap order
 
-1. Configured managers (`[peers] managers`) — TCP `ListPeers`.
-2. Persisted peer cache — direct `ListSessions` to remembered peers.
-3. UDP `Discover` to: `255.255.255.255` (best-effort), directed broadcast
-   per local subnet, `127.0.0.1`, and `[peers].scan` targets.
-4. **Unicast subnet scan** if no replies after a short window: derive
-   subnets from `getifaddrs` (where available) or `connect()+getsockname()`
-   with an assumed `/24`; send `Discover` to each host. Capped at 1024
-   targets; `scan` CIDRs are always scanned.
+1. Local Unix sockets — `ListSessions`.
+2. UDP `Discover` (broadcast / directed / `network.scan` CIDRs) — then
+   TCP `ListSessions` per announce.
+3. `network.scan` host/`host:port` entries — TCP `ListSessions` (no UDP
+   needed; the iSH / client-isolation path).
+4. **ListPeers pivot** on every `network.scan` host and every
+   `[peers] managers` entry. A seed that isn't a directory returns an
+   empty list; a seed with `[peers] directory = true` expands the fleet.
+5. Persisted peer cache — direct `ListSessions` to remembered peers
+   (when wired up).
+
+So one line in `network.scan` is enough for a constrained client *if*
+that seed holds a peer directory (standalone `lrmux manager`, or a normal
+server with `directory = true` that other nodes Register to / announce
+into).
 
 ### 6.2 Server announces
 

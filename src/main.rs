@@ -7,6 +7,7 @@
 
 mod client;
 mod cmd;
+mod compat;
 mod config;
 mod grid;
 mod ipc;
@@ -885,7 +886,7 @@ fn run() -> io::Result<()> {
                 }
                 let msg = proto::encode_client(&ClientMsg::SelectSession { name: sess.clone() });
                 proto::send(&mut stream, &msg)?;
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: switched to session '{sess}'");
                 return Ok(());
             }
@@ -929,7 +930,7 @@ fn run() -> io::Result<()> {
                 let msg = proto::encode_client(&ClientMsg::NewWindowIn { session, command });
                 proto::send(&mut stream, &msg)?;
                 // Give the server time to process the message before closing.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new window created (use Ctrl-A n/p to switch)");
                 return Ok(());
             }
@@ -979,7 +980,7 @@ fn run() -> io::Result<()> {
                     proto::send(&mut stream, &msg)?;
                 }
                 // Give the server time to process the messages before closing.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: new session created (use Ctrl-A N/P to switch)");
                 return Ok(());
             }
@@ -1008,7 +1009,7 @@ fn run() -> io::Result<()> {
                 }
                 let msg = proto::encode_client(&ClientMsg::SelectSession { name: name.clone() });
                 proto::send(&mut stream, &msg)?;
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::compat::sleep(std::time::Duration::from_millis(100));
                 eprintln!("lrmux: switched to session '{name}'");
                 return Ok(());
             }
@@ -1158,7 +1159,7 @@ fn run() -> io::Result<()> {
                     }
                     let msg = proto::encode_client(&ClientMsg::NewSession { name, cwd, command });
                     proto::send(&mut stream, &msg)?;
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    crate::compat::sleep(std::time::Duration::from_millis(100));
                 }
                 eprintln!("lrmux: session created (detached)");
                 Ok(())
@@ -1260,7 +1261,7 @@ fn run() -> io::Result<()> {
             }
             let msg = proto::encode_client(&ClientMsg::SelectSession { name });
             proto::send(&mut stream, &msg)?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            crate::compat::sleep(std::time::Duration::from_millis(100));
             eprintln!("lrmux: switched to session");
             Ok(())
         }
@@ -2052,7 +2053,7 @@ fn kill_server(name: &str) -> io::Result<()> {
         let msg = proto::encode_client(&ClientMsg::KillServer);
         proto::send(&mut stream, &msg)?;
         eprintln!("lrmux: sent KillServer via TCP.");
-        std::thread::sleep(Duration::from_millis(100));
+        crate::compat::sleep(Duration::from_millis(100));
         eprintln!("lrmux: killed server '{name}'.");
         return Ok(());
     }
@@ -2072,7 +2073,7 @@ fn kill_server(name: &str) -> io::Result<()> {
             if proto::send(&mut stream, &msg).is_ok() {
                 eprintln!("lrmux: sent KillServer to '{name}'.");
                 // Give the server a moment to clean up.
-                std::thread::sleep(Duration::from_millis(100));
+                crate::compat::sleep(Duration::from_millis(100));
             }
             // Also remove the socket file in case the server didn't clean up.
             let _ = std::fs::remove_file(&sock);
@@ -2460,7 +2461,7 @@ fn wait_for_server(sock: &Path) -> io::Result<()> {
         if ipc::server_exists(sock) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        crate::compat::sleep(Duration::from_millis(10));
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,

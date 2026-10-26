@@ -270,17 +270,18 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
     // Direct TCP ListSessions for `network.scan` host / host:port entries.
     // Works without UDP (iSH, AP client isolation, off-LAN). CIDRs stay
     // UDP-only — we do not TCP-probe every address in a /24.
-    for addr in scan_tcp_targets(&net.scan, net.discovery_port) {
+    let scan_addrs = scan_tcp_targets(&net.scan, net.discovery_port);
+    for addr in &scan_addrs {
         let already = entries
             .iter()
-            .any(|e| e.tcp_addr() == Some(addr.as_str()) || e.address == addr);
+            .any(|e| e.tcp_addr() == Some(addr.as_str()) || e.address == *addr);
         if already {
             continue;
         }
-        match query_sessions_tcp(&addr) {
+        match query_sessions_tcp(addr) {
             Ok((address, sessions)) => {
                 // Inventory key: hostname, or full host:port on collision.
-                let mut name = host_of_addr(&addr);
+                let mut name = host_of_addr(addr);
                 if entries.iter().any(|e| e.name == name) {
                     name = addr.clone();
                 }
@@ -303,53 +304,80 @@ pub fn collect(discover_timeout: Duration) -> io::Result<Vec<ServerEntry>> {
         }
     }
 
-    // Configured managers report their cached peers. This is the path
-    // that works without any UDP/broadcast at all: a constrained client
-    // only needs TCP to the manager to see the whole fleet.
-    for m in &crate::config::global().peers.managers {
+    // Mesh pivot without UDP: ListPeers on scan seeds and configured
+    // managers. A seed that isn't a directory returns an empty PeerList
+    // (harmless). Seeds with `[peers] directory = true` expand the fleet.
+    let mut peer_seeds: Vec<String> = scan_addrs.clone();
+    let managers = &crate::config::global().peers.managers;
+    for m in managers {
+        if !peer_seeds.iter().any(|s| s == m) {
+            peer_seeds.push(m.clone());
+        }
+    }
+    for m in &peer_seeds {
+        let is_manager = managers.iter().any(|x| x == m);
+        let from_scan = scan_addrs.iter().any(|s| s == m);
         match query_peers_tcp(m) {
             Ok(peers) => {
-                for p in peers {
-                    if p.addr.is_empty() || p.state == "stale" {
-                        continue;
-                    }
-                    let dup = entries
-                        .iter()
-                        .any(|e| e.name == p.name || e.tcp_addr() == Some(p.addr.as_str()));
-                    if dup {
-                        continue;
-                    }
-                    entries.push(ServerEntry {
-                        name: p.name,
-                        source: ServerSource::Lan {
-                            tcp_addr: p.addr.clone(),
-                            tls: p.tls,
-                            version: String::new(),
-                            fingerprint: p.fingerprint,
-                        },
-                        sessions: p
-                            .sessions
-                            .iter()
-                            .map(|s| SessionInfo {
-                                name: s.clone(),
-                                attached: 0,
-                                created: 0,
-                                last_activity: 0,
-                                has_activity: false,
-                            })
-                            .collect(),
-                        address: p.addr,
-                        probe_error: None,
-                    });
+                if peers.is_empty() && from_scan {
+                    // Common misconfig: scan points at a normal session
+                    // host. Without a peer cache there is nothing to pivot.
+                    eprintln!(
+                        "lrmux: scan seed {m} has no peer directory \
+                         (ListPeers empty). On that host set \
+                         [peers] directory = true (and let others \
+                         announce/Register), or point scan/managers at \
+                         `lrmux manager`."
+                    );
                 }
+                merge_peer_list(&mut entries, peers);
             }
             Err(e) => {
-                eprintln!("lrmux: warning: peer query to manager {m} failed ({e})");
+                if is_manager || from_scan {
+                    eprintln!("lrmux: warning: ListPeers to {m} failed ({e})");
+                }
             }
         }
     }
 
     Ok(entries)
+}
+
+/// Merge a `PeerList` into inventory, skipping stale/empty/duplicate rows.
+fn merge_peer_list(entries: &mut Vec<ServerEntry>, peers: Vec<proto::PeerInfo>) {
+    for p in peers {
+        if p.addr.is_empty() || p.state == "stale" {
+            continue;
+        }
+        let dup = entries
+            .iter()
+            .any(|e| e.name == p.name || e.tcp_addr() == Some(p.addr.as_str()));
+        if dup {
+            continue;
+        }
+        entries.push(ServerEntry {
+            name: p.name,
+            source: ServerSource::Lan {
+                tcp_addr: p.addr.clone(),
+                tls: p.tls,
+                version: String::new(),
+                fingerprint: p.fingerprint,
+            },
+            sessions: p
+                .sessions
+                .iter()
+                .map(|s| SessionInfo {
+                    name: s.clone(),
+                    attached: 0,
+                    created: 0,
+                    last_activity: 0,
+                    has_activity: false,
+                })
+                .collect(),
+            address: p.addr,
+            probe_error: None,
+        });
+    }
 }
 
 /// Ask a directory/manager for its peer cache: Identify (auth) then

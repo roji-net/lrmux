@@ -644,7 +644,10 @@ pub fn run(
         let mut need_status_bar_all = false;
         for pty_i in 0..num_pty_fds {
             let pf = &fds[pty_base + pty_i];
-            if pf.revents & libc::POLLIN != 0 {
+            // POLLIN = data. POLLHUP/POLLERR = slave closed / child gone —
+            // on some platforms (iSH) hangup arrives *without* POLLIN, and
+            // skipping it leaves the pane hung until an explicit kill.
+            if pf.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 let (si, wi) = pty_map[pty_i];
                 // Bounds-check against current sessions/windows (safety: a
                 // previous exit in this same poll iteration may have removed
@@ -728,11 +731,19 @@ pub fn run(
         }
 
         // Automatic-rename sweep (bounded cadence): rename unlocked
-        // windows to their pane's foreground command.
+        // windows to their pane's foreground command. Same tick does an
+        // opportunistic waitpid — defense when PTY poll never reports
+        // hangup after the child exits (iSH).
         if last_name_sweep.elapsed() >= NAME_SWEEP_INTERVAL {
             last_name_sweep = std::time::Instant::now();
-            for session in sessions.iter_mut() {
-                for window in session.windows.iter_mut() {
+            for (si, session) in sessions.iter_mut().enumerate() {
+                for (wi, window) in session.windows.iter_mut().enumerate() {
+                    if let Some(code) = window.pane.try_reap_child() {
+                        window.pane.trace_event(&format!(
+                            "child exited (waitpid sweep), code {code}"
+                        ));
+                        pty_exits.push((si, wi, code));
+                    }
                     if let Some(name) = auto_rename_window(window) {
                         need_status_bar_all = true;
                         broadcast_control_notify(
@@ -4413,7 +4424,7 @@ fn shutdown_flush(clients: &mut [ClientConn]) {
         if !pending || std::time::Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        crate::compat::sleep(std::time::Duration::from_millis(5));
     }
 }
 
