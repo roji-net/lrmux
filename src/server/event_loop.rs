@@ -739,9 +739,9 @@ pub fn run(
             for (si, session) in sessions.iter_mut().enumerate() {
                 for (wi, window) in session.windows.iter_mut().enumerate() {
                     if let Some(code) = window.pane.try_reap_child() {
-                        window.pane.trace_event(&format!(
-                            "child exited (waitpid sweep), code {code}"
-                        ));
+                        window
+                            .pane
+                            .trace_event(&format!("child exited (waitpid sweep), code {code}"));
                         pty_exits.push((si, wi, code));
                     }
                     if let Some(name) = auto_rename_window(window) {
