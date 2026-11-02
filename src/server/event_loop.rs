@@ -5919,10 +5919,15 @@ fn handle_single_control_command(
 
 /// Parse send-keys flags: -H (hex args), -l (literal), -t <target>.
 /// Combined forms like "-lt" / "-H" come from iTerm2.
+///
+/// Args are shell-split so iTerm2's quoted key names under
+/// modifyOtherKeys (`send -t %N 'C-d'`) decode to control bytes instead
+/// of writing the literal text `C-d` into the pane (Claude Code path).
 /// Returns (key bytes, optional target string).
 fn parse_send_keys_args(args_str: &str) -> (Vec<u8>, Option<String>) {
-    let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
+    let args = split_args_shell(args_str);
     let mut hex_mode = false;
+    let mut literal_mode = false;
     let mut target_str: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0;
@@ -5930,7 +5935,7 @@ fn parse_send_keys_args(args_str: &str) -> (Vec<u8>, Option<String>) {
         let a = &args[i];
         if a.starts_with('-') && a.len() > 1 {
             let flags = &a[1..];
-            if flags == "t" || flags.ends_with('t') && flags.len() > 1 {
+            if flags == "t" || (flags.ends_with('t') && flags.len() > 1) {
                 // -t or -Xt: takes next arg as target.
                 if i + 1 < args.len() {
                     target_str = Some(args[i + 1].clone());
@@ -5939,6 +5944,9 @@ fn parse_send_keys_args(args_str: &str) -> (Vec<u8>, Option<String>) {
             }
             if flags.contains('H') {
                 hex_mode = true;
+            }
+            if flags.contains('l') {
+                literal_mode = true;
             }
         } else {
             positionals.push(a.clone());
@@ -5959,91 +5967,16 @@ fn parse_send_keys_args(args_str: &str) -> (Vec<u8>, Option<String>) {
             }
         }
         out
+    } else if literal_mode {
+        let mut out = Vec::new();
+        for p in &positionals {
+            out.extend_from_slice(p.as_bytes());
+        }
+        out
     } else {
-        parse_tmux_keys_for_control(&positionals)
+        crate::cmd::parse_tmux_keys(&positionals)
     };
     (keys, target_str)
-}
-
-/// Parse tmux-style key names into byte sequences (for control mode send-keys).
-/// Reuses the same logic as main.rs::parse_tmux_keys.
-fn parse_tmux_keys_for_control(parts: &[String]) -> Vec<u8> {
-    let mut result = Vec::new();
-    for part in parts {
-        match part.as_str() {
-            "Enter" | "Return" => result.push(b'\r'),
-            "Tab" => result.push(b'\t'),
-            "Escape" | "Esc" => result.push(0x1b),
-            "Space" => result.push(b' '),
-            "BS" | "BSpace" => result.push(0x7f),
-            "Up" => result.extend_from_slice(b"\x1b[A"),
-            "Down" => result.extend_from_slice(b"\x1b[B"),
-            "Right" => result.extend_from_slice(b"\x1b[C"),
-            "Left" => result.extend_from_slice(b"\x1b[D"),
-            "Home" => result.extend_from_slice(b"\x1b[H"),
-            "End" => result.extend_from_slice(b"\x1b[F"),
-            "PageUp" | "PgUp" => result.extend_from_slice(b"\x1b[5~"),
-            "PageDown" | "PgDn" => result.extend_from_slice(b"\x1b[6~"),
-            "F1" => result.extend_from_slice(b"\x1bOP"),
-            "F2" => result.extend_from_slice(b"\x1bOQ"),
-            "F3" => result.extend_from_slice(b"\x1bOR"),
-            "F4" => result.extend_from_slice(b"\x1bOS"),
-            "F5" => result.extend_from_slice(b"\x1b[15~"),
-            "F6" => result.extend_from_slice(b"\x1b[17~"),
-            "F7" => result.extend_from_slice(b"\x1b[18~"),
-            "F8" => result.extend_from_slice(b"\x1b[19~"),
-            "F9" => result.extend_from_slice(b"\x1b[20~"),
-            "F10" => result.extend_from_slice(b"\x1b[21~"),
-            "F11" => result.extend_from_slice(b"\x1b[23~"),
-            "F12" => result.extend_from_slice(b"\x1b[24~"),
-            _ if part.starts_with("C-") && part.len() == 3 => {
-                let key = part.as_bytes()[2];
-                if key.is_ascii_uppercase() {
-                    result.push(key - b'A' + 1);
-                } else if key.is_ascii_lowercase() {
-                    result.push(key - b'a' + 1);
-                } else if key == b'@' {
-                    result.push(0x00);
-                } else if key == b'[' {
-                    result.push(0x1b);
-                } else if key == b'\\' {
-                    result.push(0x1c);
-                } else if key == b']' {
-                    result.push(0x1d);
-                } else if key == b'^' {
-                    result.push(0x1e);
-                } else if key == b'_' {
-                    result.push(0x1f);
-                } else if key == b'?' {
-                    result.push(0x7f);
-                } else {
-                    result.extend_from_slice(part.as_bytes());
-                }
-            }
-            _ if part.starts_with("M-") && part.len() == 3 => {
-                result.push(0x1b);
-                result.push(part.as_bytes()[2]);
-            }
-            // Hex key code without -H: tmux treats 0xNN as a Unicode
-            // codepoint and UTF-8-encodes it. iTerm2 sends non-ASCII keys
-            // this way (e.g. ñ → `send -t %0 0xf1`). With -H (handled
-            // above) the same form means raw bytes instead.
-            _ if part.starts_with("0x") || part.starts_with("0X") => {
-                if let Ok(cp) = u32::from_str_radix(&part[2..], 16) {
-                    if let Some(ch) = char::from_u32(cp) {
-                        let mut buf = [0u8; 4];
-                        result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
-                } else {
-                    result.extend_from_slice(part.as_bytes());
-                }
-            }
-            _ => {
-                result.extend_from_slice(part.as_bytes());
-            }
-        }
-    }
-    result
 }
 
 /// Find a session by name (or return the first if name is None).
@@ -6151,7 +6084,7 @@ fn resolve_target(
 
 #[cfg(test)]
 mod escape_output_tests {
-    use super::{escape_output, split_args_shell};
+    use super::{escape_output, parse_send_keys_args, split_args_shell};
 
     #[test]
     fn preserves_box_drawing() {
@@ -6222,6 +6155,31 @@ mod escape_output_tests {
             vec!["-e", "A=1", "-e", "B=x y", "cmd \"q\""]
         );
         assert_eq!(split_args_shell(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn send_keys_quoted_ctrl_names_from_iterm2() {
+        // Claude / modifyOtherKeys: iTerm2 sends `send -t %N 'C-d'`.
+        let (keys, target) = parse_send_keys_args("-t %1 'C-d'");
+        assert_eq!(keys, vec![0x04]);
+        assert_eq!(target.as_deref(), Some("%1"));
+
+        let (keys, _) = parse_send_keys_args("-t '%2' 'C-Space'");
+        assert_eq!(keys, vec![0x00]);
+
+        // Unquoted forms still work (shell path / older iTerm2).
+        let (keys, _) = parse_send_keys_args("-t %0 C-d");
+        assert_eq!(keys, vec![0x04]);
+        let (keys, _) = parse_send_keys_args("-t %0 C-Space");
+        assert_eq!(keys, vec![0x00]);
+
+        // -l skips key-name lookup.
+        let (keys, _) = parse_send_keys_args("-lt %0 C-d");
+        assert_eq!(keys, b"C-d".to_vec());
+
+        // -H hex path unchanged.
+        let (keys, _) = parse_send_keys_args("-t %0 -H 04");
+        assert_eq!(keys, vec![0x04]);
     }
 }
 

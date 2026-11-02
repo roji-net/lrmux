@@ -685,7 +685,7 @@ fn parse_new_window(args: &[String]) -> CliAction {
 fn parse_send_keys(args: &[String]) -> CliAction {
     let parsed = cmd::parse_flags(args);
     let quiet = parsed.has("q") || parsed.has("quiet");
-    let keys = parse_tmux_keys(&parsed.positional);
+    let keys = cmd::parse_tmux_keys(&parsed.positional);
     let raw_target = parsed.get("t").or_else(|| parsed.get("target"));
     CliAction::SendKeys {
         server: parsed
@@ -720,88 +720,6 @@ fn parse_send_event(args: &[String]) -> CliAction {
         events,
         quiet,
     }
-}
-
-/// Parse tmux-style key names into byte sequences.
-/// Supported:
-///   C-a, C-c, C-z  → Ctrl+key (0x01, 0x03, 0x1a)
-///   F1-F12         → function key escape sequences
-///   Enter          → \r
-///   Tab            → \t
-///   Escape, Esc    → \x1b
-///   Space          → ' '
-///   BS, BSpace     → \x7f
-///   Up/Down/Left/Right → arrow key escape sequences
-///   Home/End       → Home/End escape sequences
-///   PageUp/PageDown   → page up/down escape sequences
-///   Any other string  → its raw bytes (literal text)
-fn parse_tmux_keys(parts: &[String]) -> Vec<u8> {
-    let mut result = Vec::new();
-    for part in parts {
-        match part.as_str() {
-            "Enter" | "Return" => result.push(b'\r'),
-            "Tab" => result.push(b'\t'),
-            "Escape" | "Esc" => result.push(0x1b),
-            "Space" => result.push(b' '),
-            "BS" | "BSpace" => result.push(0x7f),
-            "Up" => result.extend_from_slice(b"\x1b[A"),
-            "Down" => result.extend_from_slice(b"\x1b[B"),
-            "Right" => result.extend_from_slice(b"\x1b[C"),
-            "Left" => result.extend_from_slice(b"\x1b[D"),
-            "Home" => result.extend_from_slice(b"\x1b[H"),
-            "End" => result.extend_from_slice(b"\x1b[F"),
-            "PageUp" | "PgUp" => result.extend_from_slice(b"\x1b[5~"),
-            "PageDown" | "PgDn" => result.extend_from_slice(b"\x1b[6~"),
-            "F1" => result.extend_from_slice(b"\x1bOP"),
-            "F2" => result.extend_from_slice(b"\x1bOQ"),
-            "F3" => result.extend_from_slice(b"\x1bOR"),
-            "F4" => result.extend_from_slice(b"\x1bOS"),
-            "F5" => result.extend_from_slice(b"\x1b[15~"),
-            "F6" => result.extend_from_slice(b"\x1b[17~"),
-            "F7" => result.extend_from_slice(b"\x1b[18~"),
-            "F8" => result.extend_from_slice(b"\x1b[19~"),
-            "F9" => result.extend_from_slice(b"\x1b[20~"),
-            "F10" => result.extend_from_slice(b"\x1b[21~"),
-            "F11" => result.extend_from_slice(b"\x1b[23~"),
-            "F12" => result.extend_from_slice(b"\x1b[24~"),
-            _ if part.starts_with("C-") && part.len() == 3 => {
-                let key = part.as_bytes()[2];
-                // C-@ through C-_ → 0x00 through 0x1f
-                if key.is_ascii_uppercase() {
-                    result.push(key - b'A' + 1);
-                } else if key.is_ascii_lowercase() {
-                    result.push(key - b'a' + 1);
-                } else if key == b'@' {
-                    result.push(0x00);
-                } else if key == b'[' {
-                    result.push(0x1b);
-                } else if key == b'\\' {
-                    result.push(0x1c);
-                } else if key == b']' {
-                    result.push(0x1d);
-                } else if key == b'^' {
-                    result.push(0x1e);
-                } else if key == b'_' {
-                    result.push(0x1f);
-                } else if key == b'?' {
-                    result.push(0x7f);
-                } else {
-                    // Unknown C-x, pass literally.
-                    result.extend_from_slice(part.as_bytes());
-                }
-            }
-            _ if part.starts_with("M-") && part.len() == 3 => {
-                // M-x → ESC + x (meta prefix)
-                result.push(0x1b);
-                result.push(part.as_bytes()[2]);
-            }
-            _ => {
-                // Literal text — pass as raw bytes.
-                result.extend_from_slice(part.as_bytes());
-            }
-        }
-    }
-    result
 }
 
 /// Entry point: parse args, connect to or fork a server, run the client.
