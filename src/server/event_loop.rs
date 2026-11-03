@@ -6167,6 +6167,12 @@ mod escape_output_tests {
         let (keys, _) = parse_send_keys_args("-t '%2' 'C-Space'");
         assert_eq!(keys, vec![0x00]);
 
+        // Shift-Tab / Ctrl-Backspace arrive quoted the same way.
+        let (keys, _) = parse_send_keys_args("-t %0 'S-Tab'");
+        assert_eq!(keys, b"\x1b[Z".to_vec());
+        let (keys, _) = parse_send_keys_args("-t %0 'C-BSpace'");
+        assert_eq!(keys, b"\x1b[27;5;127~".to_vec());
+
         // Unquoted forms still work (shell path / older iTerm2).
         let (keys, _) = parse_send_keys_args("-t %0 C-d");
         assert_eq!(keys, vec![0x04]);

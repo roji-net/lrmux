@@ -926,25 +926,88 @@ fn is_tcp_port(s: &str) -> bool {
     matches!(s.parse::<u16>(), Ok(p) if p > 0)
 }
 
-/// Decode a tmux-style key name after a `C-` prefix into a control byte.
-/// `Space`/`space` → NUL (same as `C-@`); single letters → `1..=26`.
-fn decode_ctrl_key(rest: &str) -> Option<u8> {
-    if rest.eq_ignore_ascii_case("Space") {
-        return Some(0x00);
+#[derive(Clone, Copy, Default)]
+struct KeyMods {
+    ctrl: bool,
+    meta: bool,
+    shift: bool,
+}
+
+impl KeyMods {
+    /// xterm/tmux modifier parameter: 1 + Shift + 2·Meta + 4·Ctrl.
+    fn param(self) -> u8 {
+        1 + u8::from(self.shift) + 2 * u8::from(self.meta) + 4 * u8::from(self.ctrl)
     }
-    let mut chars = rest.chars();
-    let key = chars.next()?;
-    if chars.next().is_some() {
-        return None;
+
+    fn any(self) -> bool {
+        self.ctrl || self.meta || self.shift
     }
-    let b = key as u8;
-    if key.is_ascii_uppercase() {
-        Some(b - b'A' + 1)
-    } else if key.is_ascii_lowercase() {
-        Some(b - b'a' + 1)
+}
+
+/// Strip leading `C-` / `M-` / `S-` prefixes (any order, case-insensitive).
+fn strip_key_mods(name: &str) -> (KeyMods, &str) {
+    let mut mods = KeyMods::default();
+    let mut rest = name;
+    loop {
+        let lower = rest.as_bytes();
+        if lower.len() >= 2 && lower[1] == b'-' {
+            match lower[0].to_ascii_lowercase() {
+                b'c' => {
+                    mods.ctrl = true;
+                    rest = &rest[2..];
+                    continue;
+                }
+                b'm' => {
+                    mods.meta = true;
+                    rest = &rest[2..];
+                    continue;
+                }
+                b's' => {
+                    mods.shift = true;
+                    rest = &rest[2..];
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        break;
+    }
+    (mods, rest)
+}
+
+/// xterm modifyOtherKeys encoding: `CSI 27 ; mod ; code ~`.
+/// iTerm2 delegates these names to tmux under -CC so the pane (e.g. Claude)
+/// receives the sequence it requested rather than a literal `S-Tab`.
+fn encode_modify_other(mods: KeyMods, code: u32) -> Vec<u8> {
+    format!("\x1b[27;{};{}~", mods.param(), code).into_bytes()
+}
+
+/// Cursor-key style with modifiers: `CSI 1 ; mod X` (X = A/B/C/D/H/F).
+fn encode_mod_cursor(mods: KeyMods, final_byte: u8) -> Vec<u8> {
+    if mods.any() {
+        format!("\x1b[1;{}{}", mods.param(), final_byte as char).into_bytes()
     } else {
-        match b {
-            b'@' => Some(0x00),
+        vec![0x1b, b'[', final_byte]
+    }
+}
+
+/// Numbered special with modifiers: `CSI n ~` or `CSI n ; mod ~`.
+fn encode_mod_tilde(mods: KeyMods, n: u8) -> Vec<u8> {
+    if mods.any() {
+        format!("\x1b[{};{}~", n, mods.param()).into_bytes()
+    } else {
+        format!("\x1b[{n}~").into_bytes()
+    }
+}
+
+fn encode_ctrl_ascii(ch: u8) -> Option<u8> {
+    if ch.is_ascii_uppercase() {
+        Some(ch - b'A' + 1)
+    } else if ch.is_ascii_lowercase() {
+        Some(ch - b'a' + 1)
+    } else {
+        match ch {
+            b'@' | b' ' => Some(0x00),
             b'[' => Some(0x1b),
             b'\\' => Some(0x1c),
             b']' => Some(0x1d),
@@ -956,76 +1019,166 @@ fn decode_ctrl_key(rest: &str) -> Option<u8> {
     }
 }
 
+/// Resolve one tmux key name to bytes. Returns `None` for unknown names
+/// (caller passes them through as literal UTF-8).
+fn encode_tmux_key(name: &str) -> Option<Vec<u8>> {
+    // Bare unicode codepoint: `0xNN` (iTerm2 non-`-H` form).
+    if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        let cp = u32::from_str_radix(hex, 16).ok()?;
+        let ch = char::from_u32(cp)?;
+        let mut buf = [0u8; 4];
+        return Some(ch.encode_utf8(&mut buf).as_bytes().to_vec());
+    }
+
+    let (mods, base) = strip_key_mods(name);
+    if base.is_empty() {
+        return None;
+    }
+
+    // Back-tab: tmux's canonical name is BTab; iTerm2 sends S-Tab.
+    if base.eq_ignore_ascii_case("BTab")
+        || (base.eq_ignore_ascii_case("Tab") && mods.shift && !mods.ctrl && !mods.meta)
+    {
+        return Some(b"\x1b[Z".to_vec());
+    }
+
+    // Function keys — unmodified keep SS3/CSI; with mods use CSI 1;mod / n;mod.
+    let fkey = |n: u8, mods: KeyMods| -> Vec<u8> {
+        match (n, mods.any()) {
+            (1, false) => b"\x1bOP".to_vec(),
+            (2, false) => b"\x1bOQ".to_vec(),
+            (3, false) => b"\x1bOR".to_vec(),
+            (4, false) => b"\x1bOS".to_vec(),
+            (1..=4, true) => {
+                format!("\x1b[1;{}{}", mods.param(), (b'P' + (n - 1)) as char).into_bytes()
+            }
+            (5, _) => encode_mod_tilde(mods, 15),
+            (6, _) => encode_mod_tilde(mods, 17),
+            (7, _) => encode_mod_tilde(mods, 18),
+            (8, _) => encode_mod_tilde(mods, 19),
+            (9, _) => encode_mod_tilde(mods, 20),
+            (10, _) => encode_mod_tilde(mods, 21),
+            (11, _) => encode_mod_tilde(mods, 23),
+            (12, _) => encode_mod_tilde(mods, 24),
+            _ => Vec::new(),
+        }
+    };
+
+    // Named bases (case-insensitive for multi-char tmux names).
+    let named: Option<Vec<u8>> =
+        if base.eq_ignore_ascii_case("Enter") || base.eq_ignore_ascii_case("Return") {
+            Some(if mods.any() {
+                encode_modify_other(mods, 13)
+            } else {
+                vec![b'\r']
+            })
+        } else if base.eq_ignore_ascii_case("Tab") {
+            Some(if mods.any() {
+                encode_modify_other(mods, 9)
+            } else {
+                vec![b'\t']
+            })
+        } else if base.eq_ignore_ascii_case("Escape") || base.eq_ignore_ascii_case("Esc") {
+            Some(if mods.any() {
+                encode_modify_other(mods, 27)
+            } else {
+                vec![0x1b]
+            })
+        } else if base.eq_ignore_ascii_case("Space") {
+            Some(if mods.ctrl && !mods.meta && !mods.shift {
+                vec![0x00] // C-Space / C-@
+            } else if mods.any() {
+                encode_modify_other(mods, 32)
+            } else {
+                vec![b' ']
+            })
+        } else if base.eq_ignore_ascii_case("BSpace") || base.eq_ignore_ascii_case("BS") {
+            Some(if mods.ctrl && !mods.meta && !mods.shift {
+                // Ctrl-Backspace: modifyOtherKeys (Claude / iTerm2 -CC path).
+                encode_modify_other(mods, 127)
+            } else if mods.meta && !mods.ctrl && !mods.shift {
+                vec![0x1b, 0x7f]
+            } else if mods.any() {
+                encode_modify_other(mods, 127)
+            } else {
+                vec![0x7f]
+            })
+        } else if base.eq_ignore_ascii_case("Up") {
+            Some(encode_mod_cursor(mods, b'A'))
+        } else if base.eq_ignore_ascii_case("Down") {
+            Some(encode_mod_cursor(mods, b'B'))
+        } else if base.eq_ignore_ascii_case("Right") {
+            Some(encode_mod_cursor(mods, b'C'))
+        } else if base.eq_ignore_ascii_case("Left") {
+            Some(encode_mod_cursor(mods, b'D'))
+        } else if base.eq_ignore_ascii_case("Home") {
+            Some(encode_mod_cursor(mods, b'H'))
+        } else if base.eq_ignore_ascii_case("End") {
+            Some(encode_mod_cursor(mods, b'F'))
+        } else if base.eq_ignore_ascii_case("PageUp") || base.eq_ignore_ascii_case("PgUp") {
+            Some(encode_mod_tilde(mods, 5))
+        } else if base.eq_ignore_ascii_case("PageDown") || base.eq_ignore_ascii_case("PgDn") {
+            Some(encode_mod_tilde(mods, 6))
+        } else if base.eq_ignore_ascii_case("IC") || base.eq_ignore_ascii_case("Insert") {
+            Some(encode_mod_tilde(mods, 2))
+        } else if base.eq_ignore_ascii_case("DC") || base.eq_ignore_ascii_case("Delete") {
+            Some(encode_mod_tilde(mods, 3))
+        } else if let Some(n) = base
+            .strip_prefix('F')
+            .or_else(|| base.strip_prefix('f'))
+            .and_then(|s| s.parse::<u8>().ok())
+        {
+            let bytes = fkey(n, mods);
+            if bytes.is_empty() { None } else { Some(bytes) }
+        } else {
+            None
+        };
+    if let Some(bytes) = named {
+        return Some(bytes);
+    }
+
+    // Single-character base with modifiers.
+    let mut chars = base.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let b = ch as u8;
+    if !ch.is_ascii() {
+        return None;
+    }
+
+    // Plain C-x → C0 control (keeps Ctrl-D / Ctrl-C working as raw bytes).
+    if mods.ctrl && !mods.meta && !mods.shift {
+        return encode_ctrl_ascii(b).map(|c| vec![c]);
+    }
+    // M-x → ESC + x; C-M-x → ESC + C0.
+    if mods.meta && !mods.shift {
+        return if mods.ctrl {
+            encode_ctrl_ascii(b).map(|c| vec![0x1b, c])
+        } else {
+            Some(vec![0x1b, b])
+        };
+    }
+    // Anything involving Shift (C-S-J, S-a, …) needs modifyOtherKeys —
+    // a raw byte can't carry Shift. Match iTerm2: use the given case.
+    if mods.any() {
+        return Some(encode_modify_other(mods, u32::from(b)));
+    }
+    Some(vec![b])
+}
+
 /// Parse tmux-style key names into byte sequences (CLI + control-mode
 /// `send-keys`). Unknown names pass through as literal UTF-8 bytes.
 ///
-/// Recognizes named keys (`Enter`, arrows, …), `C-x` / `C-Space`,
-/// `M-x`, and bare `0xNN` Unicode codepoints (iTerm2's non-`-H` form).
+/// Handles `C-`/`M-`/`S-` prefixes (including `C-BSpace`, `S-Tab`,
+/// `C-S-J`), named keys, and bare `0xNN` Unicode codepoints.
 pub fn parse_tmux_keys(parts: &[String]) -> Vec<u8> {
     let mut result = Vec::new();
     for part in parts {
-        match part.as_str() {
-            "Enter" | "Return" => result.push(b'\r'),
-            "Tab" => result.push(b'\t'),
-            "Escape" | "Esc" => result.push(0x1b),
-            "Space" => result.push(b' '),
-            "BS" | "BSpace" => result.push(0x7f),
-            "Up" => result.extend_from_slice(b"\x1b[A"),
-            "Down" => result.extend_from_slice(b"\x1b[B"),
-            "Right" => result.extend_from_slice(b"\x1b[C"),
-            "Left" => result.extend_from_slice(b"\x1b[D"),
-            "Home" => result.extend_from_slice(b"\x1b[H"),
-            "End" => result.extend_from_slice(b"\x1b[F"),
-            "PageUp" | "PgUp" => result.extend_from_slice(b"\x1b[5~"),
-            "PageDown" | "PgDn" => result.extend_from_slice(b"\x1b[6~"),
-            "F1" => result.extend_from_slice(b"\x1bOP"),
-            "F2" => result.extend_from_slice(b"\x1bOQ"),
-            "F3" => result.extend_from_slice(b"\x1bOR"),
-            "F4" => result.extend_from_slice(b"\x1bOS"),
-            "F5" => result.extend_from_slice(b"\x1b[15~"),
-            "F6" => result.extend_from_slice(b"\x1b[17~"),
-            "F7" => result.extend_from_slice(b"\x1b[18~"),
-            "F8" => result.extend_from_slice(b"\x1b[19~"),
-            "F9" => result.extend_from_slice(b"\x1b[20~"),
-            "F10" => result.extend_from_slice(b"\x1b[21~"),
-            "F11" => result.extend_from_slice(b"\x1b[23~"),
-            "F12" => result.extend_from_slice(b"\x1b[24~"),
-            _ if let Some(rest) = part.strip_prefix("C-") => {
-                if let Some(b) = decode_ctrl_key(rest) {
-                    result.push(b);
-                } else {
-                    result.extend_from_slice(part.as_bytes());
-                }
-            }
-            _ if let Some(rest) = part.strip_prefix("M-") => {
-                if rest.len() == 1 {
-                    result.push(0x1b);
-                    result.push(rest.as_bytes()[0]);
-                } else if rest.eq_ignore_ascii_case("Space") {
-                    result.push(0x1b);
-                    result.push(b' ');
-                } else {
-                    result.extend_from_slice(part.as_bytes());
-                }
-            }
-            // Hex key code without -H: tmux treats 0xNN as a Unicode
-            // codepoint and UTF-8-encodes it. iTerm2 sends non-ASCII keys
-            // this way (e.g. ñ → `send -t %0 0xf1`).
-            _ if part.starts_with("0x") || part.starts_with("0X") => {
-                if let Ok(cp) = u32::from_str_radix(&part[2..], 16) {
-                    if let Some(ch) = char::from_u32(cp) {
-                        let mut buf = [0u8; 4];
-                        result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    } else {
-                        result.extend_from_slice(part.as_bytes());
-                    }
-                } else {
-                    result.extend_from_slice(part.as_bytes());
-                }
-            }
-            _ => {
-                result.extend_from_slice(part.as_bytes());
-            }
+        match encode_tmux_key(part) {
+            Some(bytes) => result.extend_from_slice(&bytes),
+            None => result.extend_from_slice(part.as_bytes()),
         }
     }
     result
@@ -1153,8 +1306,19 @@ mod tests {
         assert_eq!(parse_tmux_keys(&p("Enter")), vec![b'\r']);
         assert_eq!(parse_tmux_keys(&p("M-a")), vec![0x1b, b'a']);
         assert_eq!(parse_tmux_keys(&p("0xf1")), "ñ".as_bytes());
-        // Unknown multi-char C- name stays literal (not silently dropped).
-        assert_eq!(parse_tmux_keys(&p("C-Enter")), b"C-Enter".to_vec());
+        // Shift-Tab (iTerm2) and BTab (tmux) → classic back-tab.
+        assert_eq!(parse_tmux_keys(&p("S-Tab")), b"\x1b[Z".to_vec());
+        assert_eq!(parse_tmux_keys(&p("BTab")), b"\x1b[Z".to_vec());
+        // Ctrl-Backspace → modifyOtherKeys (what Claude expects via -CC).
+        assert_eq!(parse_tmux_keys(&p("C-BSpace")), b"\x1b[27;5;127~".to_vec());
+        assert_eq!(parse_tmux_keys(&p("S-BSpace")), b"\x1b[27;2;127~".to_vec());
+        assert_eq!(parse_tmux_keys(&p("S-Enter")), b"\x1b[27;2;13~".to_vec());
+        assert_eq!(parse_tmux_keys(&p("C-Escape")), b"\x1b[27;5;27~".to_vec());
+        assert_eq!(parse_tmux_keys(&p("S-Left")), b"\x1b[1;2D".to_vec());
+        assert_eq!(parse_tmux_keys(&p("C-Right")), b"\x1b[1;5C".to_vec());
+        assert_eq!(parse_tmux_keys(&p("C-S-J")), b"\x1b[27;6;74~".to_vec());
+        // Still-unknown names stay literal.
+        assert_eq!(parse_tmux_keys(&p("C-NotAKey")), b"C-NotAKey".to_vec());
     }
 
     #[test]
