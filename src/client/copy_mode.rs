@@ -362,12 +362,15 @@ impl CopyMode {
         // Reset SGR.
         emit_reset(stdout)?;
 
-        // Render status bar with [copy] indicator.
+        // Render status bar with [copy] indicator. Truncate + DECAWM off
+        // so a narrow client (Termux) cannot wrap this row and scroll the
+        // DECSTBM content region (see render_status_bar).
         let row = view_rows + 1;
-        write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
+        write!(stdout, "\x1b[?7l\x1b[0m\x1b[{};1H\x1b[2K", row)?;
         let copy_status = format!("\x1b[0;44;97m[copy] \x1b[0;1;44;93m{}\x1b[0m", status_text);
-        let display: String = copy_status.chars().take(term_cols).collect();
+        let display = super::truncate_ansi(&copy_status, term_cols);
         stdout.write_all(display.as_bytes())?;
+        write!(stdout, "\x1b[?7h")?;
 
         // Position the copy mode cursor (after status bar so it stays in place).
         let cursor_screen_row = self.vrow.saturating_sub(self.viewport_top) + 1;

@@ -1945,55 +1945,52 @@ fn take_network_setup_flash() -> Option<String> {
 fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
     let mut stdout = client_stdout();
     let row = term_rows;
+    let cols = (terminal::get_size().1 as usize).min(500);
     // Reset SGR before clear/write so reverse/underline from the pane
     // cannot bleed into the prompt (same issue as the status bar).
-    write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row).ok();
-    match state {
-        ConfirmState::None => {}
-        ConfirmState::KillWindow => {
-            write!(stdout, "\x1b[0;43;30m Kill current window? (y/n) \x1b[0m").ok();
-        }
+    // Disable DECAWM: a wrap on this row scrolls the content region on
+    // Termux (auto-wrap keys off mBottomMargin even below the margin).
+    write!(stdout, "\x1b[?7l\x1b[0m\x1b[{};1H\x1b[2K", row).ok();
+    let text = match state {
+        ConfirmState::None => String::new(),
+        ConfirmState::KillWindow => "\x1b[0;43;30m Kill current window? (y/n) \x1b[0m".to_string(),
         ConfirmState::KillSession {
             input,
             target,
             window_count,
         } => {
-            write!(
-                stdout,
+            format!(
                 "\x1b[0;41;97m Kill session '{}' ({} window{})? Type the name to confirm: {}\x1b[0m",
                 target,
                 window_count,
                 if *window_count == 1 { "" } else { "s" },
                 input
             )
-            .ok();
         }
         ConfirmState::RenameSession { input } => {
-            write!(
-                stdout,
+            format!(
                 "\x1b[0;44;97m Rename session: {}\x1b[0;1;44;93m_\x1b[0;44;97m  (Enter=confirm, Esc=cancel)\x1b[0m",
                 input
             )
-            .ok();
         }
         ConfirmState::NetworkSetupMenu => {
             let has = !crate::config::effective_psk().is_empty();
-            write!(
-                stdout,
+            format!(
                 "\x1b[0;44;97m Network setup: [g]enerate PSK  [s]et PSK  [q]uit{}\x1b[0m",
                 if has { " (PSK already set)" } else { "" }
             )
-            .ok();
         }
         ConfirmState::NetworkSetupSetPsk { input } => {
-            write!(
-                stdout,
+            format!(
                 "\x1b[0;44;97m Enter PSK: {}\x1b[0;1;44;93m_\x1b[0;44;97m  (Enter=save, Esc=cancel)\x1b[0m",
                 "*".repeat(input.len())
             )
-            .ok();
         }
+    };
+    if !text.is_empty() {
+        let _ = stdout.write_all(truncate_ansi(&text, cols).as_bytes());
     }
+    write!(stdout, "\x1b[0m\x1b[?7h").ok();
     stdout.flush().ok();
 }
 
@@ -2140,31 +2137,28 @@ fn render_status_bar(
     grid: &Grid,
     mouse_on: bool,
 ) -> io::Result<()> {
-    // Position cursor at the last row of the terminal (1-based).
     let row = term_rows;
-    // Reset SGR *before* clear/write. The diff renderer leaves the last
-    // cell's attrs active (AI CLIs often use reverse/underline), and
-    // `\x1b[2K` / bare `\x1b[44m` would otherwise inherit them — making
-    // the footer look inverted or underlined until the next clean redraw.
-    write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
-    // Write the full status bar text (it includes its own ANSI colors).
-    stdout.write_all(text.as_bytes())?;
-    // Measure visible width (excluding ANSI escape sequences) and pad
-    // the rest of the line with the bar background color so the
-    // blue background extends to the right edge of the terminal.
     let max_cols = term_cols.min(500);
-    let visible_len = strip_ansi(text).chars().count();
+    // Truncate to the terminal width. An untruncated bar wraps on narrow
+    // clients (Termux); Termux then scrolls the DECSTBM content region
+    // because its auto-wrap path keys off mBottomMargin even when the
+    // cursor sits on the status row below that margin — one scroll per
+    // keystroke, with the diff renderer leaving the new glyph one row
+    // below the scrolled prompt.
+    let clipped = truncate_ansi(text, max_cols);
+    let visible_len = strip_ansi(&clipped).chars().count().min(max_cols);
+    // DECAWM off for the paint: last-column pad/`[M]` must not wrap.
+    write!(stdout, "\x1b[?7l\x1b[0m\x1b[{};1H\x1b[2K", row)?;
+    stdout.write_all(clipped.as_bytes())?;
     if visible_len < max_cols {
         // Full SGR reset + blue bg (no reverse/underline/bold).
         write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - visible_len))?;
     }
-    // Reset attributes.
     stdout.write_all(b"\x1b[0m")?;
-    // [M] indicator/toggle at the right edge.
     draw_mouse_button(stdout, term_rows, term_cols, mouse_on)?;
+    write!(stdout, "\x1b[?7h")?;
     // Reposition cursor to the grid cursor location so the user sees
     // the cursor in the pane, not on the status bar.
-    // Only reposition if the cursor is within the viewport.
     if grid.cursor_visible {
         let view_rows = grid.rows().min(term_rows.saturating_sub(1));
         let view_cols = grid.cols().min(term_cols);
@@ -2192,12 +2186,9 @@ fn render_flash_status_bar(
     mouse_on: bool,
 ) -> io::Result<()> {
     let row = term_rows;
-    write!(stdout, "\x1b[0m\x1b[{};1H\x1b[2K", row)?;
     let max_cols = term_cols.min(500);
 
-    // Strip escape sequences from normal_text to measure visible width.
-    let normal_visible: String = strip_ansi(normal_text);
-    let normal_len = normal_visible.chars().count();
+    let normal_len = strip_ansi(normal_text).chars().count();
 
     // Flash message in bold yellow on blue, with a separator.
     // Leading `0;` clears reverse/underline inherited from the pane.
@@ -2205,31 +2196,26 @@ fn render_flash_status_bar(
     const BAR: &str = "\x1b[0;44;97m"; // reset, bg blue, bright white
 
     let flash_text = format!("{}  ⚠ {}{}", FLASH, msg, BAR);
-    let flash_visible: String = strip_ansi(&flash_text);
-    let flash_len = flash_visible.chars().count();
+    let flash_len = strip_ansi(&flash_text).chars().count();
 
-    // If both fit, show normal on left + flash on right.
-    if normal_len + flash_len <= max_cols {
-        // Write normal status bar (it already has its own colors).
-        let normal_display: String = normal_text.chars().take(max_cols).collect();
-        stdout.write_all(normal_display.as_bytes())?;
-        // Write flash message.
-        stdout.write_all(flash_text.as_bytes())?;
+    // Prefer flash when both don't fit; always ANSI-aware truncate.
+    let combined = if normal_len + flash_len <= max_cols {
+        format!("{normal_text}{flash_text}")
     } else {
-        // Not enough room — just show the flash message.
-        let display: String = flash_text.chars().take(max_cols).collect();
-        stdout.write_all(display.as_bytes())?;
-    }
+        flash_text
+    };
+    let clipped = truncate_ansi(&combined, max_cols);
+    let visible_len = strip_ansi(&clipped).chars().count().min(max_cols);
 
-    // Pad the rest with blue background.
-    let total_visible = normal_len + flash_len;
-    if total_visible < max_cols {
-        write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - total_visible))?;
+    write!(stdout, "\x1b[?7l\x1b[0m\x1b[{};1H\x1b[2K", row)?;
+    stdout.write_all(clipped.as_bytes())?;
+    if visible_len < max_cols {
+        write!(stdout, "\x1b[0;44m{}", " ".repeat(max_cols - visible_len))?;
     }
     stdout.write_all(b"\x1b[0m")?;
     draw_mouse_button(stdout, term_rows, term_cols, mouse_on)?;
+    write!(stdout, "\x1b[?7h")?;
 
-    // Reposition cursor.
     if grid.cursor_visible {
         let view_rows = grid.rows().min(term_rows.saturating_sub(1));
         let view_cols = grid.cols().min(term_cols);
@@ -2263,6 +2249,66 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     result
+}
+
+/// Truncate a string that may contain ANSI escapes to `width` visible
+/// characters, copying escape sequences verbatim. Used so the status bar
+/// never wraps on a narrow client.
+fn truncate_ansi(s: &str, width: usize) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut vis = 0usize;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        i += 1;
+        if c != '\x1b' {
+            if vis >= width {
+                break;
+            }
+            out.push(c);
+            vis += 1;
+            continue;
+        }
+        out.push('\x1b');
+        match cs.get(i).copied() {
+            Some('[') => {
+                out.push('[');
+                i += 1;
+                while i < cs.len() {
+                    let c2 = cs[i];
+                    out.push(c2);
+                    i += 1;
+                    if ('@'..='~').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                out.push(']');
+                i += 1;
+                while i < cs.len() {
+                    let c2 = cs[i];
+                    out.push(c2);
+                    i += 1;
+                    if c2 == '\x07' {
+                        break;
+                    }
+                    if c2 == '\x1b' && cs.get(i) == Some(&'\\') {
+                        out.push('\\');
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            Some(next) => {
+                out.push(next);
+                i += 1;
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 /// Update the renderer's viewport based on terminal and grid dimensions.
@@ -3285,6 +3331,52 @@ mod tests {
             outer_title("s\x1b]8;;x", "we\x07ird", &["z\x1bsh".into()], 0, &[]),
             "lrmux - s]8;;x:weird:zsh"
         );
+    }
+
+    #[test]
+    fn truncate_ansi_keeps_escapes_and_caps_visible_width() {
+        let s = "\x1b[0;44;97mhello\x1b[0;1;44;93mWORLD\x1b[0m";
+        let t = truncate_ansi(s, 7);
+        assert_eq!(strip_ansi(&t).chars().count(), 7);
+        assert!(t.contains("\x1b[0;44;97m"));
+        assert_eq!(strip_ansi(&t), "helloWO");
+        // Already short: unchanged visible content.
+        assert_eq!(strip_ansi(&truncate_ansi(s, 100)), "helloWORLD");
+        // Zero width keeps leading escapes until the first visible char is skipped.
+        assert!(strip_ansi(&truncate_ansi(s, 0)).is_empty());
+    }
+
+    #[test]
+    fn status_bar_text_fits_narrow_term_after_truncate() {
+        let (text, _) = format_status_bar(
+            "very-long-session-name",
+            &[
+                "zsh".into(),
+                "vim".into(),
+                "htop".into(),
+                "logs".into(),
+                "build".into(),
+            ],
+            2,
+            "abcdef123456",
+            true,
+            "infra-284-letsencrypt",
+            &[true, false, true, false, true],
+            &[false, true, false, true, false],
+        );
+        let visible = strip_ansi(&text);
+        assert!(
+            visible.chars().count() > 40,
+            "fixture should overflow a phone-width term: {visible}"
+        );
+        for width in [20usize, 40, 60, 80] {
+            let clipped = truncate_ansi(&text, width);
+            assert_eq!(
+                strip_ansi(&clipped).chars().count(),
+                width.min(visible.chars().count()),
+                "width={width}"
+            );
+        }
     }
 
     #[test]
