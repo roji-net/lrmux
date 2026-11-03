@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use crate::ipc;
 use crate::proto::{self, ClientMsg, ServerMsg, SessionInfo};
 use crate::pty;
+use crate::server::pane::Pane;
 use crate::server::session::{Session, unix_now};
 use crate::server::state;
 use crate::server::window::Window;
@@ -825,11 +826,11 @@ pub fn run(
                     Some(Removed::Pane) => {
                         broadcast_control_notify(
                             &mut clients,
-                            &format!(
-                                "%layout-change {} {}",
-                                wid,
-                                session.windows[wi].layout_str()
-                            ),
+                            &layout_change_notify(&session.windows[wi]),
+                        );
+                        broadcast_control_notify(
+                            &mut clients,
+                            &window_pane_changed_notify(&session.windows[wi]),
                         );
                         let _ = send_all_snapshots(&mut clients, &sessions);
                         broadcast_status_bar(&mut clients, &sessions);
@@ -4806,13 +4807,9 @@ fn send_control_initial_state(client: &mut ClientConn, sessions: &[Session]) {
             client,
             &format!("%window-renamed {} {}", window.id_str(), window.name),
         );
-        // %layout-change @N <checksum>,<width>x<height>,<x>,<y>,<pane-id>
-        // width=columns, height=rows (iTerm2's TmuxLayoutParser expects this).
-        let layout = window_layout_str(window);
-        send_control_notify(
-            client,
-            &format!("%layout-change {} {}", window.id_str(), layout),
-        );
+        // %layout-change @N layout visible-layout flags
+        send_control_notify(client, &layout_change_notify(window));
+        send_control_notify(client, &window_pane_changed_notify(window));
     }
 }
 
@@ -4876,13 +4873,15 @@ fn positional_format(positional: &[String]) -> Option<String> {
     }
 }
 
-/// Expand a tmux -F format string for a session/window.
+/// Expand a tmux -F format string for a session/window[/pane].
 /// Supports #{...} variables used by iTerm2 plus common ones, and \t / \n escapes.
+/// When `pane` is `None`, pane_* vars use the window's active pane.
 fn expand_format(
     fmt: &str,
     session: Option<&Session>,
     window: Option<&Window>,
     socket_path: &std::path::Path,
+    pane: Option<&Pane>,
 ) -> String {
     let mut out = String::with_capacity(fmt.len() * 2);
     let mut chars = fmt.chars().peekable();
@@ -4906,7 +4905,7 @@ fn expand_format(
                 }
                 var.push(c);
             }
-            out.push_str(&format_var(&var, session, window, socket_path));
+            out.push_str(&format_var(&var, session, window, pane, socket_path));
         } else if c == '#' {
             // tmux shorthand variables: ## is a literal '#', the rest
             // map to their #{long} form.
@@ -4929,7 +4928,7 @@ fn expand_format(
                     continue;
                 }
             };
-            out.push_str(&format_var(long, session, window, socket_path));
+            out.push_str(&format_var(long, session, window, pane, socket_path));
         } else {
             out.push(c);
         }
@@ -4944,12 +4943,16 @@ fn window_layout_str(window: &Window) -> String {
 }
 
 /// Resolve a single #{...} format variable.
+/// `pane` overrides the window's active pane for pane_* / cursor fields.
 fn format_var(
     var: &str,
     session: Option<&Session>,
     window: Option<&Window>,
+    pane: Option<&Pane>,
     socket_path: &std::path::Path,
 ) -> String {
+    // Prefer explicit pane; else the window's active pane.
+    let p = pane.or_else(|| window.map(|w| w.pane()));
     match var {
         "socket_path" => socket_path.to_string_lossy().into_owned(),
         "pid" => std::process::id().to_string(),
@@ -4974,22 +4977,23 @@ fn format_var(
                 }
             })
             .unwrap_or_default(),
-        "pane_id" => window
-            .map(|w| format!("%{}", w.pane().id))
-            .unwrap_or_default(),
-        "pane_width" => window
-            .map(|w| w.pane().cols.to_string())
-            .unwrap_or_default(),
-        "pane_height" => window
-            .map(|w| w.pane().rows.to_string())
-            .unwrap_or_default(),
-        "pane_pid" => window
-            .map(|w| w.pane().pty.child_pid.to_string())
-            .unwrap_or_default(),
+        "pane_id" => p.map(|p| format!("%{}", p.id)).unwrap_or_default(),
+        "pane_width" => p.map(|p| p.cols.to_string()).unwrap_or_default(),
+        "pane_height" => p.map(|p| p.rows.to_string()).unwrap_or_default(),
+        "pane_pid" => p.map(|p| p.pty.child_pid.to_string()).unwrap_or_default(),
         "window_panes" => window
             .map(|w| w.panes.len().to_string())
             .unwrap_or_else(|| "0".to_string()),
-        "pane_active" | "window_active" | "session_attached" => "1".to_string(),
+        "pane_active" => window
+            .map(|w| {
+                if p.map(|x| x.id == w.pane().id).unwrap_or(true) {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            })
+            .unwrap_or_else(|| "1".to_string()),
+        "window_active" | "session_attached" => "1".to_string(),
         "window_layout" | "window_visible_layout" => {
             window.map(window_layout_str).unwrap_or_default()
         }
@@ -5010,35 +5014,33 @@ fn format_var(
         | "mouse_sgr_flag"
         | "bracket_paste_flag"
         | "pane_key_mode" => "0".to_string(),
-        "cursor_flag" => window
-            .map(|w| {
-                if w.pane().grid.cursor_visible {
+        "cursor_flag" => p
+            .map(|p| {
+                if p.grid.cursor_visible {
                     "1".to_string()
                 } else {
                     "0".to_string()
                 }
             })
             .unwrap_or_else(|| "1".to_string()),
-        "cursor_x" => window
-            .map(|w| w.pane().grid.cursor_col.to_string())
+        "cursor_x" => p
+            .map(|p| p.grid.cursor_col.to_string())
             .unwrap_or_else(|| "0".to_string()),
-        "cursor_y" => window
-            .map(|w| w.pane().grid.cursor_row.to_string())
+        "cursor_y" => p
+            .map(|p| p.grid.cursor_row.to_string())
             .unwrap_or_else(|| "0".to_string()),
         "alternate_saved_x" | "alternate_saved_y" => "0".to_string(),
         "scroll_region_upper" => "0".to_string(),
-        "scroll_region_lower" => window
-            .map(|w| (w.pane().rows - 1).to_string())
-            .unwrap_or_default(),
-        "pane_tabs" => window
-            .map(|w| {
+        "scroll_region_lower" => p.map(|p| (p.rows - 1).to_string()).unwrap_or_default(),
+        "pane_tabs" => p
+            .map(|p| {
                 // tmux reports comma-separated tab stops (every 8 cols).
                 // A single value equal to pane width makes iTerm2 treat the
                 // right margin as the only stop — tabs in live %output then
                 // jump there (e.g. red git-status text appears as one char
                 // on the right edge). capture-pane expands tabs in the grid,
                 // which is why detach/reattach looked fine.
-                let cols = w.pane().cols as usize;
+                let cols = p.cols as usize;
                 (8..cols)
                     .step_by(8)
                     .map(|i| i.to_string())
@@ -5051,8 +5053,9 @@ fn format_var(
             if let Some(rest) = var.strip_prefix('?') {
                 let parts: Vec<&str> = rest.splitn(3, ',').collect();
                 if parts.len() == 3 {
-                    let truthy = !format_var(parts[0], session, window, socket_path).is_empty()
-                        && format_var(parts[0], session, window, socket_path) != "0";
+                    let truthy = !format_var(parts[0], session, window, pane, socket_path)
+                        .is_empty()
+                        && format_var(parts[0], session, window, pane, socket_path) != "0";
                     return if truthy {
                         parts[1].to_string()
                     } else {
@@ -5136,10 +5139,10 @@ fn handle_control_command(
         let cmd_name = crate::cmd::canonical_name(parts[0]);
 
         if cmd_name == "send-keys" {
-            // Gather consecutive send-keys to the same target.
+            // Gather consecutive send-keys to the same target pane.
             let mut coalesced: Vec<u8> = Vec::new();
             let mut n_respond = 0;
-            let mut group_loc: Option<(usize, usize)> = None;
+            let mut group_loc: Option<(usize, usize, usize)> = None;
             while i < cmds.len() {
                 let c = cmds[i].trim();
                 if c.is_empty() {
@@ -5152,7 +5155,7 @@ fn handle_control_command(
                 }
                 let args_str = p.get(1).unwrap_or(&"");
                 let (keys, target_str) = parse_send_keys_args(args_str);
-                let loc = resolve_target(sessions, client, target_str.as_deref());
+                let loc = resolve_pane_target(sessions, client, target_str.as_deref());
                 if n_respond == 0 {
                     group_loc = loc;
                 } else if loc != group_loc {
@@ -5163,10 +5166,10 @@ fn handle_control_command(
                 n_respond += 1;
                 i += 1;
             }
-            if let Some((si, wi)) = group_loc {
+            if let Some((si, wi, pi)) = group_loc {
                 let window = &mut sessions[si].windows[wi];
-                if !window.pane().exited && !coalesced.is_empty() {
-                    let _ = window.pane_mut().write_input(&coalesced);
+                if pi < window.panes.len() && !window.panes[pi].exited && !coalesced.is_empty() {
+                    let _ = window.panes[pi].write_input(&coalesced);
                 }
             }
             for _ in 0..n_respond {
@@ -5238,14 +5241,7 @@ fn handle_single_control_command(
                         let window = &mut sessions[si].windows[wi];
                         if cols > 0 && rows > 0 && (window.cols != cols || window.rows != rows) {
                             window.resize(rows, cols);
-                            send_control_notify(
-                                client,
-                                &format!(
-                                    "%layout-change {} {}",
-                                    window.id_str(),
-                                    window_layout_str(window)
-                                ),
-                            );
+                            send_control_notify(client, &layout_change_notify(window));
                         }
                     }
                 }
@@ -5400,7 +5396,7 @@ fn handle_single_control_command(
             let lines: Vec<String> = if let Some(fmt) = extract_format_arg(args_str) {
                 sessions
                     .iter()
-                    .map(|s| expand_format(&fmt, Some(s), None, socket_path))
+                    .map(|s| expand_format(&fmt, Some(s), None, socket_path, None))
                     .collect()
             } else {
                 sessions
@@ -5434,7 +5430,13 @@ fn handle_single_control_command(
             if let Some(fmt) = extract_format_arg(args_str) {
                 for session in &targets {
                     for w in &session.windows {
-                        lines.push(expand_format(&fmt, Some(session), Some(w), socket_path));
+                        lines.push(expand_format(
+                            &fmt,
+                            Some(session),
+                            Some(w),
+                            socket_path,
+                            None,
+                        ));
                     }
                 }
             } else {
@@ -5475,10 +5477,19 @@ fn handle_single_control_command(
                 let lines: Vec<String> = match si.and_then(|i| sessions.get(i)) {
                     Some(s) => {
                         if let Some(fmt) = extract_format_arg(args_str) {
-                            s.windows
-                                .iter()
-                                .map(|w| expand_format(&fmt, Some(s), Some(w), socket_path))
-                                .collect()
+                            let mut lines = Vec::new();
+                            for w in &s.windows {
+                                for p in &w.panes {
+                                    lines.push(expand_format(
+                                        &fmt,
+                                        Some(s),
+                                        Some(w),
+                                        socket_path,
+                                        Some(p),
+                                    ));
+                                }
+                            }
+                            lines
                         } else {
                             s.windows
                                 .iter()
@@ -5501,31 +5512,47 @@ fn handle_single_control_command(
                 let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
                 respond(client, &refs);
             } else {
-                let (session, window) = match resolve_target(sessions, client, t.as_deref()) {
-                    Some((si, wi)) => (
-                        sessions.get(si),
-                        sessions.get(si).and_then(|s| s.windows.get(wi)),
-                    ),
-                    None => (None, None),
+                // -t %N: iTerm2 dumps that specific pane (pane_id must match).
+                // -t @N / empty: list every pane in the window.
+                let pane_specific = t
+                    .as_deref()
+                    .map(|s| unquote(s).starts_with('%'))
+                    .unwrap_or(false);
+                let loc = resolve_pane_target(sessions, client, t.as_deref());
+                let lines: Vec<String> = match loc {
+                    Some((si, wi, pi)) => {
+                        let session = sessions.get(si);
+                        let window = session.and_then(|s| s.windows.get(wi));
+                        if let (Some(fmt), Some(w)) = (extract_format_arg(args_str), window) {
+                            if pane_specific {
+                                let p = w.panes.get(pi);
+                                vec![expand_format(&fmt, session, Some(w), socket_path, p)]
+                            } else {
+                                w.panes
+                                    .iter()
+                                    .map(|p| {
+                                        expand_format(&fmt, session, Some(w), socket_path, Some(p))
+                                    })
+                                    .collect()
+                            }
+                        } else if let Some(w) = window {
+                            w.panes
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| {
+                                    let active = if i == w.active_pane { " (active)" } else { "" };
+                                    format!(
+                                        "{i}: [{}x{}] [history 0/0] %{}{active}",
+                                        p.cols, p.rows, p.id
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    None => Vec::new(),
                 };
-                let lines: Vec<String> =
-                    if let (Some(fmt), Some(w)) = (extract_format_arg(args_str), window) {
-                        vec![expand_format(&fmt, session, Some(w), socket_path)]
-                    } else if let Some(w) = window {
-                        w.panes
-                            .iter()
-                            .enumerate()
-                            .map(|(pi, p)| {
-                                let active = if pi == w.active_pane { " (active)" } else { "" };
-                                format!(
-                                    "{pi}: [{}x{}] [history 0/0] %{}{active}",
-                                    p.cols, p.rows, p.id
-                                )
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
                 let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
                 respond(client, &refs);
             }
@@ -5581,12 +5608,16 @@ fn handle_single_control_command(
                 } else {
                     super::capture::CaptureFormat::Ascii
                 });
-            let window = resolve_target(sessions, client, t.as_deref())
-                .and_then(|(si, wi)| sessions.get(si).and_then(|s| s.windows.get(wi)));
-            let text = window
-                .map(|w| {
+            let text = resolve_pane_target(sessions, client, t.as_deref())
+                .and_then(|(si, wi, pi)| {
+                    sessions
+                        .get(si)
+                        .and_then(|s| s.windows.get(wi))
+                        .and_then(|w| w.panes.get(pi))
+                })
+                .map(|p| {
                     super::capture::render_pane(
-                        w.pane(),
+                        p,
                         format,
                         colors,
                         include_scrollback,
@@ -5635,7 +5666,7 @@ fn handle_single_control_command(
                 }
             });
             if let Some(fmt) = fmt {
-                let text = expand_format(&fmt, session, window, socket_path);
+                let text = expand_format(&fmt, session, window, socket_path, None);
                 respond(client, &[&text]);
             } else {
                 respond(client, &[]);
@@ -5699,14 +5730,14 @@ fn handle_single_control_command(
         }
         "send-keys" => {
             let (keys, target_str) = parse_send_keys_args(args_str);
-            let loc = resolve_target(sessions, client, target_str.as_deref());
-            let Some((si, wi)) = loc else {
+            let loc = resolve_pane_target(sessions, client, target_str.as_deref());
+            let Some((si, wi, pi)) = loc else {
                 respond(client, &[]);
                 return false;
             };
             let window = &mut sessions[si].windows[wi];
-            if !window.pane().exited {
-                let _ = window.pane_mut().write_input(&keys);
+            if pi < window.panes.len() && !window.panes[pi].exited {
+                let _ = window.panes[pi].write_input(&keys);
             }
             respond(client, &[]);
         }
@@ -5721,13 +5752,15 @@ fn handle_single_control_command(
                         .get("t")
                         .or_else(|| parsed.get("target"))
                         .map(|s| s.to_string());
-                    if let Some((si, wi)) = resolve_target(sessions, client, target_str.as_deref())
+                    if let Some((si, wi, pi)) =
+                        resolve_pane_target(sessions, client, target_str.as_deref())
                     {
                         let window = &mut sessions[si].windows[wi];
-                        if !window.pane().exited
-                            && let Ok(data) = encode_input_events(window.pane(), &events)
+                        if pi < window.panes.len()
+                            && !window.panes[pi].exited
+                            && let Ok(data) = encode_input_events(&window.panes[pi], &events)
                         {
-                            let _ = window.pane_mut().write_input(&data);
+                            let _ = window.panes[pi].write_input(&data);
                         }
                     }
                 }
@@ -5812,7 +5845,7 @@ fn handle_single_control_command(
                 let (rows, cols) = session
                     .windows
                     .first()
-                    .map(|w| (w.pane().rows, w.pane().cols))
+                    .map(|w| (w.rows, w.cols))
                     .unwrap_or((24, 80));
                 let command = positional.join(" ");
                 // An explicit -n name is user intent — automatic-rename
@@ -5844,11 +5877,13 @@ fn handle_single_control_command(
                 win.name_locked = name_locked;
                 wid_str = win.id_str();
                 let wname = win.name.clone();
-                let layout = window_layout_str(&win);
+                let layout_notify = layout_change_notify(&win);
+                let pane_notify = window_pane_changed_notify(&win);
                 session.windows.push(win);
                 send_control_notify(client, &format!("%window-add {}", wid_str));
                 send_control_notify(client, &format!("%window-renamed {} {}", wid_str, wname));
-                send_control_notify(client, &format!("%layout-change {} {}", wid_str, layout));
+                send_control_notify(client, &layout_notify);
+                send_control_notify(client, &pane_notify);
             }
             if print && !wid_str.is_empty() {
                 let fmt = fmt.unwrap_or_else(|| "#{window_id}".to_string());
@@ -5859,13 +5894,14 @@ fn handle_single_control_command(
                         .get(si)
                         .and_then(|s| s.windows.iter().find(|w| w.id_str() == wid_str)),
                     socket_path,
+                    None,
                 );
                 respond(client, &[text.as_str()]);
             } else {
                 respond(client, &[]);
             }
         }
-        "kill-window" | "kill-pane" => {
+        "kill-window" => {
             let args = split_args_shell(args_str);
             let parsed = crate::cmd::parse_flags(&args);
             let t = parsed
@@ -5884,26 +5920,70 @@ fn handle_single_control_command(
                 && si < sessions.len()
                 && wi < sessions[si].windows.len()
             {
-                // SIGHUP the child, then remove the window.
                 let window = &mut sessions[si].windows[wi];
-                if !window.pane().exited {
-                    unsafe {
-                        libc::kill(window.pane().pty.child_pid.into(), libc::SIGHUP);
+                for p in &window.panes {
+                    if !p.exited {
+                        unsafe {
+                            libc::kill(p.pty.child_pid.into(), libc::SIGHUP);
+                        }
                     }
                 }
                 let wid = window.id_str();
                 sessions[si].windows.remove(wi);
                 send_control_notify(client, &format!("%window-close {}", wid));
-                // Fix up this client's active_window if needed.
                 if client.session_idx == si && client.active_window >= sessions[si].windows.len() {
                     client.active_window = sessions[si].windows.len().saturating_sub(1);
                 }
             }
             respond(client, &[]);
         }
-        "select-window" | "select-pane" => {
-            // Track the client's active window so send-keys, list-panes,
-            // capture-pane etc. target the pane iTerm2 is showing.
+        "kill-pane" => {
+            let args = split_args_shell(args_str);
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            let loc = resolve_pane_target(sessions, client, t.as_deref());
+            if t.is_some() && loc.is_none() {
+                control_respond_error(
+                    client,
+                    &format!("can't find pane: {}", unquote(t.as_deref().unwrap_or(""))),
+                );
+                return false;
+            }
+            if let Some((si, wi, pi)) = loc
+                && si < sessions.len()
+                && wi < sessions[si].windows.len()
+                && pi < sessions[si].windows[wi].panes.len()
+            {
+                use crate::server::window::Removed;
+                let pane_id = sessions[si].windows[wi].panes[pi].id;
+                if !sessions[si].windows[wi].panes[pi].exited {
+                    let pid = sessions[si].windows[wi].panes[pi].pty.child_pid;
+                    crate::pty::kill_child(pid, libc::SIGHUP);
+                }
+                let wid = sessions[si].windows[wi].id_str();
+                match sessions[si].windows[wi].remove_pane(pane_id) {
+                    Some(Removed::Pane) => {
+                        let w = &sessions[si].windows[wi];
+                        send_control_notify(client, &layout_change_notify(w));
+                        send_control_notify(client, &window_pane_changed_notify(w));
+                    }
+                    Some(Removed::WindowEmpty) | None => {
+                        sessions[si].windows.remove(wi);
+                        send_control_notify(client, &format!("%window-close {}", wid));
+                        if client.session_idx == si
+                            && client.active_window >= sessions[si].windows.len()
+                        {
+                            client.active_window = sessions[si].windows.len().saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            respond(client, &[]);
+        }
+        "select-window" => {
             let args: Vec<String> = args_str.split_whitespace().map(|s| s.to_string()).collect();
             let parsed = crate::cmd::parse_flags(&args);
             let t = parsed
@@ -5915,6 +5995,133 @@ fn handle_single_control_command(
                 client.active_window = wi;
             }
             respond(client, &[]);
+        }
+        "select-pane" => {
+            // Focus a pane inside its window; iTerm2 tracks via
+            // %window-pane-changed.
+            let args = split_args_shell(args_str);
+            let parsed = crate::cmd::parse_flags(&args);
+            let t = parsed
+                .get("t")
+                .or_else(|| parsed.get("target"))
+                .map(|s| s.to_string());
+            if let Some((si, wi, pi)) = resolve_pane_target(sessions, client, t.as_deref())
+                && si < sessions.len()
+                && wi < sessions[si].windows.len()
+                && pi < sessions[si].windows[wi].panes.len()
+            {
+                client.session_idx = si;
+                client.active_window = wi;
+                let pane_id = sessions[si].windows[wi].panes[pi].id;
+                sessions[si].windows[wi].focus_pane(pane_id);
+                send_control_notify(
+                    client,
+                    &window_pane_changed_notify(&sessions[si].windows[wi]),
+                );
+            }
+            respond(client, &[]);
+        }
+        "split-window" => {
+            // iTerm2: split-window -h|-v -t %N [-c path] [-P -F '#{pane_id}']
+            // tmux -h = left|right (Horizontal); -v = top/bottom (Vertical).
+            let args = split_args_shell(args_str);
+            let mut horizontal = false;
+            let mut vertical = false;
+            let mut target: Option<String> = None;
+            let mut cwd: Option<String> = None;
+            let mut fmt: Option<String> = None;
+            let mut print = false;
+            let mut positional: Vec<String> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a.starts_with('-') && a.len() > 1 && a != "-" {
+                    let mut chars = a[1..].chars().peekable();
+                    while let Some(f) = chars.next() {
+                        match f {
+                            'h' => horizontal = true,
+                            'v' => vertical = true,
+                            'd' | 'b' | 'f' | 'I' | 'l' => {}
+                            'P' => print = true,
+                            't' | 'c' | 'F' | 'e' => {
+                                let rest: String = chars.collect();
+                                let v = if !rest.is_empty() {
+                                    rest
+                                } else {
+                                    i += 1;
+                                    args.get(i).cloned().unwrap_or_default()
+                                };
+                                match f {
+                                    't' => target = Some(v),
+                                    'c' => cwd = Some(v),
+                                    'F' => fmt = Some(v),
+                                    _ => {}
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    positional.push(a.clone());
+                }
+                i += 1;
+            }
+            let dir = if horizontal && !vertical {
+                crate::layout::SplitDir::Horizontal
+            } else {
+                // Default matches tmux: vertical (top/bottom).
+                crate::layout::SplitDir::Vertical
+            };
+            let loc = resolve_pane_target(sessions, client, target.as_deref());
+            let mut new_pane_id: Option<u32> = None;
+            if let Some((si, wi, pi)) = loc
+                && si < sessions.len()
+                && wi < sessions[si].windows.len()
+                && pi < sessions[si].windows[wi].panes.len()
+            {
+                let session_id = sessions[si].id;
+                let target_pane = sessions[si].windows[wi].panes[pi].id;
+                // Prefer explicit -c; else inherit the target pane's cwd.
+                let split_cwd = cwd.or_else(|| {
+                    let p = &sessions[si].windows[wi].panes[pi];
+                    if p.exited {
+                        None
+                    } else {
+                        crate::pty::child_cwd_full(p.pty.child_pid)
+                    }
+                });
+                // Custom command: not common from iTerm2; spawn shell for now
+                // when positional command is empty (usual case).
+                let _cmd = positional.join(" ");
+                new_pane_id = sessions[si].windows[wi].split(
+                    dir,
+                    session_id,
+                    Some(target_pane),
+                    split_cwd.as_deref(),
+                );
+                if new_pane_id.is_some() {
+                    let w = &sessions[si].windows[wi];
+                    send_control_notify(client, &layout_change_notify(w));
+                    send_control_notify(client, &window_pane_changed_notify(w));
+                    // Other interactive clients viewing this window need a
+                    // fresh snapshot once TUI composite render exists; for
+                    // now status/layout is enough for -CC.
+                    *pending_status_bar = true;
+                }
+            }
+            if print {
+                if let Some(pid) = new_pane_id {
+                    let fmt = fmt.unwrap_or_else(|| "#{pane_id}".to_string());
+                    let text = fmt.replace("#{pane_id}", &format!("%{pid}"));
+                    respond(client, &[text.as_str()]);
+                } else {
+                    control_respond_error(client, "split-window failed");
+                    return false;
+                }
+            } else {
+                respond(client, &[]);
+            }
         }
         "rename-window" => {
             // rename-window [-t target] <name>. An explicit rename locks
@@ -6080,14 +6287,24 @@ fn unquote(s: &str) -> &str {
 }
 
 /// Resolve a tmux -t target to (session_idx, window_idx).
-/// "%N" = pane id (searched across sessions), "@N" = window id,
-/// "$N" = session id, "name"/"name:idx"/"idx" = session/window.
-/// None = the client's current session and active window.
+/// Pane ids (`%N`) resolve to the containing window (active pane unchanged).
+/// Prefer [`resolve_pane_target`] when the specific pane matters.
 fn resolve_target(
     sessions: &[Session],
     client: &ClientConn,
     target: Option<&str>,
 ) -> Option<(usize, usize)> {
+    resolve_pane_target(sessions, client, target).map(|(si, wi, _)| (si, wi))
+}
+
+/// Resolve a tmux -t target to (session_idx, window_idx, pane_idx).
+/// "%N" = exact pane; "@N"/session forms use that window's active pane;
+/// empty = client's session + active window + that window's active pane.
+fn resolve_pane_target(
+    sessions: &[Session],
+    client: &ClientConn,
+    target: Option<&str>,
+) -> Option<(usize, usize, usize)> {
     let t = unquote(target.unwrap_or(""));
     if t.is_empty() {
         let si = client.session_idx;
@@ -6097,40 +6314,50 @@ fn resolve_target(
                 .map(|s| s.windows.len().saturating_sub(1))
                 .unwrap_or(0),
         );
-        return Some((si, wi));
+        let pi = sessions.get(si)?.windows.get(wi)?.active_pane;
+        return Some((si, wi, pi));
     }
     if let Some(pid) = t.strip_prefix('%') {
-        // Pane id: find the window containing it.
         let pid = pid.parse::<u32>().ok()?;
-        for (si, s) in sessions.iter().enumerate() {
-            for (wi, w) in s.windows.iter().enumerate() {
-                if w.pane_index_by_id(pid).is_some() {
-                    return Some((si, wi));
-                }
-            }
-        }
-        return None;
+        return find_pane_by_id(sessions, pid);
     }
     if t.starts_with('@') {
         for (si, s) in sessions.iter().enumerate() {
             if let Some(wi) = find_window(s, &Some(t.to_string())) {
-                return Some((si, wi));
+                let pi = s.windows[wi].active_pane;
+                return Some((si, wi, pi));
             }
         }
         return None;
     }
     if t.starts_with('$') {
-        // Session id: its first window.
         let si = resolve_session_target(sessions, client, Some(t))?;
         if sessions[si].windows.is_empty() {
             return None;
         }
-        return Some((si, 0));
+        let pi = sessions[si].windows[0].active_pane;
+        return Some((si, 0, pi));
     }
     let parsed = crate::cmd::Target::parse(t);
     let si = find_session(sessions, &parsed.session).or(Some(client.session_idx))?;
     let wi = find_window(&sessions[si], &parsed.window)?;
-    Some((si, wi))
+    let pi = sessions[si].windows[wi].active_pane;
+    Some((si, wi, pi))
+}
+
+/// `%layout-change` notification in the form iTerm2 expects:
+/// `%layout-change window-id layout visible-layout flags`
+fn layout_change_notify(window: &Window) -> String {
+    let layout = window.layout_str();
+    format!("%layout-change {} {} {} *", window.id_str(), layout, layout)
+}
+
+fn window_pane_changed_notify(window: &Window) -> String {
+    format!(
+        "%window-pane-changed {} %{}",
+        window.id_str(),
+        window.pane().id
+    )
 }
 
 #[cfg(test)]
