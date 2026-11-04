@@ -1,5 +1,6 @@
 // Client process: raw mode, input relay, prefix detection, output render.
 
+pub mod composite;
 pub mod control;
 pub mod copy_mode;
 mod input_filter;
@@ -294,8 +295,8 @@ pub fn run(
     report_outer_term_palette(&mut stream, &mut probe_leftover, &mut osc_probe)?;
     input_filter.inject(&probe_leftover);
 
-    // Create the local grid + renderer.
-    let mut grid = Grid::new(grid_rows, grid_cols, 10_000);
+    // Create the local window view (composite grid + per-pane state) + renderer.
+    let mut grid = composite::WindowView::single(grid_rows, grid_cols);
     let mut renderer = render::Renderer::new(grid_rows, grid_cols);
 
     // Track the actual terminal size (including status bar row).
@@ -1171,34 +1172,71 @@ pub fn run(
                 let mut needs_render = false;
                 while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
                     match msg {
-                        ServerMsg::ScrollbackUpdate { rows, replay } => {
-                            // Push to internal scrollback (for copy mode).
-                            let n = rows.len();
+                        ServerMsg::WindowLayout {
+                            rows,
+                            cols,
+                            active_pane,
+                            panes,
+                        } => {
                             client_trace_msg(
                                 "EVT",
                                 &format!(
-                                    "scrollback +{n}rows replay={replay} total={}",
-                                    grid.scrollback.len() + n
+                                    "layout {rows}x{cols} panes={} active=%{active_pane}",
+                                    panes.len()
                                 ),
                             );
-                            for row in rows {
-                                grid.scrollback.push(row);
+                            grid.apply_layout(rows, cols, active_pane, &panes);
+                            renderer.resize(grid.win_rows, grid.win_cols);
+                            update_viewport(
+                                &mut renderer,
+                                term_rows,
+                                term_cols,
+                                grid.win_rows,
+                                grid.win_cols,
+                            );
+                            renderer.invalidate();
+                            let mut stdout = client_stdout();
+                            let view_rows = term_rows.saturating_sub(1);
+                            if grid.pane_count() > 1 {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H")?;
+                            } else {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
                             }
-                            // Scroll the terminal to push content into the
-                            // terminal's native scrollback buffer — but only
-                            // for live scroll. Replay chunks (history after a
-                            // GridSnapshot) would scroll the just-rendered
-                            // content off screen, leaving it blank. The same
-                            // applies while in copy mode: the scroll would
-                            // push the viewed rows away.
-                            if n > 0 && copy_mode.is_none() && !replay {
+                            renderer.render(&mut stdout, &mut grid.composite)?;
+                            render_filler(
+                                &mut stdout,
+                                grid.win_rows,
+                                grid.win_cols,
+                                term_rows,
+                                term_cols,
+                            )?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid.composite,
+                                mouse_reporting_on(applied_mouse),
+                            )?;
+                            stdout.flush()?;
+                            needs_render = false;
+                        }
+                        ServerMsg::ScrollbackUpdate {
+                            rows,
+                            replay,
+                            pane_id,
+                        } => {
+                            let n = rows.len();
+                            client_trace_msg(
+                                "EVT",
+                                &format!("scrollback +{n}rows replay={replay} pane={pane_id:?}"),
+                            );
+                            grid.push_scrollback(pane_id, rows);
+                            // Host CSI S only for live single-pane output.
+                            if n > 0 && copy_mode.is_none() && !replay && grid.pane_count() <= 1 {
                                 let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
-                                // The terminal shifted all content up by n lines.
-                                // Mark all rows dirty so the renderer rewrites them
-                                // at their correct positions (the GridUpdate that
-                                // follows will render them).
                                 grid.mark_all_dirty();
                                 renderer.invalidate();
                             }
@@ -1209,18 +1247,20 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                             mouse_flags,
+                            pane_id,
                         } => {
-                            for (row, cells) in &dirty {
-                                apply_row(&mut grid, *row as usize, cells);
-                            }
-                            grid.cursor_row = cursor_row as usize;
-                            grid.cursor_col = cursor_col as usize;
-                            grid.cursor_visible = cursor_visible;
-                            grid.set_mouse_flags(mouse_flags);
+                            grid.apply_pane_update(
+                                pane_id,
+                                &dirty,
+                                cursor_row,
+                                cursor_col,
+                                cursor_visible,
+                                mouse_flags,
+                            );
                             client_trace_msg(
                                 "EVT",
                                 &format!(
-                                    "grid-update dirty={}rows cur={cursor_row};{cursor_col} vis={cursor_visible}",
+                                    "grid-update pane={pane_id:?} dirty={}rows cur={cursor_row};{cursor_col}",
                                     dirty.len()
                                 ),
                             );
@@ -1234,49 +1274,46 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                             mouse_flags,
+                            pane_id,
                         } => {
-                            grid = Grid::new(rows as usize, cols as usize, 10_000);
-                            grid.mark_all_dirty();
-                            renderer.resize(rows as usize, cols as usize);
+                            grid.apply_pane_snapshot(
+                                pane_id,
+                                rows,
+                                cols,
+                                &cells,
+                                cursor_row,
+                                cursor_col,
+                                cursor_visible,
+                                mouse_flags,
+                            );
+                            renderer.resize(grid.win_rows, grid.win_cols);
                             update_viewport(
                                 &mut renderer,
                                 term_rows,
                                 term_cols,
-                                rows as usize,
-                                cols as usize,
+                                grid.win_rows,
+                                grid.win_cols,
                             );
                             renderer.invalidate();
-                            let cols = cols as usize;
-                            for (i, cell) in cells.iter().enumerate() {
-                                let row = i / cols;
-                                let col = i % cols;
-                                if row < grid.rows()
-                                    && let Some(r) = grid.row_mut(row)
-                                    && col < r.len()
-                                {
-                                    r[col] = cell.clone();
-                                }
-                            }
-                            grid.cursor_row = cursor_row as usize;
-                            grid.cursor_col = cursor_col as usize;
-                            grid.cursor_visible = cursor_visible;
-                            grid.set_mouse_flags(mouse_flags);
                             client_trace_msg(
                                 "EVT",
-                                &format!("snapshot {rows}x{cols} cur={cursor_row};{cursor_col}"),
+                                &format!(
+                                    "snapshot pane={pane_id:?} {rows}x{cols} win={}x{} cur={cursor_row};{cursor_col}",
+                                    grid.win_rows, grid.win_cols
+                                ),
                             );
                             let mut stdout = client_stdout();
-                            // Reset scroll region to full screen, clear, then
-                            // re-establish the scroll region. This ensures the
-                            // clear affects the entire screen and the terminal
-                            // viewport is in a clean state before rendering.
                             let view_rows = term_rows.saturating_sub(1);
-                            write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
-                            renderer.render(&mut stdout, &mut grid)?;
+                            if grid.pane_count() > 1 {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H")?;
+                            } else {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
+                            }
+                            renderer.render(&mut stdout, &mut grid.composite)?;
                             render_filler(
                                 &mut stdout,
-                                grid.rows(),
-                                grid.cols(),
+                                grid.win_rows,
+                                grid.win_cols,
                                 term_rows,
                                 term_cols,
                             )?;
@@ -1285,9 +1322,11 @@ pub fn run(
                                 &status_text,
                                 term_rows,
                                 term_cols,
-                                &grid,
+                                &grid.composite,
                                 mouse_reporting_on(applied_mouse),
                             )?;
+                            stdout.flush()?;
+                            needs_render = false;
                         }
                         ServerMsg::StatusBarUpdate {
                             session,
@@ -1732,6 +1771,22 @@ fn process_prefix(
                     b'F' => {
                         let (r, c) = terminal::get_size();
                         send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
+                    }
+                    // '-' → split with horizontal divider (panes top/bottom).
+                    b'-' => {
+                        send_cmd(stream, &ClientMsg::SplitPane { dir: 0 })?;
+                    }
+                    // '|' → split with vertical divider (panes left/right).
+                    b'|' => {
+                        send_cmd(stream, &ClientMsg::SplitPane { dir: 1 })?;
+                    }
+                    // 'o' → focus next pane.
+                    b'o' => {
+                        send_cmd(stream, &ClientMsg::FocusNext)?;
+                    }
+                    // ';' → focus previous pane.
+                    b';' => {
+                        send_cmd(stream, &ClientMsg::FocusPrev)?;
                     }
                     // 'm' → cycle the mouse-reporting override
                     // (auto → forced on → forced off → auto).
@@ -2728,6 +2783,10 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A K", "Kill session (confirm)"),
         ("Ctrl-A x", "Kill pane/window"),
         ("Ctrl-A k", "Kill pane (confirm)"),
+        ("Ctrl-A -", "Split top/bottom"),
+        ("Ctrl-A |", "Split left/right"),
+        ("Ctrl-A o", "Next pane"),
+        ("Ctrl-A ;", "Previous pane"),
         ("Ctrl-A [", "Enter copy mode"),
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),

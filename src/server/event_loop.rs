@@ -1430,6 +1430,102 @@ pub fn run(
                                                 need_status_bar_all = true;
                                             }
                                         }
+                                        ClientMsg::SplitPane { dir } => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                            {
+                                                let split_dir = if dir == 1 {
+                                                    crate::layout::SplitDir::Horizontal
+                                                } else {
+                                                    crate::layout::SplitDir::Vertical
+                                                };
+                                                let session_id = sessions[si].id;
+                                                let cwd = {
+                                                    let p = sessions[si].windows[wi].pane();
+                                                    if p.exited {
+                                                        None
+                                                    } else {
+                                                        crate::pty::child_cwd_full(p.pty.child_pid)
+                                                    }
+                                                };
+                                                if sessions[si].windows[wi]
+                                                    .split(
+                                                        split_dir,
+                                                        session_id,
+                                                        None,
+                                                        cwd.as_deref(),
+                                                    )
+                                                    .is_some()
+                                                {
+                                                    // Control clients get layout notifies.
+                                                    let w = &sessions[si].windows[wi];
+                                                    broadcast_control_notify(
+                                                        &mut clients,
+                                                        &layout_change_notify(w),
+                                                    );
+                                                    broadcast_control_notify(
+                                                        &mut clients,
+                                                        &window_pane_changed_notify(w),
+                                                    );
+                                                    resync_window_viewers(
+                                                        &mut clients,
+                                                        &sessions,
+                                                        si,
+                                                        wi,
+                                                        &mut need_snapshot,
+                                                    );
+                                                    // Also resync other windows' viewers?
+                                                    // Only this window changed.
+                                                    need_status_bar_all = true;
+                                                }
+                                            }
+                                        }
+                                        ClientMsg::FocusNext => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].panes.len() > 1
+                                            {
+                                                sessions[si].windows[wi].focus_next();
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                            }
+                                        }
+                                        ClientMsg::FocusPrev => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].panes.len() > 1
+                                            {
+                                                sessions[si].windows[wi].focus_prev();
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                            }
+                                        }
                                         ClientMsg::Identify { .. } => {}
                                         ClientMsg::ListSessions => {
                                             let list = build_session_list(&sessions, &clients);
@@ -2593,7 +2689,7 @@ fn send_status_bar_to_client(client: &mut ClientConn, sessions: &[Session]) {
     let _ = client_send(client, &msg);
 }
 
-/// Send a full grid snapshot of a client's active window to that client.
+/// Send window layout + per-pane grid snapshots (+ scrollback) to a client.
 fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io::Result<()> {
     let si = client.session_idx;
     let aw = client.active_window;
@@ -2604,38 +2700,80 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     if si >= sessions.len() || aw >= sessions[si].windows.len() {
         return Ok(());
     }
-    let pane = sessions[si].windows[aw].pane();
-    let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-
-    // Send the grid snapshot first (client creates a fresh grid).
-    let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-        rows: pane.rows,
-        cols: pane.cols,
-        cells: pane.snapshot(),
-        cursor_row,
-        cursor_col,
-        cursor_visible,
-        mouse_flags: pane.grid.mouse_flags(),
-    });
-    if !client_send(client, &snapshot) {
+    let window = &sessions[si].windows[aw];
+    if !send_window_layout(client, window) {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "client gone",
         ));
     }
-
-    // Then send scrollback so the client can populate the fresh grid's
-    // history. Chunk it and pace against outbuf — a full 10k-row buffer at
-    // wide sizes encodes to tens of MB. Prefer recent history when the
-    // budget can't fit everything (oldest rows are dropped first).
-    let sb_rows = pane.scrollback_rows();
-    if !sb_rows.is_empty() && !send_scrollback_replay_paced(client, &sb_rows) {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "client gone",
-        ));
+    // Snapshot every pane so the client can composite. Active pane last
+    // so its cursor/mouse flags win if anything races.
+    let mut order: Vec<usize> = (0..window.panes.len()).collect();
+    if let Some(pos) = order.iter().position(|&i| i == window.active_pane) {
+        let last = order.remove(pos);
+        order.push(last);
+    }
+    for &pi in &order {
+        let pane = &window.panes[pi];
+        let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+        let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
+            rows: pane.rows,
+            cols: pane.cols,
+            cells: pane.snapshot(),
+            cursor_row,
+            cursor_col,
+            cursor_visible,
+            mouse_flags: pane.grid.mouse_flags(),
+            pane_id: Some(pane.id),
+        });
+        if !client_send(client, &snapshot) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "client gone",
+            ));
+        }
+        let sb_rows = pane.scrollback_rows();
+        if !sb_rows.is_empty() && !send_scrollback_replay_paced(client, &sb_rows, Some(pane.id)) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "client gone",
+            ));
+        }
     }
     Ok(())
+}
+
+/// Encode and send `WindowLayout` for an interactive client.
+fn send_window_layout(client: &mut ClientConn, window: &Window) -> bool {
+    let msg = proto::encode_server(&ServerMsg::WindowLayout {
+        rows: window.rows,
+        cols: window.cols,
+        active_pane: window.active_pane_id(),
+        panes: window.pane_rects(),
+    });
+    client_send(client, &msg)
+}
+
+/// Notify every interactive client viewing `(si, wi)` with a fresh
+/// layout + snapshots (after split / focus / kill-pane).
+fn resync_window_viewers(
+    clients: &mut [ClientConn],
+    _sessions: &[Session],
+    si: usize,
+    wi: usize,
+    need_snapshot: &mut Vec<usize>,
+) {
+    for (ci, c) in clients.iter().enumerate() {
+        if c.attach
+            && !c.is_control
+            && c.session_idx == si
+            && c.active_window == wi
+            && !need_snapshot.contains(&ci)
+        {
+            need_snapshot.push(ci);
+        }
+    }
 }
 
 /// Best-effort scrollback replay that never pushes a client to the hard
@@ -2644,6 +2782,7 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
 fn send_scrollback_replay_paced(
     client: &mut ClientConn,
     sb_rows: &[Vec<crate::grid::Cell>],
+    pane_id: Option<u32>,
 ) -> bool {
     // When already behind (typical after burst resync), prefer the newest
     // rows that fit under CLIENT_SUPPRESS_HIGH. Quiet attaches start at 0
@@ -2672,6 +2811,7 @@ fn send_scrollback_replay_paced(
         let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate {
             rows: chunk.to_vec(),
             replay: true,
+            pane_id,
         });
         // Stop if the client isn't draining — don't climb toward the hard cap.
         if client.outbuf.len() > CLIENT_SUPPRESS_HIGH
@@ -2821,10 +2961,18 @@ fn handshake_first_client(
     });
     proto::send(&mut client, &ack)?;
 
-    // Full GridSnapshot (same path as NewWindow / window switch) so the
+    // Layout + GridSnapshot (same path as NewWindow / window switch) so the
     // client resets its outer scroll region and renderer — a bare
     // GridUpdate left the first pane looking "cursed" vs Ctrl-A c.
+    let layout_msg = proto::encode_server(&ServerMsg::WindowLayout {
+        rows: window.rows,
+        cols: window.cols,
+        active_pane: window.active_pane_id(),
+        panes: window.pane_rects(),
+    });
+    proto::send(&mut client, &layout_msg)?;
     let (cursor_row, cursor_col, cursor_visible) = window.pane().cursor();
+    let pane_id = window.pane().id;
     let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
         rows: window.pane().rows,
         cols: window.pane().cols,
@@ -2833,6 +2981,7 @@ fn handshake_first_client(
         cursor_col,
         cursor_visible,
         mouse_flags: window.pane().grid.mouse_flags(),
+        pane_id: Some(pane_id),
     });
     proto::send(&mut client, &snapshot)?;
     let _ = window.pane_mut().take_dirty_rows(); // snapshot already has full state
@@ -3572,11 +3721,13 @@ fn send_grid_update_to_window_viewers(
     // burst that scrolls thousands of lines at once would otherwise build
     // a single frame larger than the client outbuf cap and get the client
     // disconnected.
+    let pane_id = pane.id;
     let scrolled = pane.take_pending_scrollback();
     for chunk in scrolled.chunks(500) {
         let sb_msg = proto::encode_server(&ServerMsg::ScrollbackUpdate {
             rows: chunk.to_vec(),
             replay: false,
+            pane_id: Some(pane_id),
         });
         let mut i = 0;
         while i < clients.len() {
@@ -3610,6 +3761,7 @@ fn send_grid_update_to_window_viewers(
         cursor_col,
         cursor_visible,
         mouse_flags: pane.grid.mouse_flags(),
+        pane_id: Some(pane_id),
     });
     let mut i = 0;
     while i < clients.len() {
@@ -3660,6 +3812,7 @@ fn send_grid_update<W: Write>(
         cursor_col,
         cursor_visible,
         mouse_flags: pane.grid.mouse_flags(),
+        pane_id: Some(pane.id),
     });
     proto::send(writer, &msg)
 }

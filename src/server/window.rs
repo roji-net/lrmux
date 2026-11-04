@@ -117,6 +117,26 @@ impl Window {
         self.layout.to_tmux_str(self.cols, self.rows)
     }
 
+    /// Pane rectangles from the current layout (for client composite).
+    pub fn pane_rects(&self) -> Vec<crate::proto::PaneRect> {
+        self.layout
+            .reflow(self.cols, self.rows)
+            .into_iter()
+            .map(|(pane_id, r)| crate::proto::PaneRect {
+                pane_id,
+                x: r.x,
+                y: r.y,
+                cols: r.cols,
+                rows: r.rows,
+            })
+            .collect()
+    }
+
+    /// Active pane id (or 0 if empty).
+    pub fn active_pane_id(&self) -> u32 {
+        self.pane().id
+    }
+
     /// Focus the next pane (wrap). Returns the new active pane id.
     pub fn focus_next(&mut self) -> u32 {
         if self.panes.is_empty() {
