@@ -61,8 +61,8 @@ enum PrefixState {
 enum ConfirmState {
     /// No confirmation active.
     None,
-    /// "Kill current window? (y/n)" — waiting for a single keypress.
-    KillWindow,
+    /// "Kill this pane? (y/n)" — waiting for a single keypress.
+    KillPane,
     /// "Type session name to confirm kill:" — waiting for text input + Enter.
     KillSession {
         input: String,
@@ -1742,13 +1742,9 @@ fn process_prefix(
                             detach = true;
                             to_selector = true;
                         }
-                        // 'x' → kill pane (no confirmation, immediate).
-                        b'x' => {
-                            send_cmd(stream, &ClientMsg::KillPane)?;
-                        }
-                        // 'k' → kill current window (with y/n confirmation).
-                        b'k' => {
-                            confirm = Some(ConfirmState::KillWindow);
+                        // 'x' / 'k' → kill pane (y/n confirmation, tmux-style).
+                        b'x' | b'k' => {
+                            confirm = Some(ConfirmState::KillPane);
                         }
                         // 'K' → kill current session (type name to confirm).
                         b'K' => {
@@ -1899,7 +1895,7 @@ fn process_confirm(
 ) -> io::Result<ConfirmAction> {
     match state {
         ConfirmState::None => Ok(ConfirmAction::Cancelled),
-        ConfirmState::KillWindow => {
+        ConfirmState::KillPane => {
             // Single-key confirmation: y = kill, anything else = cancel.
             match input.first() {
                 Some(b'y' | b'Y') => {
@@ -2038,7 +2034,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
     write!(stdout, "\x1b[?7l\x1b[0m\x1b[{};1H\x1b[2K", row).ok();
     let text = match state {
         ConfirmState::None => String::new(),
-        ConfirmState::KillWindow => "\x1b[0;43;30m Kill current window? (y/n) \x1b[0m".to_string(),
+        ConfirmState::KillPane => "\x1b[0;43;30m Kill this pane? (y/n) \x1b[0m".to_string(),
         ConfirmState::KillSession {
             input,
             target,
@@ -2811,8 +2807,7 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A P", "Previous session"),
         ("Ctrl-A $", "Rename session"),
         ("Ctrl-A K", "Kill session (confirm)"),
-        ("Ctrl-A x", "Kill pane/window"),
-        ("Ctrl-A k", "Kill pane (confirm)"),
+        ("Ctrl-A x / k", "Kill pane (confirm y/n)"),
         ("Ctrl-A -", "Split top/bottom"),
         ("Ctrl-A |", "Split left/right"),
         ("Ctrl-A ←↑↓→", "Focus pane in direction"),
