@@ -38,15 +38,17 @@ pub fn save_state(socket_path: &Path, sessions: &[Session]) {
     for session in sessions {
         content.push_str(&format!("[session:{}]\n", session.name));
         for w in &session.windows {
-            let pid = w.pane.pty.child_pid.as_raw();
-            let exited = w.pane.exited;
-            let cwd = crate::pty::child_cwd_full(w.pane.pty.child_pid)
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let status = if exited { "exited" } else { "running" };
-            content.push_str(&format!(
-                "  window name={} pid={} status={} cwd={}\n",
-                w.name, pid, status, cwd
-            ));
+            for p in &w.panes {
+                let pid = p.pty.child_pid.as_raw();
+                let exited = p.exited;
+                let cwd = crate::pty::child_cwd_full(p.pty.child_pid)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let status = if exited { "exited" } else { "running" };
+                content.push_str(&format!(
+                    "  window name={} pane=%{} pid={} status={} cwd={}\n",
+                    w.name, p.id, pid, status, cwd
+                ));
+            }
         }
     }
     let tmp = path.with_extension("state.tmp");
