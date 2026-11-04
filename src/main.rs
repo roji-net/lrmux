@@ -1001,6 +1001,16 @@ fn run() -> io::Result<()> {
                 );
                 return Ok(());
             }
+            // Nested -CC would emit DCS into the outer control stream /
+            // pane and hang waiting for iTerm2. Refuse before silencing
+            // stderr in run_control_mode.
+            CliAction::ControlMode { .. } => {
+                eprintln!(
+                    "lrmux: cannot use -CC / attach -CC from inside lrmux; \
+                     detach first (or run it from a normal iTerm2 tab)"
+                );
+                return Ok(());
+            }
             // Non-interactive subcommands pass through.
             _ => {}
         }
@@ -1567,6 +1577,15 @@ fn start_manager(name: &str, tcp_addr: Option<&str>) -> io::Result<()> {
 /// With no `-t`, resolve like other CLI commands; auto-start a headless
 /// CWD-named server only when no local servers are running.
 fn run_control_mode(target: Option<&str>) -> io::Result<()> {
+    // Nested panes export LRMUX=1. Starting -CC there emits DCS into the
+    // outer session and hangs; refuse before we silence stderr.
+    if std::env::var_os("LRMUX").is_some() {
+        return Err(io::Error::other(
+            "cannot use -CC / attach -CC from inside lrmux; detach first \
+             (or run it from a normal iTerm2 tab)",
+        ));
+    }
+
     // Resolve the target and validate the server before silencing stderr,
     // so that real errors (unknown server) are still visible to the user.
     let server = resolve_control_target(target)?;

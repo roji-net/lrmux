@@ -70,6 +70,15 @@ impl CcDebug {
 /// 5. Read tmux-style commands from stdin and send them to the server.
 /// 6. On %exit or server disconnect, emit `%exit` and exit.
 pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
+    // Nested lrmux panes export LRMUX=1. Emitting DCS here would hijack
+    // the outer -CC / TUI stream and hang; refuse early with a visible error.
+    if std::env::var_os("LRMUX").is_some() {
+        return Err(io::Error::other(
+            "cannot use -CC / attach -CC from inside lrmux; detach first \
+             (or run it from a normal iTerm2 tab)",
+        ));
+    }
+
     let mut stream = ipc::connect_any(socket_path)?;
 
     // Get terminal size (default to 24x80 if not available).
