@@ -178,6 +178,25 @@ pub enum ClientMsg {
     /// target through it. Requires an authenticated connection and
     /// relay enabled on the node.
     RelayOpen { addr: String },
+    /// Split the active pane. `dir`: 0 = top/bottom (`SplitDir::Vertical`),
+    /// 1 = left/right (`SplitDir::Horizontal`).
+    SplitPane { dir: u8 },
+    /// Focus the next pane in the active window (wrap).
+    FocusNext,
+    /// Focus the previous pane in the active window (wrap).
+    FocusPrev,
+    /// Focus the adjacent pane. `dir`: 0=up, 1=down, 2=left, 3=right.
+    FocusDir { dir: u8 },
+}
+
+/// Geometry of one pane inside a window (cells, origin top-left).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneRect {
+    pub pane_id: u32,
+    pub x: u16,
+    pub y: u16,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Server → Client messages.
@@ -191,6 +210,7 @@ pub enum ServerMsg {
         address: String,
     },
     /// Full grid snapshot (sent on first connect, window switch, or after resize).
+    /// With multi-pane, one snapshot is sent per pane after [`WindowLayout`].
     GridSnapshot {
         rows: u16,
         cols: u16,
@@ -201,6 +221,9 @@ pub enum ServerMsg {
         /// Packed mouse state (`Grid::mouse_flags`). Missing on messages
         /// from an older server (pre-mouse): decode as 0.
         mouse_flags: u8,
+        /// Pane this snapshot belongs to. `None` = legacy single-pane
+        /// (entire window). Present on multi-pane-capable servers.
+        pane_id: Option<u32>,
     },
     /// Dirty rows update (sent after PTY output is parsed into the grid).
     GridUpdate {
@@ -211,6 +234,8 @@ pub enum ServerMsg {
         /// Packed mouse state (`Grid::mouse_flags`). Missing on messages
         /// from an older server: decode as 0.
         mouse_flags: u8,
+        /// Pane this update belongs to. `None` = legacy / sole pane.
+        pane_id: Option<u32>,
     },
     /// Scrollback rows that scrolled off the top since the last update.
     /// Sent before GridUpdate so the client can push them to scrollback.
@@ -220,6 +245,17 @@ pub enum ServerMsg {
         /// switch / attach); false for live scroll lines. The client uses
         /// it to decide whether to scroll the host terminal.
         replay: bool,
+        /// Pane this history belongs to. `None` = legacy / sole pane.
+        pane_id: Option<u32>,
+    },
+    /// Window geometry + per-pane rectangles + focused pane.
+    /// Sent before a burst of per-pane [`GridSnapshot`]s whenever the
+    /// layout or focus changes.
+    WindowLayout {
+        rows: u16,
+        cols: u16,
+        active_pane: u32,
+        panes: Vec<PaneRect>,
     },
     /// Child process exited.
     PaneExit { code: u8 },
@@ -332,6 +368,10 @@ const C_LIST_PEERS: u8 = 0x1c;
 const C_REGISTER: u8 = 0x1d;
 const C_RELAY_OPEN: u8 = 0x1e;
 const C_SEND_EVENT: u8 = 0x1f;
+const C_SPLIT_PANE: u8 = 0x20;
+const C_FOCUS_NEXT: u8 = 0x21;
+const C_FOCUS_PREV: u8 = 0x22;
+const C_FOCUS_DIR: u8 = 0x23;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -351,6 +391,7 @@ const S_REGISTER_ACK: u8 = 0x1e;
 const S_RELAY_ACK: u8 = 0x1f;
 const S_SEND_KEYS_ACK: u8 = 0x20;
 const S_SEND_EVENT_ACK: u8 = 0x21;
+const S_WINDOW_LAYOUT: u8 = 0x22;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -654,6 +695,20 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.extend_from_slice(&(addr.len() as u32).to_le_bytes());
             payload.extend_from_slice(addr.as_bytes());
         }
+        ClientMsg::SplitPane { dir } => {
+            payload.push(C_SPLIT_PANE);
+            payload.push(*dir);
+        }
+        ClientMsg::FocusNext => {
+            payload.push(C_FOCUS_NEXT);
+        }
+        ClientMsg::FocusPrev => {
+            payload.push(C_FOCUS_PREV);
+        }
+        ClientMsg::FocusDir { dir } => {
+            payload.push(C_FOCUS_DIR);
+            payload.push(*dir);
+        }
     }
     frame(payload)
 }
@@ -684,6 +739,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             cursor_col,
             cursor_visible,
             mouse_flags,
+            pane_id,
         } => {
             payload.push(S_GRID_SNAPSHOT);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -696,6 +752,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
             payload.push(*mouse_flags);
+            if let Some(pid) = pane_id {
+                payload.extend_from_slice(&pid.to_le_bytes());
+            }
         }
         ServerMsg::GridUpdate {
             dirty,
@@ -703,6 +762,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             cursor_col,
             cursor_visible,
             mouse_flags,
+            pane_id,
         } => {
             payload.push(S_GRID_UPDATE);
             payload.extend_from_slice(&(dirty.len() as u32).to_le_bytes());
@@ -717,8 +777,15 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&cursor_col.to_le_bytes());
             payload.push(*cursor_visible as u8);
             payload.push(*mouse_flags);
+            if let Some(pid) = pane_id {
+                payload.extend_from_slice(&pid.to_le_bytes());
+            }
         }
-        ServerMsg::ScrollbackUpdate { rows, replay } => {
+        ServerMsg::ScrollbackUpdate {
+            rows,
+            replay,
+            pane_id,
+        } => {
             payload.push(S_SCROLLBACK_UPDATE);
             payload.push(*replay as u8);
             payload.extend_from_slice(&(rows.len() as u32).to_le_bytes());
@@ -727,6 +794,28 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 for cell in row {
                     encode_cell(&mut payload, cell);
                 }
+            }
+            if let Some(pid) = pane_id {
+                payload.extend_from_slice(&pid.to_le_bytes());
+            }
+        }
+        ServerMsg::WindowLayout {
+            rows,
+            cols,
+            active_pane,
+            panes,
+        } => {
+            payload.push(S_WINDOW_LAYOUT);
+            payload.extend_from_slice(&rows.to_le_bytes());
+            payload.extend_from_slice(&cols.to_le_bytes());
+            payload.extend_from_slice(&active_pane.to_le_bytes());
+            payload.extend_from_slice(&(panes.len() as u32).to_le_bytes());
+            for p in panes {
+                payload.extend_from_slice(&p.pane_id.to_le_bytes());
+                payload.extend_from_slice(&p.x.to_le_bytes());
+                payload.extend_from_slice(&p.y.to_le_bytes());
+                payload.extend_from_slice(&p.cols.to_le_bytes());
+                payload.extend_from_slice(&p.rows.to_le_bytes());
             }
         }
         ServerMsg::PaneExit { code } => {
@@ -1269,6 +1358,16 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
             let addr = read_len_string(&mut r)?;
             Ok(ClientMsg::RelayOpen { addr })
         }
+        C_SPLIT_PANE => {
+            let dir = read_u8(&mut r)?;
+            Ok(ClientMsg::SplitPane { dir })
+        }
+        C_FOCUS_NEXT => Ok(ClientMsg::FocusNext),
+        C_FOCUS_PREV => Ok(ClientMsg::FocusPrev),
+        C_FOCUS_DIR => {
+            let dir = read_u8(&mut r)?;
+            Ok(ClientMsg::FocusDir { dir })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -1316,8 +1415,13 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let cursor_row = read_u16(&mut r)?;
             let cursor_col = read_u16(&mut r)?;
             let cursor_visible = read_u8(&mut r)? != 0;
-            // Trailing field — absent on pre-mouse servers.
+            // Trailing fields — absent on older servers.
             let mouse_flags = if r.is_empty() { 0 } else { read_u8(&mut r)? };
+            let pane_id = if r.len() >= 4 {
+                Some(read_u32(&mut r)?)
+            } else {
+                None
+            };
             Ok(ServerMsg::GridSnapshot {
                 rows,
                 cols,
@@ -1326,6 +1430,7 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 cursor_col,
                 cursor_visible,
                 mouse_flags,
+                pane_id,
             })
         }
         S_GRID_UPDATE => {
@@ -1343,14 +1448,20 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let cursor_row = read_u16(&mut r)?;
             let cursor_col = read_u16(&mut r)?;
             let cursor_visible = read_u8(&mut r)? != 0;
-            // Trailing field — absent on pre-mouse servers.
+            // Trailing fields — absent on older servers.
             let mouse_flags = if r.is_empty() { 0 } else { read_u8(&mut r)? };
+            let pane_id = if r.len() >= 4 {
+                Some(read_u32(&mut r)?)
+            } else {
+                None
+            };
             Ok(ServerMsg::GridUpdate {
                 dirty,
                 cursor_row,
                 cursor_col,
                 cursor_visible,
                 mouse_flags,
+                pane_id,
             })
         }
         S_SCROLLBACK_UPDATE => {
@@ -1365,7 +1476,38 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 }
                 rows.push(row);
             }
-            Ok(ServerMsg::ScrollbackUpdate { rows, replay })
+            let pane_id = if r.len() >= 4 {
+                Some(read_u32(&mut r)?)
+            } else {
+                None
+            };
+            Ok(ServerMsg::ScrollbackUpdate {
+                rows,
+                replay,
+                pane_id,
+            })
+        }
+        S_WINDOW_LAYOUT => {
+            let rows = read_u16(&mut r)?;
+            let cols = read_u16(&mut r)?;
+            let active_pane = read_u32(&mut r)?;
+            let count = read_u32(&mut r)? as usize;
+            let mut panes = Vec::with_capacity(count);
+            for _ in 0..count {
+                panes.push(PaneRect {
+                    pane_id: read_u32(&mut r)?,
+                    x: read_u16(&mut r)?,
+                    y: read_u16(&mut r)?,
+                    cols: read_u16(&mut r)?,
+                    rows: read_u16(&mut r)?,
+                });
+            }
+            Ok(ServerMsg::WindowLayout {
+                rows,
+                cols,
+                active_pane,
+                panes,
+            })
         }
         S_PANE_EXIT => {
             let code = read_u8(&mut r)?;
@@ -1953,9 +2095,17 @@ mod tests {
             cursor_col: 2,
             cursor_visible: true,
             mouse_flags: 0x4e, // tracking 1002|1003, SGR fmt, altscroll, app cur
+            pane_id: Some(7),
         });
         match decode_server(&mut &snap[..]).unwrap() {
-            ServerMsg::GridSnapshot { mouse_flags, .. } => assert_eq!(mouse_flags, 0x4e),
+            ServerMsg::GridSnapshot {
+                mouse_flags,
+                pane_id,
+                ..
+            } => {
+                assert_eq!(mouse_flags, 0x4e);
+                assert_eq!(pane_id, Some(7));
+            }
             other => panic!("unexpected {other:?}"),
         }
 
@@ -1965,9 +2115,17 @@ mod tests {
             cursor_col: 0,
             cursor_visible: false,
             mouse_flags: 0x12,
+            pane_id: Some(3),
         });
         match decode_server(&mut &upd[..]).unwrap() {
-            ServerMsg::GridUpdate { mouse_flags, .. } => assert_eq!(mouse_flags, 0x12),
+            ServerMsg::GridUpdate {
+                mouse_flags,
+                pane_id,
+                ..
+            } => {
+                assert_eq!(mouse_flags, 0x12);
+                assert_eq!(pane_id, Some(3));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -1983,14 +2141,87 @@ mod tests {
             cursor_col: 0,
             cursor_visible: true,
             mouse_flags: 0x55,
+            pane_id: None,
         });
         snap.pop(); // strip the trailing mouse_flags byte
         // Fix the length prefix so the frame stays well-formed.
         let len = u32::from_le_bytes([snap[0], snap[1], snap[2], snap[3]]) - 1;
         snap[..4].copy_from_slice(&len.to_le_bytes());
         match decode_server(&mut &snap[..]).unwrap() {
-            ServerMsg::GridSnapshot { mouse_flags, .. } => assert_eq!(mouse_flags, 0),
+            ServerMsg::GridSnapshot {
+                mouse_flags,
+                pane_id,
+                ..
+            } => {
+                assert_eq!(mouse_flags, 0);
+                assert_eq!(pane_id, None);
+            }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_layout_and_split_roundtrip() {
+        let layout = encode_server(&ServerMsg::WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_pane: 2,
+            panes: vec![
+                PaneRect {
+                    pane_id: 1,
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 12,
+                },
+                PaneRect {
+                    pane_id: 2,
+                    x: 0,
+                    y: 13,
+                    cols: 80,
+                    rows: 11,
+                },
+            ],
+        });
+        match decode_server(&mut &layout[..]).unwrap() {
+            ServerMsg::WindowLayout {
+                rows,
+                cols,
+                active_pane,
+                panes,
+            } => {
+                assert_eq!((rows, cols, active_pane), (24, 80, 2));
+                assert_eq!(panes.len(), 2);
+                assert_eq!(panes[1].y, 13);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        for (dir, msg) in [
+            (0u8, ClientMsg::SplitPane { dir: 0 }),
+            (1u8, ClientMsg::SplitPane { dir: 1 }),
+        ] {
+            let bytes = encode_client(&msg);
+            match decode_client(&mut &bytes[..]).unwrap() {
+                ClientMsg::SplitPane { dir: d } => assert_eq!(d, dir),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        for msg in [ClientMsg::FocusNext, ClientMsg::FocusPrev] {
+            let bytes = encode_client(&msg);
+            let got = decode_client(&mut &bytes[..]).unwrap();
+            match (&msg, &got) {
+                (ClientMsg::FocusNext, ClientMsg::FocusNext) => {}
+                (ClientMsg::FocusPrev, ClientMsg::FocusPrev) => {}
+                _ => panic!("unexpected {got:?}"),
+            }
+        }
+        for dir in 0u8..=3 {
+            let bytes = encode_client(&ClientMsg::FocusDir { dir });
+            match decode_client(&mut &bytes[..]).unwrap() {
+                ClientMsg::FocusDir { dir: d } => assert_eq!(d, dir),
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 }

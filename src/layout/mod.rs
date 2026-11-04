@@ -17,6 +17,15 @@ pub enum SplitDir {
     Vertical,
 }
 
+/// Direction for `select-pane`-style focus movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// Pixel-cell rectangle inside the window (origin top-left).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -112,6 +121,79 @@ impl Layout {
         let csum = layout_checksum(&body);
         format!("{csum:04x},{body}")
     }
+
+    /// Pane adjacent to `from` in `dir` (tmux `select-pane -UDLR`).
+    /// Prefers overlapping neighbors closest along the travel axis.
+    pub fn neighbor(&self, from: u32, dir: FocusDir, cols: u16, rows: u16) -> Option<u32> {
+        let rects = self.reflow(cols, rows);
+        let src = leaf_rect(&rects, from);
+        if !rects.iter().any(|(id, _)| *id == from) {
+            return None;
+        }
+        let src_cx = src.x as i32 + src.cols as i32 / 2;
+        let src_cy = src.y as i32 + src.rows as i32 / 2;
+        let mut best: Option<(u32, i32, i32)> = None; // id, primary, secondary
+        for &(id, r) in &rects {
+            if id == from {
+                continue;
+            }
+            let cx = r.x as i32 + r.cols as i32 / 2;
+            let cy = r.y as i32 + r.rows as i32 / 2;
+            let (ok, primary, secondary) = match dir {
+                FocusDir::Left => {
+                    let edge = (r.x + r.cols) as i32;
+                    let primary = src.x as i32 - edge;
+                    (
+                        primary >= 1 && ranges_overlap(src.y, src.rows, r.y, r.rows),
+                        primary,
+                        (src_cy - cy).abs(),
+                    )
+                }
+                FocusDir::Right => {
+                    let primary = r.x as i32 - (src.x + src.cols) as i32;
+                    (
+                        primary >= 1 && ranges_overlap(src.y, src.rows, r.y, r.rows),
+                        primary,
+                        (src_cy - cy).abs(),
+                    )
+                }
+                FocusDir::Up => {
+                    let edge = (r.y + r.rows) as i32;
+                    let primary = src.y as i32 - edge;
+                    (
+                        primary >= 1 && ranges_overlap(src.x, src.cols, r.x, r.cols),
+                        primary,
+                        (src_cx - cx).abs(),
+                    )
+                }
+                FocusDir::Down => {
+                    let primary = r.y as i32 - (src.y + src.rows) as i32;
+                    (
+                        primary >= 1 && ranges_overlap(src.x, src.cols, r.x, r.cols),
+                        primary,
+                        (src_cx - cx).abs(),
+                    )
+                }
+            };
+            if !ok {
+                continue;
+            }
+            match best {
+                None => best = Some((id, primary, secondary)),
+                Some((_, bp, bs)) if primary < bp || (primary == bp && secondary < bs) => {
+                    best = Some((id, primary, secondary));
+                }
+                _ => {}
+            }
+        }
+        best.map(|(id, _, _)| id)
+    }
+}
+
+fn ranges_overlap(a0: u16, a_len: u16, b0: u16, b_len: u16) -> bool {
+    let a1 = a0.saturating_add(a_len);
+    let b1 = b0.saturating_add(b_len);
+    a0 < b1 && b0 < a1
 }
 
 fn split_node(node: &mut Node, target: u32, dir: SplitDir, new_pane: u32, ratio: f64) -> bool {
@@ -391,5 +473,21 @@ mod tests {
         let (_, b) = rects[1];
         assert_eq!(a.cols + 1 + b.cols, 81);
         assert!(a.cols < b.cols, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn neighbor_cardinal_and_nested() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split(1, SplitDir::Horizontal, 2, 0.5)); // 1 | 2
+        assert_eq!(layout.neighbor(1, FocusDir::Right, 81, 24), Some(2));
+        assert_eq!(layout.neighbor(2, FocusDir::Left, 81, 24), Some(1));
+        assert_eq!(layout.neighbor(1, FocusDir::Left, 81, 24), None);
+        assert_eq!(layout.neighbor(1, FocusDir::Up, 81, 24), None);
+
+        assert!(layout.split(2, SplitDir::Vertical, 3, 0.5)); // 1 | {2/3}
+        assert_eq!(layout.neighbor(1, FocusDir::Right, 81, 25), Some(2));
+        assert_eq!(layout.neighbor(2, FocusDir::Down, 81, 25), Some(3));
+        assert_eq!(layout.neighbor(3, FocusDir::Up, 81, 25), Some(2));
+        assert_eq!(layout.neighbor(3, FocusDir::Left, 81, 25), Some(1));
     }
 }

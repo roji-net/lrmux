@@ -1,5 +1,6 @@
 // Client process: raw mode, input relay, prefix detection, output render.
 
+pub mod composite;
 pub mod control;
 pub mod copy_mode;
 mod input_filter;
@@ -50,14 +51,18 @@ enum PrefixState {
     Normal,
     /// Prefix was pressed; waiting for the command byte.
     Command,
+    /// Prefix then Esc; waiting for `[` (CSI arrow / Shift-Tab).
+    Esc,
+    /// Prefix then Esc `[`; waiting for final (A/B/C/D/Z).
+    Csi,
 }
 
 /// State of the confirmation dialog (for destructive actions).
 enum ConfirmState {
     /// No confirmation active.
     None,
-    /// "Kill current window? (y/n)" — waiting for a single keypress.
-    KillWindow,
+    /// "Kill this pane? (y/n)" — waiting for a single keypress.
+    KillPane,
     /// "Type session name to confirm kill:" — waiting for text input + Enter.
     KillSession {
         input: String,
@@ -294,8 +299,8 @@ pub fn run(
     report_outer_term_palette(&mut stream, &mut probe_leftover, &mut osc_probe)?;
     input_filter.inject(&probe_leftover);
 
-    // Create the local grid + renderer.
-    let mut grid = Grid::new(grid_rows, grid_cols, 10_000);
+    // Create the local window view (composite grid + per-pane state) + renderer.
+    let mut grid = composite::WindowView::single(grid_rows, grid_cols);
     let mut renderer = render::Renderer::new(grid_rows, grid_cols);
 
     // Track the actual terminal size (including status bar row).
@@ -1171,34 +1176,71 @@ pub fn run(
                 let mut needs_render = false;
                 while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
                     match msg {
-                        ServerMsg::ScrollbackUpdate { rows, replay } => {
-                            // Push to internal scrollback (for copy mode).
-                            let n = rows.len();
+                        ServerMsg::WindowLayout {
+                            rows,
+                            cols,
+                            active_pane,
+                            panes,
+                        } => {
                             client_trace_msg(
                                 "EVT",
                                 &format!(
-                                    "scrollback +{n}rows replay={replay} total={}",
-                                    grid.scrollback.len() + n
+                                    "layout {rows}x{cols} panes={} active=%{active_pane}",
+                                    panes.len()
                                 ),
                             );
-                            for row in rows {
-                                grid.scrollback.push(row);
+                            grid.apply_layout(rows, cols, active_pane, &panes);
+                            renderer.resize(grid.win_rows, grid.win_cols);
+                            update_viewport(
+                                &mut renderer,
+                                term_rows,
+                                term_cols,
+                                grid.win_rows,
+                                grid.win_cols,
+                            );
+                            renderer.invalidate();
+                            let mut stdout = client_stdout();
+                            let view_rows = term_rows.saturating_sub(1);
+                            if grid.pane_count() > 1 {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H")?;
+                            } else {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
                             }
-                            // Scroll the terminal to push content into the
-                            // terminal's native scrollback buffer — but only
-                            // for live scroll. Replay chunks (history after a
-                            // GridSnapshot) would scroll the just-rendered
-                            // content off screen, leaving it blank. The same
-                            // applies while in copy mode: the scroll would
-                            // push the viewed rows away.
-                            if n > 0 && copy_mode.is_none() && !replay {
+                            renderer.render(&mut stdout, &mut grid.composite)?;
+                            render_filler(
+                                &mut stdout,
+                                grid.win_rows,
+                                grid.win_cols,
+                                term_rows,
+                                term_cols,
+                            )?;
+                            render_status_bar(
+                                &mut stdout,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                &grid.composite,
+                                mouse_reporting_on(applied_mouse),
+                            )?;
+                            stdout.flush()?;
+                            needs_render = false;
+                        }
+                        ServerMsg::ScrollbackUpdate {
+                            rows,
+                            replay,
+                            pane_id,
+                        } => {
+                            let n = rows.len();
+                            client_trace_msg(
+                                "EVT",
+                                &format!("scrollback +{n}rows replay={replay} pane={pane_id:?}"),
+                            );
+                            grid.push_scrollback(pane_id, rows);
+                            // Host CSI S only for live single-pane output.
+                            if n > 0 && copy_mode.is_none() && !replay && grid.pane_count() <= 1 {
                                 let mut stdout = client_stdout();
                                 write!(stdout, "\x1b[{}S", n)?;
                                 stdout.flush()?;
-                                // The terminal shifted all content up by n lines.
-                                // Mark all rows dirty so the renderer rewrites them
-                                // at their correct positions (the GridUpdate that
-                                // follows will render them).
                                 grid.mark_all_dirty();
                                 renderer.invalidate();
                             }
@@ -1209,18 +1251,20 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                             mouse_flags,
+                            pane_id,
                         } => {
-                            for (row, cells) in &dirty {
-                                apply_row(&mut grid, *row as usize, cells);
-                            }
-                            grid.cursor_row = cursor_row as usize;
-                            grid.cursor_col = cursor_col as usize;
-                            grid.cursor_visible = cursor_visible;
-                            grid.set_mouse_flags(mouse_flags);
+                            grid.apply_pane_update(
+                                pane_id,
+                                &dirty,
+                                cursor_row,
+                                cursor_col,
+                                cursor_visible,
+                                mouse_flags,
+                            );
                             client_trace_msg(
                                 "EVT",
                                 &format!(
-                                    "grid-update dirty={}rows cur={cursor_row};{cursor_col} vis={cursor_visible}",
+                                    "grid-update pane={pane_id:?} dirty={}rows cur={cursor_row};{cursor_col}",
                                     dirty.len()
                                 ),
                             );
@@ -1234,49 +1278,46 @@ pub fn run(
                             cursor_col,
                             cursor_visible,
                             mouse_flags,
+                            pane_id,
                         } => {
-                            grid = Grid::new(rows as usize, cols as usize, 10_000);
-                            grid.mark_all_dirty();
-                            renderer.resize(rows as usize, cols as usize);
+                            grid.apply_pane_snapshot(
+                                pane_id,
+                                rows,
+                                cols,
+                                &cells,
+                                cursor_row,
+                                cursor_col,
+                                cursor_visible,
+                                mouse_flags,
+                            );
+                            renderer.resize(grid.win_rows, grid.win_cols);
                             update_viewport(
                                 &mut renderer,
                                 term_rows,
                                 term_cols,
-                                rows as usize,
-                                cols as usize,
+                                grid.win_rows,
+                                grid.win_cols,
                             );
                             renderer.invalidate();
-                            let cols = cols as usize;
-                            for (i, cell) in cells.iter().enumerate() {
-                                let row = i / cols;
-                                let col = i % cols;
-                                if row < grid.rows()
-                                    && let Some(r) = grid.row_mut(row)
-                                    && col < r.len()
-                                {
-                                    r[col] = cell.clone();
-                                }
-                            }
-                            grid.cursor_row = cursor_row as usize;
-                            grid.cursor_col = cursor_col as usize;
-                            grid.cursor_visible = cursor_visible;
-                            grid.set_mouse_flags(mouse_flags);
                             client_trace_msg(
                                 "EVT",
-                                &format!("snapshot {rows}x{cols} cur={cursor_row};{cursor_col}"),
+                                &format!(
+                                    "snapshot pane={pane_id:?} {rows}x{cols} win={}x{} cur={cursor_row};{cursor_col}",
+                                    grid.win_rows, grid.win_cols
+                                ),
                             );
                             let mut stdout = client_stdout();
-                            // Reset scroll region to full screen, clear, then
-                            // re-establish the scroll region. This ensures the
-                            // clear affects the entire screen and the terminal
-                            // viewport is in a clean state before rendering.
                             let view_rows = term_rows.saturating_sub(1);
-                            write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
-                            renderer.render(&mut stdout, &mut grid)?;
+                            if grid.pane_count() > 1 {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H")?;
+                            } else {
+                                write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
+                            }
+                            renderer.render(&mut stdout, &mut grid.composite)?;
                             render_filler(
                                 &mut stdout,
-                                grid.rows(),
-                                grid.cols(),
+                                grid.win_rows,
+                                grid.win_cols,
                                 term_rows,
                                 term_cols,
                             )?;
@@ -1285,9 +1326,11 @@ pub fn run(
                                 &status_text,
                                 term_rows,
                                 term_cols,
-                                &grid,
+                                &grid.composite,
                                 mouse_reporting_on(applied_mouse),
                             )?;
+                            stdout.flush()?;
+                            needs_render = false;
                         }
                         ServerMsg::StatusBarUpdate {
                             session,
@@ -1630,147 +1673,185 @@ fn process_prefix(
                     passthrough.push(byte);
                 }
             }
-            PrefixState::Command => {
+            PrefixState::Esc => {
+                // Esc alone cancels; Esc `[` continues as CSI (arrows / Shift-Tab).
+                *state = if byte == b'[' {
+                    PrefixState::Csi
+                } else {
+                    PrefixState::Normal
+                };
+            }
+            PrefixState::Csi => {
                 match byte {
-                    // Double prefix → toggle to last focused window.
-                    PREFIX => {
-                        if let Some(idx) = last_window {
-                            send_cmd(stream, &ClientMsg::SelectWindow { index: idx })?;
-                        } else {
-                            // No last window — send literal prefix to child.
-                            passthrough.push(PREFIX);
-                        }
-                    }
-                    // 'a' → send literal Ctrl-A to the child (screen/byobu).
-                    b'a' => {
-                        passthrough.push(PREFIX);
-                    }
-                    // 'c' → new window.
-                    b'c' => {
-                        send_cmd(stream, &ClientMsg::NewWindow)?;
-                    }
-                    // 'n', Space, or Ctrl-Space → next window.
-                    b'n' | b' ' | 0x00 | 0x0e => {
-                        if window_count <= 1 {
-                            flash = Some("No next window".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::NextWindow)?;
-                        }
-                    }
-                    // 'p' or Ctrl-P → previous window.
-                    b'p' | 0x10 => {
-                        if window_count <= 1 {
-                            flash = Some("No previous window".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::PrevWindow)?;
-                        }
-                    }
-                    // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
-                    b'd' | 0x04 => {
-                        detach = true;
-                    }
-                    // '/' → detach and return to the session/server selector.
-                    b'/' => {
-                        detach = true;
-                        to_selector = true;
-                    }
-                    // 'x' → kill pane (no confirmation, immediate).
-                    b'x' => {
-                        send_cmd(stream, &ClientMsg::KillPane)?;
-                    }
-                    // 'k' → kill current window (with y/n confirmation).
-                    b'k' => {
-                        confirm = Some(ConfirmState::KillWindow);
-                    }
-                    // 'K' → kill current session (type name to confirm).
-                    b'K' => {
-                        confirm = Some(ConfirmState::KillSession {
-                            input: String::new(),
-                            target: String::new(),
-                            window_count: 0,
-                        });
-                    }
-                    // '$' → rename current session (editable name prompt).
-                    b'$' => {
-                        confirm = Some(ConfirmState::RenameSession {
-                            input: String::new(),
-                        });
-                    }
-                    // 'C' → new session (uppercase, like lowercase 'c' for new window).
-                    b'C' => {
-                        send_cmd(
-                            stream,
-                            &ClientMsg::NewSession {
-                                name: None,
-                                cwd: None,
-                                command: None,
-                            },
-                        )?;
-                    }
-                    // 'N' → next session.
-                    b'N' => {
-                        if session_count <= 1 {
-                            flash = Some("No next session".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::NextSession)?;
-                        }
-                    }
-                    // 'P' → previous session.
-                    b'P' => {
-                        if session_count <= 1 {
-                            flash = Some("No previous session".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::PrevSession)?;
-                        }
-                    }
-                    // 'S' → session chooser (list sessions, pick one).
-                    b'S' => {
-                        send_cmd(stream, &ClientMsg::ListSessions)?;
-                        request_session_chooser = true;
-                    }
-                    // 'F' → explicit canonical resize (resize panes to current terminal size).
-                    b'F' => {
-                        let (r, c) = terminal::get_size();
-                        send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
-                    }
-                    // 'm' → cycle the mouse-reporting override
-                    // (auto → forced on → forced off → auto).
-                    b'm' => {
-                        toggle_mouse = true;
-                    }
-                    // '[' → enter copy/scrollback mode.
-                    b'[' => {
-                        enter_copy_mode = true;
-                    }
-                    // ']' → paste from internal paste buffer.
-                    b']' => {
-                        paste = true;
-                    }
-                    // '\' → show server ring log overlay.
-                    b'\\' => {
-                        send_cmd(stream, &ClientMsg::GetLog)?;
-                    }
-                    // 'r' → refresh the screen with a fresh snapshot from the server.
-                    b'r' => {
-                        send_cmd(stream, &ClientMsg::Refresh)?;
-                        flash = Some("refreshing...".to_string());
-                    }
-                    // ',' → network / PSK setup (scaffolding; fullscreen editor later).
-                    b',' => {
-                        confirm = Some(ConfirmState::NetworkSetupMenu);
-                    }
-                    // '?' → show keybindings help overlay.
-                    b'?' => {
-                        show_help = true;
-                    }
-                    // '0'–'9' → select window by index.
-                    b'0'..=b'9' => {
-                        send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
-                    }
-                    // Unknown command → discarded.
+                    // Arrow keys → directional pane focus (tmux select-pane -UDLR).
+                    b'A' => send_cmd(stream, &ClientMsg::FocusDir { dir: 0 })?, // up
+                    b'B' => send_cmd(stream, &ClientMsg::FocusDir { dir: 1 })?, // down
+                    b'C' => send_cmd(stream, &ClientMsg::FocusDir { dir: 3 })?, // right
+                    b'D' => send_cmd(stream, &ClientMsg::FocusDir { dir: 2 })?, // left
+                    // Shift-Tab → previous pane.
+                    b'Z' => send_cmd(stream, &ClientMsg::FocusPrev)?,
                     _ => {}
                 }
                 *state = PrefixState::Normal;
+            }
+            PrefixState::Command => {
+                if byte == 0x1b {
+                    // Start CSI / cancel sequence (arrows arrive as Esc [ A…).
+                    *state = PrefixState::Esc;
+                } else {
+                    match byte {
+                        // Double prefix → toggle to last focused window.
+                        PREFIX => {
+                            if let Some(idx) = last_window {
+                                send_cmd(stream, &ClientMsg::SelectWindow { index: idx })?;
+                            } else {
+                                // No last window — send literal prefix to child.
+                                passthrough.push(PREFIX);
+                            }
+                        }
+                        // 'a' → send literal Ctrl-A to the child (screen/byobu).
+                        b'a' => {
+                            passthrough.push(PREFIX);
+                        }
+                        // 'c' → new window.
+                        b'c' => {
+                            send_cmd(stream, &ClientMsg::NewWindow)?;
+                        }
+                        // 'n', Space, or Ctrl-Space → next window.
+                        b'n' | b' ' | 0x00 | 0x0e => {
+                            if window_count <= 1 {
+                                flash = Some("No next window".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::NextWindow)?;
+                            }
+                        }
+                        // 'p' or Ctrl-P → previous window.
+                        b'p' | 0x10 => {
+                            if window_count <= 1 {
+                                flash = Some("No previous window".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::PrevWindow)?;
+                            }
+                        }
+                        // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
+                        b'd' | 0x04 => {
+                            detach = true;
+                        }
+                        // '/' → detach and return to the session/server selector.
+                        b'/' => {
+                            detach = true;
+                            to_selector = true;
+                        }
+                        // 'x' / 'k' → kill pane (y/n confirmation, tmux-style).
+                        b'x' | b'k' => {
+                            confirm = Some(ConfirmState::KillPane);
+                        }
+                        // 'K' → kill current session (type name to confirm).
+                        b'K' => {
+                            confirm = Some(ConfirmState::KillSession {
+                                input: String::new(),
+                                target: String::new(),
+                                window_count: 0,
+                            });
+                        }
+                        // '$' → rename current session (editable name prompt).
+                        b'$' => {
+                            confirm = Some(ConfirmState::RenameSession {
+                                input: String::new(),
+                            });
+                        }
+                        // 'C' → new session (uppercase, like lowercase 'c' for new window).
+                        b'C' => {
+                            send_cmd(
+                                stream,
+                                &ClientMsg::NewSession {
+                                    name: None,
+                                    cwd: None,
+                                    command: None,
+                                },
+                            )?;
+                        }
+                        // 'N' → next session.
+                        b'N' => {
+                            if session_count <= 1 {
+                                flash = Some("No next session".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::NextSession)?;
+                            }
+                        }
+                        // 'P' → previous session.
+                        b'P' => {
+                            if session_count <= 1 {
+                                flash = Some("No previous session".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::PrevSession)?;
+                            }
+                        }
+                        // 'S' → session chooser (list sessions, pick one).
+                        b'S' => {
+                            send_cmd(stream, &ClientMsg::ListSessions)?;
+                            request_session_chooser = true;
+                        }
+                        // 'F' → explicit canonical resize (resize panes to current terminal size).
+                        b'F' => {
+                            let (r, c) = terminal::get_size();
+                            send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
+                        }
+                        // '-' → split with horizontal divider (panes top/bottom).
+                        b'-' => {
+                            send_cmd(stream, &ClientMsg::SplitPane { dir: 0 })?;
+                        }
+                        // '|' → split with vertical divider (panes left/right).
+                        b'|' => {
+                            send_cmd(stream, &ClientMsg::SplitPane { dir: 1 })?;
+                        }
+                        // Tab / 'o' → focus next pane.
+                        b'\t' | b'o' => {
+                            send_cmd(stream, &ClientMsg::FocusNext)?;
+                        }
+                        // ';' → focus previous pane.
+                        b';' => {
+                            send_cmd(stream, &ClientMsg::FocusPrev)?;
+                        }
+                        // 'm' → cycle the mouse-reporting override
+                        // (auto → forced on → forced off → auto).
+                        b'm' => {
+                            toggle_mouse = true;
+                        }
+                        // '[' → enter copy/scrollback mode.
+                        b'[' => {
+                            enter_copy_mode = true;
+                        }
+                        // ']' → paste from internal paste buffer.
+                        b']' => {
+                            paste = true;
+                        }
+                        // '\' → show server ring log overlay.
+                        b'\\' => {
+                            send_cmd(stream, &ClientMsg::GetLog)?;
+                        }
+                        // 'r' → refresh the screen with a fresh snapshot from the server.
+                        b'r' => {
+                            send_cmd(stream, &ClientMsg::Refresh)?;
+                            flash = Some("refreshing...".to_string());
+                        }
+                        // ',' → network / PSK setup (scaffolding; fullscreen editor later).
+                        b',' => {
+                            confirm = Some(ConfirmState::NetworkSetupMenu);
+                        }
+                        // '?' → show keybindings help overlay.
+                        b'?' => {
+                            show_help = true;
+                        }
+                        // '0'–'9' → select window by index.
+                        b'0'..=b'9' => {
+                            send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
+                        }
+                        // Unknown command → discarded.
+                        _ => {}
+                    }
+                    *state = PrefixState::Normal;
+                }
             }
         }
     }
@@ -1814,7 +1895,7 @@ fn process_confirm(
 ) -> io::Result<ConfirmAction> {
     match state {
         ConfirmState::None => Ok(ConfirmAction::Cancelled),
-        ConfirmState::KillWindow => {
+        ConfirmState::KillPane => {
             // Single-key confirmation: y = kill, anything else = cancel.
             match input.first() {
                 Some(b'y' | b'Y') => {
@@ -1953,7 +2034,7 @@ fn render_confirm_prompt(state: &ConfirmState, term_rows: usize) {
     write!(stdout, "\x1b[?7l\x1b[0m\x1b[{};1H\x1b[2K", row).ok();
     let text = match state {
         ConfirmState::None => String::new(),
-        ConfirmState::KillWindow => "\x1b[0;43;30m Kill current window? (y/n) \x1b[0m".to_string(),
+        ConfirmState::KillPane => "\x1b[0;43;30m Kill this pane? (y/n) \x1b[0m".to_string(),
         ConfirmState::KillSession {
             input,
             target,
@@ -2726,8 +2807,12 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A P", "Previous session"),
         ("Ctrl-A $", "Rename session"),
         ("Ctrl-A K", "Kill session (confirm)"),
-        ("Ctrl-A x", "Kill pane/window"),
-        ("Ctrl-A k", "Kill pane (confirm)"),
+        ("Ctrl-A x / k", "Kill pane (confirm y/n)"),
+        ("Ctrl-A -", "Split top/bottom"),
+        ("Ctrl-A |", "Split left/right"),
+        ("Ctrl-A ←↑↓→", "Focus pane in direction"),
+        ("Ctrl-A Tab / o", "Next pane"),
+        ("Ctrl-A Shift-Tab / ;", "Previous pane"),
         ("Ctrl-A [", "Enter copy mode"),
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),

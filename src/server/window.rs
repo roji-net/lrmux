@@ -117,26 +117,58 @@ impl Window {
         self.layout.to_tmux_str(self.cols, self.rows)
     }
 
-    /// Focus the next pane (wrap). Returns the new active pane id.
-    pub fn focus_next(&mut self) -> u32 {
-        if self.panes.is_empty() {
-            return 0;
-        }
-        self.active_pane = (self.active_pane + 1) % self.panes.len();
+    /// Pane rectangles from the current layout (for client composite).
+    pub fn pane_rects(&self) -> Vec<crate::proto::PaneRect> {
+        self.layout
+            .reflow(self.cols, self.rows)
+            .into_iter()
+            .map(|(pane_id, r)| crate::proto::PaneRect {
+                pane_id,
+                x: r.x,
+                y: r.y,
+                cols: r.cols,
+                rows: r.rows,
+            })
+            .collect()
+    }
+
+    /// Active pane id (or 0 if empty).
+    pub fn active_pane_id(&self) -> u32 {
         self.pane().id
     }
 
-    /// Focus the previous pane (wrap).
-    pub fn focus_prev(&mut self) -> u32 {
-        if self.panes.is_empty() {
+    /// Focus the next pane in layout tree order (wrap).
+    pub fn focus_next(&mut self) -> u32 {
+        let ids = self.layout.pane_ids();
+        if ids.is_empty() {
             return 0;
         }
-        self.active_pane = if self.active_pane == 0 {
-            self.panes.len() - 1
-        } else {
-            self.active_pane - 1
-        };
-        self.pane().id
+        let cur = self.pane().id;
+        let pos = ids.iter().position(|&id| id == cur).unwrap_or(0);
+        let next = ids[(pos + 1) % ids.len()];
+        self.focus_pane(next);
+        next
+    }
+
+    /// Focus the previous pane in layout tree order (wrap).
+    pub fn focus_prev(&mut self) -> u32 {
+        let ids = self.layout.pane_ids();
+        if ids.is_empty() {
+            return 0;
+        }
+        let cur = self.pane().id;
+        let pos = ids.iter().position(|&id| id == cur).unwrap_or(0);
+        let prev = ids[(pos + ids.len() - 1) % ids.len()];
+        self.focus_pane(prev);
+        prev
+    }
+
+    /// Focus the adjacent pane in `dir` (no wrap). Returns new id if moved.
+    pub fn focus_dir(&mut self, dir: crate::layout::FocusDir) -> Option<u32> {
+        let from = self.pane().id;
+        let next = self.layout.neighbor(from, dir, self.cols, self.rows)?;
+        self.focus_pane(next);
+        Some(next)
     }
 
     /// Focus a pane by id. Returns false if missing.
