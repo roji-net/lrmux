@@ -183,6 +183,7 @@ impl WindowView {
         p.grid.cursor_visible = cursor_visible;
         p.grid.set_mouse_flags(mouse_flags);
         let rect = p.rect;
+        let inactive = pid != self.active_pane && self.panes.len() > 1;
         // Blit only dirty rows into composite.
         for (row, _) in dirty {
             let pr = *row as usize;
@@ -194,7 +195,7 @@ impl WindowView {
                     let x0 = rect.x as usize;
                     for (i, cell) in src.iter().enumerate() {
                         if x0 + i < dst.len() {
-                            dst[x0 + i] = cell.clone();
+                            dst[x0 + i] = composite_cell(cell, inactive);
                         }
                     }
                     self.composite.mark_dirty(cy);
@@ -242,6 +243,7 @@ impl WindowView {
     }
 
     fn blit_pane(&mut self, pane_id: u32) {
+        let inactive = pane_id != self.active_pane && self.panes.len() > 1;
         let Some(p) = self.panes.get(&pane_id) else {
             return;
         };
@@ -258,7 +260,7 @@ impl WindowView {
             if let Some(dst) = self.composite.row_mut(cy) {
                 for c in 0..pc {
                     if x0 + c < dst.len() && c < src.len() {
-                        dst[x0 + c] = src[c].clone();
+                        dst[x0 + c] = composite_cell(&src[c], inactive);
                     }
                 }
                 self.composite.mark_dirty(cy);
@@ -267,7 +269,11 @@ impl WindowView {
         let _ = pc;
     }
 
-    /// Draw separator cells in gaps between panes; highlight active borders.
+    /// Draw separator cells in gaps between panes.
+    ///
+    /// Straight edges adjacent to the active pane use `^v<>` pointing
+    /// *toward* the focus (tmux-like "which side is active?"); junctions
+    /// keep box-drawing. Active-adjacent borders are bold cyan.
     fn paint_borders(&mut self) {
         if self.panes.len() <= 1 {
             return;
@@ -296,7 +302,7 @@ impl WindowView {
                 let near_active = active_rect
                     .map(|r| is_adjacent_to_rect(x, y, r))
                     .unwrap_or(false);
-                let ch = border_glyph(x, y, &occupied, self.win_cols, self.win_rows);
+                let ch = border_glyph(x, y, &occupied, self.win_cols, self.win_rows, active_rect);
                 let mut cell = Cell::blank();
                 cell.ch = ch;
                 if near_active {
@@ -363,7 +369,26 @@ fn is_adjacent_to_rect(x: usize, y: usize, r: PaneRect) -> bool {
     vert || horiz
 }
 
-fn border_glyph(x: usize, y: usize, occupied: &[bool], cols: usize, rows: usize) -> char {
+/// Soft tint for inactive panes: only fill default backgrounds so apps
+/// that set their own colours (vim, etc.) stay untouched.
+fn composite_cell(src: &Cell, inactive: bool) -> Cell {
+    let mut cell = src.clone();
+    if inactive && matches!(cell.bg, Color::Default) {
+        cell.bg = Color::Indexed(236);
+    }
+    cell
+}
+
+/// Glyph pointing toward the active pane when `active` is adjacent on a
+/// straight edge; otherwise classic box-drawing.
+fn border_glyph(
+    x: usize,
+    y: usize,
+    occupied: &[bool],
+    cols: usize,
+    rows: usize,
+    active: Option<PaneRect>,
+) -> char {
     let at = |xx: isize, yy: isize| -> bool {
         if xx < 0 || yy < 0 || xx as usize >= cols || yy as usize >= rows {
             return false;
@@ -374,12 +399,20 @@ fn border_glyph(x: usize, y: usize, occupied: &[bool], cols: usize, rows: usize)
     let down = y + 1 < rows && !occupied[(y + 1) * cols + x];
     let left = x > 0 && !occupied[y * cols + x - 1];
     let right = x + 1 < cols && !occupied[y * cols + x + 1];
-    // Prefer box-drawing based on neighboring gap cells; fall back to
-    // whether panes sit on either side.
     let pane_l = at(x as isize - 1, y as isize);
     let pane_r = at(x as isize + 1, y as isize);
     let pane_u = at(x as isize, y as isize - 1);
     let pane_d = at(x as isize, y as isize + 1);
+
+    // A true junction has panes on both axes; gap-continuation along a
+    // straight divider must not count as a cross (those stay directional).
+    let cross = (pane_l || pane_r) && (pane_u || pane_d);
+    if !cross
+        && let Some(r) = active
+        && let Some(ch) = direction_toward_active(x, y, r)
+    {
+        return ch;
+    }
 
     match (
         pane_l || left,
@@ -401,6 +434,27 @@ fn border_glyph(x: usize, y: usize, occupied: &[bool], cols: usize, rows: usize)
         _ if pane_l || pane_r => '│',
         _ => '─',
     }
+}
+
+/// `^v<>` pointing at `active` when this gap cell sits on one of its edges.
+fn direction_toward_active(x: usize, y: usize, active: PaneRect) -> Option<char> {
+    let x0 = active.x as usize;
+    let y0 = active.y as usize;
+    let x1 = x0 + active.cols as usize;
+    let y1 = y0 + active.rows as usize;
+    if x >= x0 && x < x1 && y + 1 == y0 {
+        return Some('v'); // active is below → point down
+    }
+    if x >= x0 && x < x1 && y == y1 {
+        return Some('^'); // active is above → point up
+    }
+    if y >= y0 && y < y1 && x + 1 == x0 {
+        return Some('>'); // active is to the right → point right
+    }
+    if y >= y0 && y < y1 && x == x1 {
+        return Some('<'); // active is to the left → point left
+    }
+    None
 }
 
 #[cfg(test)]
@@ -437,5 +491,115 @@ mod tests {
         let gap = w.composite.cell(12, 0).unwrap();
         assert_ne!(gap.ch, '\0');
         assert_ne!(gap.ch, ' ');
+    }
+
+    #[test]
+    fn active_border_points_at_focus_and_inactive_tints() {
+        let mut w = WindowView::single(24, 80);
+        w.apply_layout(
+            25,
+            80,
+            2, // active = bottom pane
+            &[
+                PaneRect {
+                    pane_id: 1,
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 12,
+                },
+                PaneRect {
+                    pane_id: 2,
+                    x: 0,
+                    y: 13,
+                    cols: 80,
+                    rows: 12,
+                },
+            ],
+        );
+        let gap = w.composite.cell(12, 5).unwrap();
+        assert_eq!(gap.ch, 'v', "border should point down toward active");
+        assert_eq!(gap.fg, Color::Indexed(6));
+
+        // Inactive (top) default-bg cells get a soft tint; active do not.
+        let top = w.composite.cell(0, 0).unwrap();
+        let bot = w.composite.cell(13, 0).unwrap();
+        assert_eq!(top.bg, Color::Indexed(236));
+        assert_eq!(bot.bg, Color::Default);
+
+        // Flip focus → arrows reverse, tint swaps.
+        w.apply_layout(
+            25,
+            80,
+            1,
+            &[
+                PaneRect {
+                    pane_id: 1,
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 12,
+                },
+                PaneRect {
+                    pane_id: 2,
+                    x: 0,
+                    y: 13,
+                    cols: 80,
+                    rows: 12,
+                },
+            ],
+        );
+        assert_eq!(w.composite.cell(12, 5).unwrap().ch, '^');
+        assert_eq!(w.composite.cell(0, 0).unwrap().bg, Color::Default);
+        assert_eq!(w.composite.cell(13, 0).unwrap().bg, Color::Indexed(236));
+    }
+
+    #[test]
+    fn horizontal_split_border_points_sideways() {
+        let mut w = WindowView::single(24, 80);
+        w.apply_layout(
+            24,
+            81,
+            1, // active = left
+            &[
+                PaneRect {
+                    pane_id: 1,
+                    x: 0,
+                    y: 0,
+                    cols: 40,
+                    rows: 24,
+                },
+                PaneRect {
+                    pane_id: 2,
+                    x: 41,
+                    y: 0,
+                    cols: 40,
+                    rows: 24,
+                },
+            ],
+        );
+        assert_eq!(w.composite.cell(5, 40).unwrap().ch, '<');
+        w.apply_layout(
+            24,
+            81,
+            2,
+            &[
+                PaneRect {
+                    pane_id: 1,
+                    x: 0,
+                    y: 0,
+                    cols: 40,
+                    rows: 24,
+                },
+                PaneRect {
+                    pane_id: 2,
+                    x: 41,
+                    y: 0,
+                    cols: 40,
+                    rows: 24,
+                },
+            ],
+        );
+        assert_eq!(w.composite.cell(5, 40).unwrap().ch, '>');
     }
 }

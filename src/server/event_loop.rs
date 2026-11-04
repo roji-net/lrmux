@@ -1526,6 +1526,38 @@ pub fn run(
                                                 );
                                             }
                                         }
+                                        ClientMsg::FocusDir { dir } => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].panes.len() > 1
+                                            {
+                                                let focus_dir = match dir {
+                                                    0 => crate::layout::FocusDir::Up,
+                                                    1 => crate::layout::FocusDir::Down,
+                                                    2 => crate::layout::FocusDir::Left,
+                                                    _ => crate::layout::FocusDir::Right,
+                                                };
+                                                if sessions[si].windows[wi]
+                                                    .focus_dir(focus_dir)
+                                                    .is_some()
+                                                {
+                                                    let w = &sessions[si].windows[wi];
+                                                    broadcast_control_notify(
+                                                        &mut clients,
+                                                        &window_pane_changed_notify(w),
+                                                    );
+                                                    resync_window_viewers(
+                                                        &mut clients,
+                                                        &sessions,
+                                                        si,
+                                                        wi,
+                                                        &mut need_snapshot,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         ClientMsg::Identify { .. } => {}
                                         ClientMsg::ListSessions => {
                                             let list = build_session_list(&sessions, &clients);

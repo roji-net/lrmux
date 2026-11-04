@@ -185,6 +185,8 @@ pub enum ClientMsg {
     FocusNext,
     /// Focus the previous pane in the active window (wrap).
     FocusPrev,
+    /// Focus the adjacent pane. `dir`: 0=up, 1=down, 2=left, 3=right.
+    FocusDir { dir: u8 },
 }
 
 /// Geometry of one pane inside a window (cells, origin top-left).
@@ -369,6 +371,7 @@ const C_SEND_EVENT: u8 = 0x1f;
 const C_SPLIT_PANE: u8 = 0x20;
 const C_FOCUS_NEXT: u8 = 0x21;
 const C_FOCUS_PREV: u8 = 0x22;
+const C_FOCUS_DIR: u8 = 0x23;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -701,6 +704,10 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::FocusPrev => {
             payload.push(C_FOCUS_PREV);
+        }
+        ClientMsg::FocusDir { dir } => {
+            payload.push(C_FOCUS_DIR);
+            payload.push(*dir);
         }
     }
     frame(payload)
@@ -1357,6 +1364,10 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
         }
         C_FOCUS_NEXT => Ok(ClientMsg::FocusNext),
         C_FOCUS_PREV => Ok(ClientMsg::FocusPrev),
+        C_FOCUS_DIR => {
+            let dir = read_u8(&mut r)?;
+            Ok(ClientMsg::FocusDir { dir })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -2203,6 +2214,13 @@ mod tests {
                 (ClientMsg::FocusNext, ClientMsg::FocusNext) => {}
                 (ClientMsg::FocusPrev, ClientMsg::FocusPrev) => {}
                 _ => panic!("unexpected {got:?}"),
+            }
+        }
+        for dir in 0u8..=3 {
+            let bytes = encode_client(&ClientMsg::FocusDir { dir });
+            match decode_client(&mut &bytes[..]).unwrap() {
+                ClientMsg::FocusDir { dir: d } => assert_eq!(d, dir),
+                other => panic!("unexpected {other:?}"),
             }
         }
     }

@@ -51,6 +51,10 @@ enum PrefixState {
     Normal,
     /// Prefix was pressed; waiting for the command byte.
     Command,
+    /// Prefix then Esc; waiting for `[` (CSI arrow / Shift-Tab).
+    Esc,
+    /// Prefix then Esc `[`; waiting for final (A/B/C/D/Z).
+    Csi,
 }
 
 /// State of the confirmation dialog (for destructive actions).
@@ -1669,163 +1673,189 @@ fn process_prefix(
                     passthrough.push(byte);
                 }
             }
-            PrefixState::Command => {
+            PrefixState::Esc => {
+                // Esc alone cancels; Esc `[` continues as CSI (arrows / Shift-Tab).
+                *state = if byte == b'[' {
+                    PrefixState::Csi
+                } else {
+                    PrefixState::Normal
+                };
+            }
+            PrefixState::Csi => {
                 match byte {
-                    // Double prefix → toggle to last focused window.
-                    PREFIX => {
-                        if let Some(idx) = last_window {
-                            send_cmd(stream, &ClientMsg::SelectWindow { index: idx })?;
-                        } else {
-                            // No last window — send literal prefix to child.
-                            passthrough.push(PREFIX);
-                        }
-                    }
-                    // 'a' → send literal Ctrl-A to the child (screen/byobu).
-                    b'a' => {
-                        passthrough.push(PREFIX);
-                    }
-                    // 'c' → new window.
-                    b'c' => {
-                        send_cmd(stream, &ClientMsg::NewWindow)?;
-                    }
-                    // 'n', Space, or Ctrl-Space → next window.
-                    b'n' | b' ' | 0x00 | 0x0e => {
-                        if window_count <= 1 {
-                            flash = Some("No next window".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::NextWindow)?;
-                        }
-                    }
-                    // 'p' or Ctrl-P → previous window.
-                    b'p' | 0x10 => {
-                        if window_count <= 1 {
-                            flash = Some("No previous window".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::PrevWindow)?;
-                        }
-                    }
-                    // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
-                    b'd' | 0x04 => {
-                        detach = true;
-                    }
-                    // '/' → detach and return to the session/server selector.
-                    b'/' => {
-                        detach = true;
-                        to_selector = true;
-                    }
-                    // 'x' → kill pane (no confirmation, immediate).
-                    b'x' => {
-                        send_cmd(stream, &ClientMsg::KillPane)?;
-                    }
-                    // 'k' → kill current window (with y/n confirmation).
-                    b'k' => {
-                        confirm = Some(ConfirmState::KillWindow);
-                    }
-                    // 'K' → kill current session (type name to confirm).
-                    b'K' => {
-                        confirm = Some(ConfirmState::KillSession {
-                            input: String::new(),
-                            target: String::new(),
-                            window_count: 0,
-                        });
-                    }
-                    // '$' → rename current session (editable name prompt).
-                    b'$' => {
-                        confirm = Some(ConfirmState::RenameSession {
-                            input: String::new(),
-                        });
-                    }
-                    // 'C' → new session (uppercase, like lowercase 'c' for new window).
-                    b'C' => {
-                        send_cmd(
-                            stream,
-                            &ClientMsg::NewSession {
-                                name: None,
-                                cwd: None,
-                                command: None,
-                            },
-                        )?;
-                    }
-                    // 'N' → next session.
-                    b'N' => {
-                        if session_count <= 1 {
-                            flash = Some("No next session".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::NextSession)?;
-                        }
-                    }
-                    // 'P' → previous session.
-                    b'P' => {
-                        if session_count <= 1 {
-                            flash = Some("No previous session".to_string());
-                        } else {
-                            send_cmd(stream, &ClientMsg::PrevSession)?;
-                        }
-                    }
-                    // 'S' → session chooser (list sessions, pick one).
-                    b'S' => {
-                        send_cmd(stream, &ClientMsg::ListSessions)?;
-                        request_session_chooser = true;
-                    }
-                    // 'F' → explicit canonical resize (resize panes to current terminal size).
-                    b'F' => {
-                        let (r, c) = terminal::get_size();
-                        send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
-                    }
-                    // '-' → split with horizontal divider (panes top/bottom).
-                    b'-' => {
-                        send_cmd(stream, &ClientMsg::SplitPane { dir: 0 })?;
-                    }
-                    // '|' → split with vertical divider (panes left/right).
-                    b'|' => {
-                        send_cmd(stream, &ClientMsg::SplitPane { dir: 1 })?;
-                    }
-                    // 'o' → focus next pane.
-                    b'o' => {
-                        send_cmd(stream, &ClientMsg::FocusNext)?;
-                    }
-                    // ';' → focus previous pane.
-                    b';' => {
-                        send_cmd(stream, &ClientMsg::FocusPrev)?;
-                    }
-                    // 'm' → cycle the mouse-reporting override
-                    // (auto → forced on → forced off → auto).
-                    b'm' => {
-                        toggle_mouse = true;
-                    }
-                    // '[' → enter copy/scrollback mode.
-                    b'[' => {
-                        enter_copy_mode = true;
-                    }
-                    // ']' → paste from internal paste buffer.
-                    b']' => {
-                        paste = true;
-                    }
-                    // '\' → show server ring log overlay.
-                    b'\\' => {
-                        send_cmd(stream, &ClientMsg::GetLog)?;
-                    }
-                    // 'r' → refresh the screen with a fresh snapshot from the server.
-                    b'r' => {
-                        send_cmd(stream, &ClientMsg::Refresh)?;
-                        flash = Some("refreshing...".to_string());
-                    }
-                    // ',' → network / PSK setup (scaffolding; fullscreen editor later).
-                    b',' => {
-                        confirm = Some(ConfirmState::NetworkSetupMenu);
-                    }
-                    // '?' → show keybindings help overlay.
-                    b'?' => {
-                        show_help = true;
-                    }
-                    // '0'–'9' → select window by index.
-                    b'0'..=b'9' => {
-                        send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
-                    }
-                    // Unknown command → discarded.
+                    // Arrow keys → directional pane focus (tmux select-pane -UDLR).
+                    b'A' => send_cmd(stream, &ClientMsg::FocusDir { dir: 0 })?, // up
+                    b'B' => send_cmd(stream, &ClientMsg::FocusDir { dir: 1 })?, // down
+                    b'C' => send_cmd(stream, &ClientMsg::FocusDir { dir: 3 })?, // right
+                    b'D' => send_cmd(stream, &ClientMsg::FocusDir { dir: 2 })?, // left
+                    // Shift-Tab → previous pane.
+                    b'Z' => send_cmd(stream, &ClientMsg::FocusPrev)?,
                     _ => {}
                 }
                 *state = PrefixState::Normal;
+            }
+            PrefixState::Command => {
+                if byte == 0x1b {
+                    // Start CSI / cancel sequence (arrows arrive as Esc [ A…).
+                    *state = PrefixState::Esc;
+                } else {
+                    match byte {
+                        // Double prefix → toggle to last focused window.
+                        PREFIX => {
+                            if let Some(idx) = last_window {
+                                send_cmd(stream, &ClientMsg::SelectWindow { index: idx })?;
+                            } else {
+                                // No last window — send literal prefix to child.
+                                passthrough.push(PREFIX);
+                            }
+                        }
+                        // 'a' → send literal Ctrl-A to the child (screen/byobu).
+                        b'a' => {
+                            passthrough.push(PREFIX);
+                        }
+                        // 'c' → new window.
+                        b'c' => {
+                            send_cmd(stream, &ClientMsg::NewWindow)?;
+                        }
+                        // 'n', Space, or Ctrl-Space → next window.
+                        b'n' | b' ' | 0x00 | 0x0e => {
+                            if window_count <= 1 {
+                                flash = Some("No next window".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::NextWindow)?;
+                            }
+                        }
+                        // 'p' or Ctrl-P → previous window.
+                        b'p' | 0x10 => {
+                            if window_count <= 1 {
+                                flash = Some("No previous window".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::PrevWindow)?;
+                            }
+                        }
+                        // 'd' or Ctrl-D → detach (handled by caller after passthrough is sent).
+                        b'd' | 0x04 => {
+                            detach = true;
+                        }
+                        // '/' → detach and return to the session/server selector.
+                        b'/' => {
+                            detach = true;
+                            to_selector = true;
+                        }
+                        // 'x' → kill pane (no confirmation, immediate).
+                        b'x' => {
+                            send_cmd(stream, &ClientMsg::KillPane)?;
+                        }
+                        // 'k' → kill current window (with y/n confirmation).
+                        b'k' => {
+                            confirm = Some(ConfirmState::KillWindow);
+                        }
+                        // 'K' → kill current session (type name to confirm).
+                        b'K' => {
+                            confirm = Some(ConfirmState::KillSession {
+                                input: String::new(),
+                                target: String::new(),
+                                window_count: 0,
+                            });
+                        }
+                        // '$' → rename current session (editable name prompt).
+                        b'$' => {
+                            confirm = Some(ConfirmState::RenameSession {
+                                input: String::new(),
+                            });
+                        }
+                        // 'C' → new session (uppercase, like lowercase 'c' for new window).
+                        b'C' => {
+                            send_cmd(
+                                stream,
+                                &ClientMsg::NewSession {
+                                    name: None,
+                                    cwd: None,
+                                    command: None,
+                                },
+                            )?;
+                        }
+                        // 'N' → next session.
+                        b'N' => {
+                            if session_count <= 1 {
+                                flash = Some("No next session".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::NextSession)?;
+                            }
+                        }
+                        // 'P' → previous session.
+                        b'P' => {
+                            if session_count <= 1 {
+                                flash = Some("No previous session".to_string());
+                            } else {
+                                send_cmd(stream, &ClientMsg::PrevSession)?;
+                            }
+                        }
+                        // 'S' → session chooser (list sessions, pick one).
+                        b'S' => {
+                            send_cmd(stream, &ClientMsg::ListSessions)?;
+                            request_session_chooser = true;
+                        }
+                        // 'F' → explicit canonical resize (resize panes to current terminal size).
+                        b'F' => {
+                            let (r, c) = terminal::get_size();
+                            send_cmd(stream, &ClientMsg::Resize { rows: r, cols: c })?;
+                        }
+                        // '-' → split with horizontal divider (panes top/bottom).
+                        b'-' => {
+                            send_cmd(stream, &ClientMsg::SplitPane { dir: 0 })?;
+                        }
+                        // '|' → split with vertical divider (panes left/right).
+                        b'|' => {
+                            send_cmd(stream, &ClientMsg::SplitPane { dir: 1 })?;
+                        }
+                        // Tab / 'o' → focus next pane.
+                        b'\t' | b'o' => {
+                            send_cmd(stream, &ClientMsg::FocusNext)?;
+                        }
+                        // ';' → focus previous pane.
+                        b';' => {
+                            send_cmd(stream, &ClientMsg::FocusPrev)?;
+                        }
+                        // 'm' → cycle the mouse-reporting override
+                        // (auto → forced on → forced off → auto).
+                        b'm' => {
+                            toggle_mouse = true;
+                        }
+                        // '[' → enter copy/scrollback mode.
+                        b'[' => {
+                            enter_copy_mode = true;
+                        }
+                        // ']' → paste from internal paste buffer.
+                        b']' => {
+                            paste = true;
+                        }
+                        // '\' → show server ring log overlay.
+                        b'\\' => {
+                            send_cmd(stream, &ClientMsg::GetLog)?;
+                        }
+                        // 'r' → refresh the screen with a fresh snapshot from the server.
+                        b'r' => {
+                            send_cmd(stream, &ClientMsg::Refresh)?;
+                            flash = Some("refreshing...".to_string());
+                        }
+                        // ',' → network / PSK setup (scaffolding; fullscreen editor later).
+                        b',' => {
+                            confirm = Some(ConfirmState::NetworkSetupMenu);
+                        }
+                        // '?' → show keybindings help overlay.
+                        b'?' => {
+                            show_help = true;
+                        }
+                        // '0'–'9' → select window by index.
+                        b'0'..=b'9' => {
+                            send_cmd(stream, &ClientMsg::SelectWindow { index: byte - b'0' })?;
+                        }
+                        // Unknown command → discarded.
+                        _ => {}
+                    }
+                    *state = PrefixState::Normal;
+                }
             }
         }
     }
@@ -2785,8 +2815,9 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A k", "Kill pane (confirm)"),
         ("Ctrl-A -", "Split top/bottom"),
         ("Ctrl-A |", "Split left/right"),
-        ("Ctrl-A o", "Next pane"),
-        ("Ctrl-A ;", "Previous pane"),
+        ("Ctrl-A ←↑↓→", "Focus pane in direction"),
+        ("Ctrl-A Tab / o", "Next pane"),
+        ("Ctrl-A Shift-Tab / ;", "Previous pane"),
         ("Ctrl-A [", "Enter copy mode"),
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),
