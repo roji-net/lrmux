@@ -155,7 +155,7 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
     let mut stdout_buf: VecDeque<u8> = VecDeque::new();
     queue_out(&mut stdout_buf, passthrough, b"\x1bP1000p");
     dbg.log("OUT", b"\x1bP1000p");
-    flush_fd(stdout_fd, &mut stdout_buf);
+    let _ = flush_fd(stdout_fd, &mut stdout_buf);
 
     // Buffered data waiting to be written to the server socket.
     let mut server_outbuf: VecDeque<u8> = VecDeque::new();
@@ -164,12 +164,16 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
 
     let stdin_fd = libc::STDIN_FILENO;
     let mut stdin_buf: Vec<u8> = Vec::new();
-    let mut stdin_eof = false;
+    // iTerm2 sends a leading ^C before the first command to clear a possible
+    // shell prompt. After we've seen a real command, a subsequent ^C (or a
+    // cancel of an already-attached dialog that leaves us orphaned) should
+    // exit rather than hang forever in control mode.
+    let mut seen_command = false;
 
     loop {
         // Build poll fds dynamically: always watch the server socket for
-        // input; watch stdin until EOF; watch POLLOUT on any fd that has
-        // buffered output pending.
+        // input; watch stdin; watch POLLOUT on any fd that has buffered
+        // output pending.
         let mut fds = vec![libc::pollfd {
             fd: stream_fd,
             events: libc::POLLIN
@@ -180,16 +184,12 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                 },
             revents: 0,
         }];
-        let stdin_idx = if !stdin_eof {
-            fds.push(libc::pollfd {
-                fd: stdin_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            Some(fds.len() - 1)
-        } else {
-            None
-        };
+        fds.push(libc::pollfd {
+            fd: stdin_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        let stdin_idx = Some(fds.len() - 1);
         let stdout_idx = if !stdout_buf.is_empty() {
             fds.push(libc::pollfd {
                 fd: stdout_fd,
@@ -213,8 +213,11 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
         // stdout writable → drain buffered output
         if let Some(i) = stdout_idx
             && fds[i].revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0
+            && !flush_fd(stdout_fd, &mut stdout_buf)
         {
-            flush_fd(stdout_fd, &mut stdout_buf);
+            dbg.log("OUT", b"<stdout gone>");
+            flush_stream(&mut stream, &mut server_outbuf);
+            return Ok(());
         }
 
         // stdin → server: read ALL available bytes at once (never blocks
@@ -226,11 +229,18 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                 if n > 0 {
                     dbg.log("IN ", &chunk[..n as usize]);
                     stdin_buf.extend_from_slice(&chunk[..n as usize]);
-                    // ^C cancels the pending partial line — iTerm2 sends it
-                    // unconditionally before the first command to clear any
-                    // garbage in case we're actually at a shell prompt.
+                    // ^C: before any command, just clear (iTerm2 probe). After
+                    // that, treat as "user wants out" — including the case
+                    // where iTerm canceled an already-attached dialog and left
+                    // this process orphaned without sending `detach`.
                     while let Some(pos) = stdin_buf.iter().position(|&b| b == 0x03) {
                         stdin_buf.drain(..=pos);
+                        if seen_command {
+                            dbg.log("IN ", b"<ctrl-c exit>");
+                            flush_stream(&mut stream, &mut server_outbuf);
+                            control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
+                            return Ok(());
+                        }
                     }
                     // Extract complete lines (terminated by \n or \r).
                     while let Some(pos) = stdin_buf.iter().position(|&b| b == b'\n' || b == b'\r') {
@@ -238,12 +248,24 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                         stdin_buf.drain(..1); // consume the terminator
                         let line = String::from_utf8_lossy(&line);
                         let line = line.trim();
-                        if !line.is_empty() {
-                            dbg.log("CMD", line.as_bytes());
-                            let msg = proto::encode_client(&ClientMsg::ControlCommand {
-                                line: line.to_string(),
-                            });
-                            server_outbuf.extend(&msg);
+                        if line.is_empty() {
+                            continue;
+                        }
+                        dbg.log("CMD", line.as_bytes());
+                        seen_command = true;
+                        let msg = proto::encode_client(&ClientMsg::ControlCommand {
+                            line: line.to_string(),
+                        });
+                        server_outbuf.extend(&msg);
+                        // iTerm2's already-attached Cancel path calls
+                        // TmuxController.detach + forceDetach and often never
+                        // writes `detach` to the PTY; when it does, exit
+                        // immediately — don't wait for a server %exit that
+                        // may never be read after DCS is unhooked.
+                        if is_detach_command(line) {
+                            flush_stream(&mut stream, &mut server_outbuf);
+                            control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
+                            return Ok(());
                         }
                     }
                     // Flush queued commands immediately; POLLOUT handles
@@ -251,19 +273,26 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                     flush_stream(&mut stream, &mut server_outbuf);
                 } else if n == 0 {
                     dbg.log("IN ", b"<eof>");
-                    stdin_eof = true;
+                    flush_stream(&mut stream, &mut server_outbuf);
+                    control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
+                    return Ok(());
                 } else {
                     let err = io::Error::last_os_error();
                     if err.raw_os_error() != Some(libc::EAGAIN) {
-                        stdin_eof = true;
+                        dbg.log("IN ", b"<read-err exit>");
+                        flush_stream(&mut stream, &mut server_outbuf);
+                        control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
+                        return Ok(());
                     }
                 }
             }
             if fds[i].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                // stdin closed — don't exit, just stop reading from it.
-                // iTerm2 may still be waiting for notifications.
-                dbg.log("IN ", b"<hup>");
-                stdin_eof = true;
+                // Tab closed / PTY hung up — exit. Staying alive used to leave
+                // a zombie -CC after iTerm canceled an already-attached dialog.
+                dbg.log("IN ", b"<hup exit>");
+                flush_stream(&mut stream, &mut server_outbuf);
+                control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
+                return Ok(());
             }
         }
 
@@ -295,14 +324,19 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                             let mut out = line.as_bytes().to_vec();
                             out.push(b'\n');
                             queue_out(&mut stdout_buf, passthrough, &out);
-                            flush_fd(stdout_fd, &mut stdout_buf);
+                            if !flush_fd(stdout_fd, &mut stdout_buf) {
+                                dbg.log("OUT", b"<stdout gone>");
+                                flush_stream(&mut stream, &mut server_outbuf);
+                                return Ok(());
+                            }
                             // Check for %exit.
                             if line.starts_with("%exit") {
-                                // Emit the DCS terminator like real tmux
-                                // (ESC \ on control-mode exit), then quit.
-                                queue_out(&mut stdout_buf, passthrough, b"\x1b\\");
-                                flush_fd(stdout_fd, &mut stdout_buf);
-                                drain_stdin_grace(&mut dbg);
+                                control_client_exit(
+                                    &mut stdout_buf,
+                                    passthrough,
+                                    stdout_fd,
+                                    &mut dbg,
+                                );
                                 return Ok(());
                             }
                         }
@@ -328,14 +362,14 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                                     data: reply,
                                 });
                                 server_outbuf.extend(&msg);
-                                flush_fd(stream_fd, &mut server_outbuf);
+                                flush_stream(&mut stream, &mut server_outbuf);
                             }
                         }
                         ServerMsg::Error { msg } => {
                             // Don't print to stderr — iTerm2 would see it on
                             // the PTY. Just exit silently.
                             let _ = msg;
-                            drain_stdin_grace(&mut dbg);
+                            control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
                             return Ok(());
                         }
                         _ => {
@@ -346,23 +380,38 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
                 }
             } else if n == 0 {
                 // Server closed the connection — report it and exit.
-                queue_out(&mut stdout_buf, passthrough, b"%exit\n");
-                queue_out(&mut stdout_buf, passthrough, b"\x1b\\");
-                flush_fd(stdout_fd, &mut stdout_buf);
-                drain_stdin_grace(&mut dbg);
+                control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
                 return Ok(());
             }
         }
 
         // Check for server hangup
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            queue_out(&mut stdout_buf, passthrough, b"%exit\n");
-            queue_out(&mut stdout_buf, passthrough, b"\x1b\\");
-            flush_fd(stdout_fd, &mut stdout_buf);
-            drain_stdin_grace(&mut dbg);
+            control_client_exit(&mut stdout_buf, passthrough, stdout_fd, &mut dbg);
             return Ok(());
         }
     }
+}
+
+/// `detach` / `detach-client` from iTerm2 (Esc, Shell→Detach, or the
+/// already-attached dialog's abort path when the command actually reaches us).
+fn is_detach_command(line: &str) -> bool {
+    let cmd = line.split_whitespace().next().unwrap_or("");
+    matches!(cmd, "detach" | "detach-client")
+}
+
+/// Emit `%exit` + DCS terminator and drain trailing stdin (iTerm2 may still
+/// write a few commands after tearing down control mode).
+fn control_client_exit(
+    stdout_buf: &mut VecDeque<u8>,
+    passthrough: bool,
+    stdout_fd: i32,
+    dbg: &mut CcDebug,
+) {
+    queue_out(stdout_buf, passthrough, b"%exit\n");
+    queue_out(stdout_buf, passthrough, b"\x1b\\");
+    let _ = flush_fd(stdout_fd, stdout_buf);
+    drain_stdin_grace(dbg);
 }
 
 /// After %exit + DCS terminator, linger briefly draining stdin.
@@ -441,17 +490,26 @@ fn set_nonblocking(fd: libc::c_int) {
 
 /// Write as much of the buffered output as possible to an fd.
 /// Leftover bytes stay in the buffer and are retried on POLLOUT.
-fn flush_fd(fd: libc::c_int, buf: &mut VecDeque<u8>) {
+/// Returns `false` if the fd is gone (EPIPE/ENOTCONN) — caller should exit.
+fn flush_fd(fd: libc::c_int, buf: &mut VecDeque<u8>) -> bool {
     while !buf.is_empty() {
         let (front, _) = buf.as_slices();
         let n = unsafe { libc::write(fd, front.as_ptr() as *const _, front.len()) };
         if n > 0 {
             buf.drain(..n as usize);
+        } else if n < 0 {
+            let err = io::Error::last_os_error();
+            let errno = err.raw_os_error();
+            if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+                break;
+            }
+            // EPIPE / EBADF / etc. — the PTY went away.
+            return false;
         } else {
-            // EAGAIN or error — retry later.
             break;
         }
     }
+    true
 }
 
 /// Flush pending bytes through a ConnStream (TLS-aware).
