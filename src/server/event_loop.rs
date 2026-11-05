@@ -5380,11 +5380,15 @@ fn format_var(
         // Fields requested by iTerm2's TmuxStateParser via
         // `list-panes -F "key=#{key}..."`. Values we don't track are
         // reported as 0 — iTerm2 parses them as booleans/ints.
+        //
+        // wrap_flag is DECAWM: if we report 0, iTerm2's -CC emulator
+        // stops wrapping at the right margin and long lines overwrite
+        // the last column (server grid still wraps; capture-pane looks
+        // fine, live %output does not).
         "alternate_on"
         | "insert_flag"
         | "keypad_cursor_flag"
         | "keypad_flag"
-        | "wrap_flag"
         | "mouse_standard_flag"
         | "mouse_button_flag"
         | "mouse_any_flag"
@@ -5392,6 +5396,9 @@ fn format_var(
         | "mouse_sgr_flag"
         | "bracket_paste_flag"
         | "pane_key_mode" => "0".to_string(),
+        "wrap_flag" => p
+            .map(|p| if p.grid.auto_wrap { "1" } else { "0" }.to_string())
+            .unwrap_or_else(|| "1".to_string()),
         "cursor_flag" => p
             .map(|p| {
                 if p.grid.cursor_visible {
