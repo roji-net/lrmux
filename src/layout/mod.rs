@@ -150,8 +150,10 @@ impl Layout {
         })
     }
 
-    /// Move the border of `pane` in `dir` by `amount` cells (tmux
-    /// `resize-pane -L/-R/-U/-D`). Adjusts the shared ancestor split's ratio.
+    /// tmux `resize-pane -L/-R/-U/-D`: adjust `pane`'s size along that
+    /// axis. Matches tmux cmd-resize-pane: `-R`/`-D` grow (`+amount`),
+    /// `-L`/`-U` shrink (`-amount`). Finds the nearest ancestor split of
+    /// the matching axis and updates its ratio.
     pub fn resize_border(
         &mut self,
         pane_id: u32,
@@ -163,20 +165,18 @@ impl Layout {
         if amount == 0 || !self.contains(pane_id) {
             return false;
         }
-        let Some(neighbor) = self.neighbor(pane_id, dir, cols, rows) else {
-            return false;
+        // tmux: -L/-U → negative change; -R/-D → positive.
+        let (axis, change) = match dir {
+            FocusDir::Right => (SplitDir::Horizontal, amount),
+            FocusDir::Left => (SplitDir::Horizontal, -amount),
+            FocusDir::Down => (SplitDir::Vertical, amount),
+            FocusDir::Up => (SplitDir::Vertical, -amount),
         };
-        let want_dir = match dir {
-            FocusDir::Left | FocusDir::Right => SplitDir::Horizontal,
-            FocusDir::Up | FocusDir::Down => SplitDir::Vertical,
-        };
-        // Positive amount = pane grows into `dir` (neighbor shrinks).
-        resize_border_node(
+        apply_size_change(
             &mut self.root,
             pane_id,
-            neighbor,
-            want_dir,
-            amount,
+            axis,
+            change,
             Rect::new(0, 0, cols.max(1), rows.max(1)),
         )
     }
@@ -337,14 +337,14 @@ fn contains_node_id(node: &Node, pane_id: u32) -> bool {
     contains_node(node, pane_id)
 }
 
-/// Adjust the split between `pane` and `neighbor` so `pane` grows by
-/// `amount` cells along `want_dir`.
-fn resize_border_node(
+/// Apply a signed size `change` to `pane` along `axis` (tmux
+/// `layout_resize_pane`). Prefer a deeper matching split so nested
+/// layouts resize the nearest divider; then adjust this node's ratio.
+fn apply_size_change(
     node: &mut Node,
     pane: u32,
-    neighbor: u32,
-    want_dir: SplitDir,
-    amount: i32,
+    axis: SplitDir,
+    change: i32,
     area: Rect,
 ) -> bool {
     match node {
@@ -356,53 +356,51 @@ fn resize_border_node(
             second,
         } => {
             let (a, b) = split_rect(area, *dir, *ratio);
-            let in_first_p = contains_node_id(first, pane);
-            let in_second_p = contains_node_id(second, pane);
-            let in_first_n = contains_node_id(first, neighbor);
-            let in_second_n = contains_node_id(second, neighbor);
+            let in_first = contains_node_id(first, pane);
+            let in_second = contains_node_id(second, pane);
+            if !in_first && !in_second {
+                return false;
+            }
 
-            // This split separates the two panes on the right axis.
-            if *dir == want_dir && ((in_first_p && in_second_n) || (in_second_p && in_first_n)) {
-                let usable = match want_dir {
-                    SplitDir::Horizontal => {
-                        if area.cols <= 2 {
-                            return false;
-                        }
-                        area.cols - 1
+            // Nearest (deepest) matching ancestor first.
+            if in_first && apply_size_change(first, pane, axis, change, a) {
+                return true;
+            }
+            if in_second && apply_size_change(second, pane, axis, change, b) {
+                return true;
+            }
+
+            if *dir != axis {
+                return false;
+            }
+            let usable = match axis {
+                SplitDir::Horizontal => {
+                    if area.cols <= 2 {
+                        return false;
                     }
-                    SplitDir::Vertical => {
-                        if area.rows <= 2 {
-                            return false;
-                        }
-                        area.rows - 1
-                    }
-                };
-                let first_size = match want_dir {
-                    SplitDir::Horizontal => a.cols,
-                    SplitDir::Vertical => a.rows,
-                } as i32;
-                // Pane in first grows → first_size += amount; pane in second
-                // grows → first_size -= amount.
-                let delta = if in_first_p { amount } else { -amount };
-                let new_first = (first_size + delta).clamp(1, usable as i32 - 1) as u16;
-                if new_first as i32 == first_size {
-                    return false;
+                    area.cols - 1
                 }
-                *ratio = new_first as f64 / usable as f64;
-                return true;
+                SplitDir::Vertical => {
+                    if area.rows <= 2 {
+                        return false;
+                    }
+                    area.rows - 1
+                }
+            };
+            let first_size = match axis {
+                SplitDir::Horizontal => a.cols,
+                SplitDir::Vertical => a.rows,
+            } as i32;
+            // Pane in first: size_first += change; pane in second: the
+            // second child's size += change ⇒ size_first -= change
+            // (same as tmux last-cell remapping onto the preceding sibling).
+            let delta = if in_first { change } else { -change };
+            let new_first = (first_size + delta).clamp(1, usable as i32 - 1) as u16;
+            if new_first as i32 == first_size {
+                return false;
             }
-
-            if (in_first_p || in_first_n)
-                && resize_border_node(first, pane, neighbor, want_dir, amount, a)
-            {
-                return true;
-            }
-            if (in_second_p || in_second_n)
-                && resize_border_node(second, pane, neighbor, want_dir, amount, b)
-            {
-                return true;
-            }
-            false
+            *ratio = new_first as f64 / usable as f64;
+            true
         }
     }
 }
@@ -689,22 +687,51 @@ mod tests {
     }
 
     #[test]
-    fn resize_border_moves_divider() {
+    fn resize_border_grows_and_shrinks_both_ways() {
         let mut layout = Layout::single(1);
         assert!(layout.split(1, SplitDir::Horizontal, 2, 0.5));
         let before = layout.reflow(81, 24);
         assert_eq!(before[0].1.cols, 40);
         assert_eq!(before[1].1.cols, 40);
-        // Grow left pane to the right by 10.
+
+        // -R on left pane → grow (tmux positive change).
         assert!(layout.resize_border(1, FocusDir::Right, 10, 81, 24));
         let after = layout.reflow(81, 24);
         assert_eq!(after[0].1.cols, 50);
         assert_eq!(after[1].1.cols, 30);
-        // Grow right pane to the left by 5.
-        assert!(layout.resize_border(2, FocusDir::Left, 5, 81, 24));
+
+        // -L on left pane → shrink (the direction that previously no-oped).
+        assert!(layout.resize_border(1, FocusDir::Left, 5, 81, 24));
         let after = layout.reflow(81, 24);
         assert_eq!(after[0].1.cols, 45);
         assert_eq!(after[1].1.cols, 35);
+
+        // -R on right pane → grow right (first shrinks).
+        assert!(layout.resize_border(2, FocusDir::Right, 10, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 35);
+        assert_eq!(after[1].1.cols, 45);
+
+        // -L on right pane → shrink right.
+        assert!(layout.resize_border(2, FocusDir::Left, 5, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 40);
+        assert_eq!(after[1].1.cols, 40);
+    }
+
+    #[test]
+    fn resize_border_vertical_both_ways() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split(1, SplitDir::Vertical, 2, 0.5));
+        assert!(layout.resize_border(1, FocusDir::Down, 4, 80, 25));
+        let after = layout.reflow(80, 25);
+        assert_eq!(after[0].1.rows, 16); // was 12
+        assert_eq!(after[1].1.rows, 8);
+        // -U on top pane shrinks it (move divider up).
+        assert!(layout.resize_border(1, FocusDir::Up, 4, 80, 25));
+        let after = layout.reflow(80, 25);
+        assert_eq!(after[0].1.rows, 12);
+        assert_eq!(after[1].1.rows, 12);
     }
 
     #[test]
