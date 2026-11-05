@@ -2851,7 +2851,7 @@ fn show_pane_numbers_overlay(
     }
     stdout.flush()?;
 
-    // Wait up to 1s for a digit (or Esc to cancel).
+    // Wait up to 10s for a digit (or Esc / other key to cancel).
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
     let mut pollfd = libc::pollfd {
@@ -2859,7 +2859,7 @@ fn show_pane_numbers_overlay(
         events: libc::POLLIN,
         revents: 0,
     };
-    let ready = unsafe { libc::poll(&mut pollfd, 1, 1000) };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 10_000) };
     if ready > 0 {
         let mut buf = [0u8; 1];
         if stdin.lock().read(&mut buf).is_ok()
