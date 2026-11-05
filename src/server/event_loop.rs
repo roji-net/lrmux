@@ -5,7 +5,7 @@
 // Grid updates are sent only to clients viewing the relevant window.
 // A status bar (1 row) is reserved at the bottom of the client terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 
@@ -842,14 +842,16 @@ pub fn run(
                 }
                 // Last pane (or remove failed): close the window.
                 session.windows.remove(wi);
+                let windows_left = session.windows.len();
                 // Tell control clients (iTerm2) the window is gone.
                 broadcast_control_notify(&mut clients, &format!("%window-close {}", wid));
-                if session.windows.is_empty() {
+                if windows_left == 0 {
                     // Last window in this session closed — remove the session.
                     crate::log::info(&format!(
                         "last window in session '{session_name}' closed, removing session"
                     ));
                     sessions.remove(si);
+                    refresh_affinity_options(&mut sessions);
                     broadcast_control_notify(&mut clients, "%sessions-changed");
                     if sessions.is_empty() {
                         // Last session closed — shut down the server.
@@ -880,12 +882,13 @@ pub fn run(
                     for c in &mut clients {
                         if c.session_idx == si {
                             if c.active_window == wi {
-                                c.active_window = wi.min(session.windows.len() - 1);
+                                c.active_window = wi.min(windows_left - 1);
                             } else if c.active_window > wi {
                                 c.active_window -= 1;
                             }
                         }
                     }
+                    refresh_affinity_options(&mut sessions);
                     // Send snapshots to affected clients + status bar to all.
                     let _ = send_all_snapshots(&mut clients, &sessions);
                     broadcast_status_bar(&mut clients, &sessions);
@@ -1052,10 +1055,16 @@ pub fn run(
                                                 };
                                                 sessions[si].windows.push(win);
                                                 let new_wi = sessions[si].windows.len() - 1;
+                                                let wid = sessions[si].windows[new_wi].id_str();
                                                 let sname = sessions[si].name.clone();
                                                 crate::log::info(&format!(
                                                     "new window {new_wi} in session '{sname}'"
                                                 ));
+                                                refresh_affinity_options(&mut sessions);
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &format!("%window-add {wid}"),
+                                                );
                                                 clients[client_idx].active_window = new_wi;
                                                 seed_client_focus_palette(
                                                     &mut sessions,
@@ -1166,17 +1175,19 @@ pub fn run(
                                             }
                                             if session.windows.len() > 1 {
                                                 session.windows.remove(wi);
+                                                let windows_left = session.windows.len();
                                                 // Fix up all clients' active_window in this session.
                                                 for c in &mut clients {
                                                     if c.session_idx == si {
                                                         if c.active_window == wi {
                                                             c.active_window =
-                                                                wi.min(session.windows.len() - 1);
+                                                                wi.min(windows_left - 1);
                                                         } else if c.active_window > wi {
                                                             c.active_window -= 1;
                                                         }
                                                     }
                                                 }
+                                                refresh_affinity_options(&mut sessions);
                                                 for ci in 0..clients.len() {
                                                     if !need_snapshot.contains(&ci) {
                                                         need_snapshot.push(ci);
@@ -1189,6 +1200,7 @@ pub fn run(
                                                     "last window in session '{session_name}' killed, removing session"
                                                 ));
                                                 sessions.remove(si);
+                                                refresh_affinity_options(&mut sessions);
                                                 if sessions.is_empty() {
                                                     crate::log::info(
                                                         "last session closed, shutting down server",
@@ -1289,6 +1301,7 @@ pub fn run(
                                                 // with the command window.
                                                 sessions[new_si].windows[0] = win;
                                             }
+                                            refresh_affinity_options(&mut sessions);
                                             // Switch the sending client to the new session.
                                             if clients[client_idx].attach {
                                                 clients[client_idx].session_idx = new_si;
@@ -1799,7 +1812,13 @@ pub fn run(
                                                         sessions[si].id,
                                                     ),
                                                 };
+                                                let wid = win.id_str();
                                                 sessions[si].windows.push(win);
+                                                refresh_affinity_options(&mut sessions);
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &format!("%window-add {wid}"),
+                                                );
                                                 need_status_bar_all = true;
                                             }
                                         }
@@ -2026,18 +2045,24 @@ pub fn run(
                                                     &mut need_snapshot,
                                                 );
                                             }
-                                            if let Some((si, value)) = pending_affinities
-                                                && migrate_affinity_sessions(
+                                            if let Some((si, value)) = pending_affinities {
+                                                if migrate_affinity_sessions(
                                                     &mut sessions,
                                                     si,
                                                     &value,
                                                     &mut clients,
-                                                )
-                                            {
-                                                broadcast_control_notify(
-                                                    &mut clients,
-                                                    "%sessions-changed",
-                                                );
+                                                ) {
+                                                    refresh_affinity_options(&mut sessions);
+                                                    broadcast_control_notify(
+                                                        &mut clients,
+                                                        "%sessions-changed",
+                                                    );
+                                                } else {
+                                                    // Atomizing / no-op set: rewrite stored
+                                                    // options from the live tree so the next
+                                                    // show stays consistent.
+                                                    refresh_affinity_options(&mut sessions);
+                                                }
                                             }
                                         }
                                     }
@@ -2098,7 +2123,13 @@ pub fn run(
                                             sessions[si].id,
                                         ),
                                     };
+                                    let wid = win.id_str();
                                     sessions[si].windows.push(win);
+                                    refresh_affinity_options(&mut sessions);
+                                    broadcast_control_notify(
+                                        &mut clients,
+                                        &format!("%window-add {wid}"),
+                                    );
                                     need_status_bar_all = true;
                                     crate::log::info(&format!(
                                         "new window {} in session '{}' (from POLLHUP)",
@@ -2154,6 +2185,7 @@ pub fn run(
                                     );
                                     sessions[new_si].windows[0] = win;
                                 }
+                                refresh_affinity_options(&mut sessions);
                                 // Auto-switch all attached clients to the new session.
                                 for c in &mut *clients {
                                     if c.attach {
@@ -4752,24 +4784,76 @@ fn shutdown_flush(clients: &mut [ClientConn]) {
     }
 }
 
-/// Build a default @affinities value: one class per session containing all
-/// of that session's window ids, in the `ids;` format iTerm2 writes.
-/// Returned only when no real value was ever stored — once iTerm2 sends a
-/// `set @affinities`, its value takes precedence.
+/// Build `@affinities` from live sessions: one class per session containing
+/// all of that session's window ids, in the `ids;` format iTerm2 writes.
+///
+/// The session↔window tree is source of truth — one session maps to one
+/// macOS window (tabs = windows, splits = panes). Stored `@affinities` from
+/// an earlier -CC attach can be stale (e.g. windows created in the TUI
+/// after the last `set`), so callers that *show* affinities always use this
+/// rather than the cached option value.
 fn synthesize_affinities(sessions: &[Session]) -> String {
-    sessions
+    synthesize_affinity_classes(
+        &sessions
+            .iter()
+            .filter(|s| !s.windows.is_empty())
+            .map(|s| s.windows.iter().map(|w| w.id).collect())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn synthesize_affinity_classes(session_window_ids: &[Vec<u32>]) -> String {
+    session_window_ids
         .iter()
-        .filter(|s| !s.windows.is_empty())
-        .map(|s| {
-            s.windows
-                .iter()
-                .map(|w| w.id.to_string())
+        .filter(|ids| !ids.is_empty())
+        .map(|ids| {
+            ids.iter()
+                .map(|id| id.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
                 + ";"
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Keep every session's stored `@affinities` in sync with the live grouping
+/// so a later attach never re-reads a stale partition.
+fn refresh_affinity_options(sessions: &mut [Session]) {
+    let synth = synthesize_affinities(sessions);
+    for s in sessions.iter_mut() {
+        if s.windows.is_empty() {
+            s.options.remove("@affinities");
+        } else {
+            s.options.insert("@affinities".to_string(), synth.clone());
+        }
+    }
+}
+
+/// True when `classes` fully partitions some multi-window session into
+/// singleton (or otherwise non-co-located) classes — the typical stale
+/// iTerm2 open-each-window-as-OS-window pattern. Cmd+N keeps the remaining
+/// windows of the source session in one shared class, so it is allowed.
+fn affinities_would_atomize(session_window_ids: &[Vec<u32>], classes: &[Vec<u32>]) -> bool {
+    for ids in session_window_ids {
+        if ids.len() < 2 {
+            continue;
+        }
+        let set: HashSet<u32> = ids.iter().copied().collect();
+        let mut max_together = 0usize;
+        let mut touching = 0usize;
+        for c in classes {
+            let n = c.iter().filter(|id| set.contains(id)).count();
+            if n > 0 {
+                touching += 1;
+                max_together = max_together.max(n);
+            }
+        }
+        if touching > 1 && max_together < 2 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Decode an iTerm2-encoded user option value: `<prefix>` + hex of UTF-8.
@@ -4824,6 +4908,19 @@ fn migrate_affinity_sessions(
         .filter(|c: &Vec<u32>| !c.is_empty())
         .collect();
     if classes.is_empty() {
+        return false;
+    }
+
+    // Refuse updates that would split every window of a multi-window session
+    // into its own OS window. That usually means iTerm opened before (or
+    // without) our synthesized affinities; applying it would lock in the
+    // wrong session↔window model. Genuine ⌘N keeps sibling windows together.
+    let session_ids: Vec<Vec<u32>> = sessions
+        .iter()
+        .map(|s| s.windows.iter().map(|w| w.id).collect())
+        .collect();
+    if affinities_would_atomize(&session_ids, &classes) {
+        crate::log::info("affinities: ignoring atomizing update (keeping session windows as tabs)");
         return false;
     }
 
@@ -5557,17 +5654,15 @@ fn handle_single_control_command(
                     .and_then(|i| sessions.get(i))
                     .and_then(|s| s.options.get(&key))
                     .cloned();
-                // Without saved affinities iTerm2 opens every window in its
-                // own OS window. Synthesize one class per session so each
-                // session's windows open as tabs of a single OS window —
-                // matching the lrmux session↔window model.
-                let val = stored.unwrap_or_else(|| {
-                    if key == "@affinities" {
-                        synthesize_affinities(sessions)
-                    } else {
-                        String::new()
-                    }
-                });
+                // Always synthesize @affinities from the live session tree.
+                // A stored value from a prior -CC attach can omit windows
+                // created later in the TUI and would make iTerm open each
+                // missing window as its own OS window.
+                let val = if key == "@affinities" {
+                    synthesize_affinities(sessions)
+                } else {
+                    stored.unwrap_or_default()
+                };
                 if val.is_empty() {
                     respond(client, &[]);
                 } else {
@@ -6002,6 +6097,7 @@ fn handle_single_control_command(
             sessions.push(new_session);
             let si = sessions.len() - 1;
             client.session_idx = si;
+            refresh_affinity_options(sessions);
 
             send_control_notify(client, "%sessions-changed");
             send_control_notify(client, &format!("%session-changed {} {}", sid, sname));
@@ -6171,6 +6267,9 @@ fn handle_single_control_command(
                 send_control_notify(client, &layout_notify);
                 send_control_notify(client, &pane_notify);
             }
+            if !wid_str.is_empty() {
+                refresh_affinity_options(sessions);
+            }
             if print && !wid_str.is_empty() {
                 let fmt = fmt.unwrap_or_else(|| "#{window_id}".to_string());
                 let text = expand_format(
@@ -6216,6 +6315,7 @@ fn handle_single_control_command(
                 }
                 let wid = window.id_str();
                 sessions[si].windows.remove(wi);
+                refresh_affinity_options(sessions);
                 send_control_notify(client, &format!("%window-close {}", wid));
                 if client.session_idx == si && client.active_window >= sessions[si].windows.len() {
                     client.active_window = sessions[si].windows.len().saturating_sub(1);
@@ -6258,6 +6358,7 @@ fn handle_single_control_command(
                     }
                     Some(Removed::WindowEmpty) | None => {
                         sessions[si].windows.remove(wi);
+                        refresh_affinity_options(sessions);
                         send_control_notify(client, &format!("%window-close {}", wid));
                         if client.session_idx == si
                             && client.active_window >= sessions[si].windows.len()
@@ -6751,6 +6852,47 @@ fn window_pane_changed_notify(window: &Window) -> String {
         window.id_str(),
         window.pane().id
     )
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::{affinities_would_atomize, synthesize_affinity_classes};
+
+    #[test]
+    fn synthesize_one_class_per_session() {
+        assert_eq!(
+            synthesize_affinity_classes(&[vec![8, 12], vec![13]]),
+            "8,12; 13;"
+        );
+        assert_eq!(synthesize_affinity_classes(&[vec![1]]), "1;");
+        assert_eq!(synthesize_affinity_classes(&[vec![]]), "");
+    }
+
+    #[test]
+    fn atomize_detects_full_partition_into_singletons() {
+        // Stale iTerm: two windows of one session each opened as OS windows.
+        assert!(affinities_would_atomize(
+            &[vec![8, 12]],
+            &[vec![8], vec![12]]
+        ));
+    }
+
+    #[test]
+    fn atomize_allows_cmd_n_peel() {
+        // ⌘N: new window alone in its class; siblings stay together.
+        assert!(!affinities_would_atomize(
+            &[vec![8, 12, 15]],
+            &[vec![8, 12], vec![15]]
+        ));
+    }
+
+    #[test]
+    fn atomize_allows_merge_across_sessions() {
+        assert!(!affinities_would_atomize(
+            &[vec![8], vec![12]],
+            &[vec![8, 12]]
+        ));
+    }
 }
 
 #[cfg(test)]
