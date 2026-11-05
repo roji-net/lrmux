@@ -340,13 +340,7 @@ fn contains_node_id(node: &Node, pane_id: u32) -> bool {
 /// Apply a signed size `change` to `pane` along `axis` (tmux
 /// `layout_resize_pane`). Prefer a deeper matching split so nested
 /// layouts resize the nearest divider; then adjust this node's ratio.
-fn apply_size_change(
-    node: &mut Node,
-    pane: u32,
-    axis: SplitDir,
-    change: i32,
-    area: Rect,
-) -> bool {
+fn apply_size_change(node: &mut Node, pane: u32, axis: SplitDir, change: i32, area: Rect) -> bool {
     match node {
         Node::Leaf { .. } => false,
         Node::Split {
