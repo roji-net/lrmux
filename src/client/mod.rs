@@ -923,6 +923,7 @@ pub fn run(
                         show_help,
                         request_session_chooser,
                         toggle_mouse,
+                        show_pane_numbers,
                     ) = process_prefix(
                         input,
                         &mut prefix_state,
@@ -931,6 +932,27 @@ pub fn run(
                         session_count,
                         last_window,
                     )?;
+                    if show_pane_numbers {
+                        show_pane_numbers_overlay(&grid, &mut stream)?;
+                        renderer.invalidate();
+                        let view_rows = term_rows.saturating_sub(1);
+                        let mut stdout = client_stdout();
+                        if grid.pane_count() > 1 && !grid.zoomed {
+                            write!(stdout, "\x1b[r\x1b[2J\x1b[H")?;
+                        } else {
+                            write!(stdout, "\x1b[r\x1b[2J\x1b[H\x1b[1;{}r", view_rows.max(1))?;
+                        }
+                        renderer.render(&mut stdout, &mut grid.composite)?;
+                        render_status_bar(
+                            &mut stdout,
+                            &status_text,
+                            term_rows,
+                            term_cols,
+                            &grid,
+                            mouse_reporting_on(applied_mouse),
+                        )?;
+                        send_cmd(&mut stream, &ClientMsg::Refresh)?;
+                    }
                     if toggle_mouse {
                         mouse_ctl.ovr = mouse_ctl.ovr.next();
                         flash = Some(match mouse_ctl.ovr {
@@ -1181,15 +1203,16 @@ pub fn run(
                             cols,
                             active_pane,
                             panes,
+                            zoomed,
                         } => {
                             client_trace_msg(
                                 "EVT",
                                 &format!(
-                                    "layout {rows}x{cols} panes={} active=%{active_pane}",
+                                    "layout {rows}x{cols} panes={} active=%{active_pane} zoomed={zoomed}",
                                     panes.len()
                                 ),
                             );
-                            grid.apply_layout(rows, cols, active_pane, &panes);
+                            grid.apply_layout(rows, cols, active_pane, &panes, zoomed);
                             renderer.resize(grid.win_rows, grid.win_cols);
                             update_viewport(
                                 &mut renderer,
@@ -1613,7 +1636,7 @@ fn server_log_path(socket_path: &std::path::Path) -> String {
 /// Process input bytes through the prefix-key state machine.
 /// Returns (passthrough, detach, to_selector, confirm, remaining,
 /// enter_copy_mode, paste, flash, show_help, request_session_chooser,
-/// toggle_mouse).
+/// toggle_mouse, show_pane_numbers).
 /// When a confirm dialog is triggered, remaining bytes after the trigger are returned
 /// so the caller can process them with process_confirm.
 #[allow(clippy::type_complexity)]
@@ -1636,6 +1659,7 @@ fn process_prefix(
     bool,
     bool,
     bool,
+    bool,
 )> {
     let mut passthrough: Vec<u8> = Vec::new();
     let mut detach = false;
@@ -1647,6 +1671,7 @@ fn process_prefix(
     let mut show_help = false;
     let mut request_session_chooser = false;
     let mut toggle_mouse = false;
+    let mut show_pane_numbers = false;
 
     for (i, &byte) in input.iter().enumerate() {
         if confirm.is_some() {
@@ -1663,6 +1688,7 @@ fn process_prefix(
                 show_help,
                 request_session_chooser,
                 toggle_mouse,
+                show_pane_numbers,
             ));
         }
         match state {
@@ -1813,6 +1839,18 @@ fn process_prefix(
                         b';' => {
                             send_cmd(stream, &ClientMsg::FocusPrev)?;
                         }
+                        // 'z' → zoom / unzoom active pane.
+                        b'z' => {
+                            send_cmd(stream, &ClientMsg::ToggleZoom)?;
+                        }
+                        // 'l' → cycle layout (Space is next-window here).
+                        b'l' => {
+                            send_cmd(stream, &ClientMsg::NextLayout)?;
+                        }
+                        // 'q' → show pane numbers (display-panes); handled by caller.
+                        b'q' => {
+                            show_pane_numbers = true;
+                        }
                         // 'm' → cycle the mouse-reporting override
                         // (auto → forced on → forced off → auto).
                         b'm' => {
@@ -1868,6 +1906,7 @@ fn process_prefix(
         show_help,
         request_session_chooser,
         toggle_mouse,
+        show_pane_numbers,
     ))
 }
 
@@ -2774,6 +2813,67 @@ fn show_session_chooser(sessions: &[String]) -> Option<String> {
     None
 }
 
+/// Overlay pane indices (tmux display-panes). Digit focuses that pane;
+/// Esc / other key / timeout dismisses.
+fn show_pane_numbers_overlay(
+    grid: &composite::WindowView,
+    stream: &mut ipc::ConnStream,
+) -> io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    if grid.pane_count() == 0 {
+        return Ok(());
+    }
+    let mut panes: Vec<(u32, crate::proto::PaneRect)> = grid
+        .panes
+        .iter()
+        .filter(|(_, p)| !grid.zoomed || p.rect.pane_id == grid.active_pane)
+        .map(|(_, p)| (p.rect.pane_id, p.rect))
+        .collect();
+    panes.sort_by_key(|(_, r)| (r.y, r.x));
+
+    let mut stdout = client_stdout();
+    for (i, (_, r)) in panes.iter().enumerate() {
+        if i > 9 {
+            break;
+        }
+        let row = r.y as usize + r.rows as usize / 2;
+        let col = r.x as usize + r.cols as usize / 2;
+        // 1-based screen coords; bold black on yellow so it pops.
+        write!(
+            stdout,
+            "\x1b[{};{}H\x1b[1;43;30m {} \x1b[0m",
+            row + 1,
+            col.saturating_add(1),
+            i
+        )?;
+    }
+    stdout.flush()?;
+
+    // Wait up to 10s for a digit (or Esc / other key to cancel).
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 10_000) };
+    if ready > 0 {
+        let mut buf = [0u8; 1];
+        if stdin.lock().read(&mut buf).is_ok()
+            && let b'0'..=b'9' = buf[0]
+        {
+            let idx = (buf[0] - b'0') as usize;
+            if let Some((pane_id, _)) = panes.get(idx) {
+                send_cmd(stream, &ClientMsg::FocusPane { pane_id: *pane_id })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Show the keybindings help as a temporary overlay.
 /// Waits for any key to dismiss.
 fn show_help_overlay(server_version: &str) {
@@ -2813,6 +2913,9 @@ fn show_help_overlay(server_version: &str) {
         ("Ctrl-A ←↑↓→", "Focus pane in direction"),
         ("Ctrl-A Tab / o", "Next pane"),
         ("Ctrl-A Shift-Tab / ;", "Previous pane"),
+        ("Ctrl-A z", "Zoom / unzoom pane"),
+        ("Ctrl-A l", "Cycle layout (even-h/v/tiled)"),
+        ("Ctrl-A q", "Show pane numbers"),
         ("Ctrl-A [", "Enter copy mode"),
         ("Ctrl-A ]", "Paste from buffer"),
         ("Ctrl-A F", "Resize to terminal size"),

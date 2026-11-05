@@ -122,6 +122,65 @@ impl Layout {
         format!("{csum:04x},{body}")
     }
 
+    /// Cycle presets: even-horizontal → even-vertical → tiled → …
+    /// `kind` is the current preset index; returns `(new_layout, new_kind)`.
+    pub fn cycle_preset(ids: &[u32], kind: u8) -> (Self, u8) {
+        let next = (kind + 1) % 3;
+        let layout = match next {
+            0 => even_rebuild(ids, SplitDir::Horizontal),
+            1 => even_rebuild(ids, SplitDir::Vertical),
+            _ => tiled_rebuild(ids),
+        };
+        (layout, next)
+    }
+
+    /// Named tmux presets (`even-horizontal`, `even-vertical`, `tiled`,
+    /// `main-horizontal`, `main-vertical`). Returns `None` if unknown.
+    pub fn named_preset(ids: &[u32], name: &str) -> Option<Self> {
+        if ids.is_empty() {
+            return None;
+        }
+        Some(match name {
+            "even-horizontal" | "eh" => even_rebuild(ids, SplitDir::Horizontal),
+            "even-vertical" | "ev" => even_rebuild(ids, SplitDir::Vertical),
+            "tiled" | "tiled-layout" => tiled_rebuild(ids),
+            "main-horizontal" | "mh" => main_rebuild(ids, SplitDir::Vertical),
+            "main-vertical" | "mv" => main_rebuild(ids, SplitDir::Horizontal),
+            _ => return None,
+        })
+    }
+
+    /// tmux `resize-pane -L/-R/-U/-D`: adjust `pane`'s size along that
+    /// axis. Matches tmux cmd-resize-pane: `-R`/`-D` grow (`+amount`),
+    /// `-L`/`-U` shrink (`-amount`). Finds the nearest ancestor split of
+    /// the matching axis and updates its ratio.
+    pub fn resize_border(
+        &mut self,
+        pane_id: u32,
+        dir: FocusDir,
+        amount: i32,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
+        if amount == 0 || !self.contains(pane_id) {
+            return false;
+        }
+        // tmux: -L/-U → negative change; -R/-D → positive.
+        let (axis, change) = match dir {
+            FocusDir::Right => (SplitDir::Horizontal, amount),
+            FocusDir::Left => (SplitDir::Horizontal, -amount),
+            FocusDir::Down => (SplitDir::Vertical, amount),
+            FocusDir::Up => (SplitDir::Vertical, -amount),
+        };
+        apply_size_change(
+            &mut self.root,
+            pane_id,
+            axis,
+            change,
+            Rect::new(0, 0, cols.max(1), rows.max(1)),
+        )
+    }
+
     /// Pane adjacent to `from` in `dir` (tmux `select-pane -UDLR`).
     /// Prefers overlapping neighbors closest along the travel axis.
     pub fn neighbor(&self, from: u32, dir: FocusDir, cols: u16, rows: u16) -> Option<u32> {
@@ -194,6 +253,150 @@ fn ranges_overlap(a0: u16, a_len: u16, b0: u16, b_len: u16) -> bool {
     let a1 = a0.saturating_add(a_len);
     let b1 = b0.saturating_add(b_len);
     a0 < b1 && b0 < a1
+}
+
+/// Balanced binary tree along `dir` with ratios matching leaf counts.
+fn even_rebuild(ids: &[u32], dir: SplitDir) -> Layout {
+    if ids.is_empty() {
+        return Layout::single(0);
+    }
+    Layout {
+        root: even_node(ids, dir),
+    }
+}
+
+fn even_node(ids: &[u32], dir: SplitDir) -> Node {
+    debug_assert!(!ids.is_empty());
+    if ids.len() == 1 {
+        return Node::Leaf { pane_id: ids[0] };
+    }
+    let mid = ids.len() / 2;
+    let mid = mid.max(1);
+    let (left, right) = ids.split_at(mid);
+    Node::Split {
+        dir,
+        ratio: left.len() as f64 / ids.len() as f64,
+        first: Box::new(even_node(left, dir)),
+        second: Box::new(even_node(right, dir)),
+    }
+}
+
+/// Grid-ish: rows of even-horizontal, stacked even-vertical.
+fn tiled_rebuild(ids: &[u32]) -> Layout {
+    if ids.is_empty() {
+        return Layout::single(0);
+    }
+    if ids.len() == 1 {
+        return Layout::single(ids[0]);
+    }
+    let cols = (ids.len() as f64).sqrt().ceil() as usize;
+    let cols = cols.max(1);
+    let row_nodes: Vec<Node> = ids
+        .chunks(cols)
+        .map(|row| even_node(row, SplitDir::Horizontal))
+        .collect();
+    Layout {
+        root: stack_nodes(&row_nodes, SplitDir::Vertical),
+    }
+}
+
+fn stack_nodes(nodes: &[Node], dir: SplitDir) -> Node {
+    debug_assert!(!nodes.is_empty());
+    if nodes.len() == 1 {
+        return nodes[0].clone();
+    }
+    let mid = (nodes.len() / 2).max(1);
+    Node::Split {
+        dir,
+        ratio: mid as f64 / nodes.len() as f64,
+        first: Box::new(stack_nodes(&nodes[..mid], dir)),
+        second: Box::new(stack_nodes(&nodes[mid..], dir)),
+    }
+}
+
+/// Main pane (first id) takes ~half; remaining panes share the other half.
+fn main_rebuild(ids: &[u32], main_axis: SplitDir) -> Layout {
+    if ids.len() <= 1 {
+        return Layout::single(ids.first().copied().unwrap_or(0));
+    }
+    let rest_dir = match main_axis {
+        SplitDir::Horizontal => SplitDir::Vertical,
+        SplitDir::Vertical => SplitDir::Horizontal,
+    };
+    Layout {
+        root: Node::Split {
+            dir: main_axis,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf { pane_id: ids[0] }),
+            second: Box::new(even_node(&ids[1..], rest_dir)),
+        },
+    }
+}
+
+fn contains_node_id(node: &Node, pane_id: u32) -> bool {
+    contains_node(node, pane_id)
+}
+
+/// Apply a signed size `change` to `pane` along `axis` (tmux
+/// `layout_resize_pane`). Prefer a deeper matching split so nested
+/// layouts resize the nearest divider; then adjust this node's ratio.
+fn apply_size_change(node: &mut Node, pane: u32, axis: SplitDir, change: i32, area: Rect) -> bool {
+    match node {
+        Node::Leaf { .. } => false,
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a, b) = split_rect(area, *dir, *ratio);
+            let in_first = contains_node_id(first, pane);
+            let in_second = contains_node_id(second, pane);
+            if !in_first && !in_second {
+                return false;
+            }
+
+            // Nearest (deepest) matching ancestor first.
+            if in_first && apply_size_change(first, pane, axis, change, a) {
+                return true;
+            }
+            if in_second && apply_size_change(second, pane, axis, change, b) {
+                return true;
+            }
+
+            if *dir != axis {
+                return false;
+            }
+            let usable = match axis {
+                SplitDir::Horizontal => {
+                    if area.cols <= 2 {
+                        return false;
+                    }
+                    area.cols - 1
+                }
+                SplitDir::Vertical => {
+                    if area.rows <= 2 {
+                        return false;
+                    }
+                    area.rows - 1
+                }
+            };
+            let first_size = match axis {
+                SplitDir::Horizontal => a.cols,
+                SplitDir::Vertical => a.rows,
+            } as i32;
+            // Pane in first: size_first += change; pane in second: the
+            // second child's size += change ⇒ size_first -= change
+            // (same as tmux last-cell remapping onto the preceding sibling).
+            let delta = if in_first { change } else { -change };
+            let new_first = (first_size + delta).clamp(1, usable as i32 - 1) as u16;
+            if new_first as i32 == first_size {
+                return false;
+            }
+            *ratio = new_first as f64 / usable as f64;
+            true
+        }
+    }
 }
 
 fn split_node(node: &mut Node, target: u32, dir: SplitDir, new_pane: u32, ratio: f64) -> bool {
@@ -343,7 +546,7 @@ fn format_node(node: &Node, rects: &[(u32, Rect)]) -> String {
                 SplitDir::Horizontal => {
                     let x = r1.x.min(r2.x);
                     let y = r1.y.min(r2.y);
-                    let cols = r2.x + r2.cols - x;
+                    let cols = r2.x.saturating_add(r2.cols).saturating_sub(x);
                     let rows = r1.rows.max(r2.rows);
                     (x, y, cols, rows)
                 }
@@ -351,7 +554,7 @@ fn format_node(node: &Node, rects: &[(u32, Rect)]) -> String {
                     let x = r1.x.min(r2.x);
                     let y = r1.y.min(r2.y);
                     let cols = r1.cols.max(r2.cols);
-                    let rows = r2.y + r2.rows - y;
+                    let rows = r2.y.saturating_add(r2.rows).saturating_sub(y);
                     (x, y, cols, rows)
                 }
             };
@@ -378,28 +581,30 @@ fn node_outer_rect(node: &Node, rects: &[(u32, Rect)]) -> Rect {
             let a = node_outer_rect(first, rects);
             let b = node_outer_rect(second, rects);
             match dir {
-                SplitDir::Horizontal => Rect::new(
-                    a.x.min(b.x),
-                    a.y.min(b.y),
-                    b.x + b.cols - a.x.min(b.x),
-                    a.rows.max(b.rows),
-                ),
-                SplitDir::Vertical => Rect::new(
-                    a.x.min(b.x),
-                    a.y.min(b.y),
-                    a.cols.max(b.cols),
-                    b.y + b.rows - a.y.min(b.y),
-                ),
+                SplitDir::Horizontal => {
+                    let x = a.x.min(b.x);
+                    let end = b.x.saturating_add(b.cols);
+                    Rect::new(x, a.y.min(b.y), end.saturating_sub(x), a.rows.max(b.rows))
+                }
+                SplitDir::Vertical => {
+                    let y = a.y.min(b.y);
+                    let end = b.y.saturating_add(b.rows);
+                    Rect::new(a.x.min(b.x), y, a.cols.max(b.cols), end.saturating_sub(y))
+                }
             }
         }
     }
 }
 
 /// tmux `layout_checksum`: 16-bit rotate-and-add over the layout body.
+/// Uses wrapping arithmetic — tmux's C impl overflows silently; debug
+/// Rust must not panic on long layout strings (many panes / nested splits).
 fn layout_checksum(layout: &str) -> u16 {
     let mut csum: u16 = 0;
     for b in layout.bytes() {
-        csum = (csum >> 1) + ((csum & 1) << 15) + u16::from(b);
+        csum = (csum >> 1)
+            .wrapping_add((csum & 1) << 15)
+            .wrapping_add(u16::from(b));
     }
     csum
 }
@@ -473,6 +678,98 @@ mod tests {
         let (_, b) = rects[1];
         assert_eq!(a.cols + 1 + b.cols, 81);
         assert!(a.cols < b.cols, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn resize_border_grows_and_shrinks_both_ways() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split(1, SplitDir::Horizontal, 2, 0.5));
+        let before = layout.reflow(81, 24);
+        assert_eq!(before[0].1.cols, 40);
+        assert_eq!(before[1].1.cols, 40);
+
+        // -R on left pane → grow (tmux positive change).
+        assert!(layout.resize_border(1, FocusDir::Right, 10, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 50);
+        assert_eq!(after[1].1.cols, 30);
+
+        // -L on left pane → shrink (the direction that previously no-oped).
+        assert!(layout.resize_border(1, FocusDir::Left, 5, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 45);
+        assert_eq!(after[1].1.cols, 35);
+
+        // -R on right pane → grow right (first shrinks).
+        assert!(layout.resize_border(2, FocusDir::Right, 10, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 35);
+        assert_eq!(after[1].1.cols, 45);
+
+        // -L on right pane → shrink right.
+        assert!(layout.resize_border(2, FocusDir::Left, 5, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 40);
+        assert_eq!(after[1].1.cols, 40);
+    }
+
+    #[test]
+    fn resize_border_vertical_both_ways() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split(1, SplitDir::Vertical, 2, 0.5));
+        assert!(layout.resize_border(1, FocusDir::Down, 4, 80, 25));
+        let after = layout.reflow(80, 25);
+        assert_eq!(after[0].1.rows, 16); // was 12
+        assert_eq!(after[1].1.rows, 8);
+        // -U on top pane shrinks it (move divider up).
+        assert!(layout.resize_border(1, FocusDir::Up, 4, 80, 25));
+        let after = layout.reflow(80, 25);
+        assert_eq!(after[0].1.rows, 12);
+        assert_eq!(after[1].1.rows, 12);
+    }
+
+    #[test]
+    fn named_preset_even_horizontal() {
+        let ids = [1u32, 2, 3];
+        let layout = Layout::named_preset(&ids, "even-horizontal").unwrap();
+        let rects = layout.reflow(82, 10);
+        assert_eq!(rects.len(), 3);
+        assert!(rects.iter().all(|(_, r)| r.y == 0 && r.rows == 10));
+    }
+
+    #[test]
+    fn layout_checksum_wraps_instead_of_panicking() {
+        // Long body that overflows u16 mid-fold in debug without wrapping.
+        let body: String = std::iter::repeat_n('x', 10_000).collect();
+        let _ = layout_checksum(&body);
+        // Nested many-pane layout string path (to_tmux_str → checksum).
+        let ids: Vec<u32> = (1..=32).collect();
+        let (layout, _) = Layout::cycle_preset(&ids, 2);
+        let s = layout.to_tmux_str(200, 60);
+        assert!(s.len() > 5, "{s}");
+        let (csum, body) = s.split_once(',').unwrap();
+        assert_eq!(csum, format!("{:04x}", layout_checksum(body)));
+    }
+
+    #[test]
+    fn cycle_preset_even_and_tiled() {
+        let ids = [1u32, 2, 3, 4];
+        let (h, k0) = Layout::cycle_preset(&ids, 2); // → even-horizontal
+        assert_eq!(k0, 0);
+        assert_eq!(h.pane_ids(), ids);
+        let rects = h.reflow(81, 24);
+        assert_eq!(rects.len(), 4);
+        // All share the same row band in an even-horizontal layout.
+        assert!(rects.iter().all(|(_, r)| r.y == 0 && r.rows == 24));
+
+        let (v, k1) = Layout::cycle_preset(&ids, 0); // → even-vertical
+        assert_eq!(k1, 1);
+        let rects = v.reflow(80, 25);
+        assert!(rects.iter().all(|(_, r)| r.x == 0 && r.cols == 80));
+
+        let (t, k2) = Layout::cycle_preset(&ids, 1); // → tiled
+        assert_eq!(k2, 2);
+        assert_eq!(t.pane_count(), 4);
     }
 
     #[test]

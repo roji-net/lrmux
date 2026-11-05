@@ -1558,6 +1558,78 @@ pub fn run(
                                                 }
                                             }
                                         }
+                                        ClientMsg::ToggleZoom => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].toggle_zoom()
+                                            {
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &layout_change_notify(w),
+                                                );
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                                need_status_bar_all = true;
+                                            }
+                                        }
+                                        ClientMsg::NextLayout => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].next_layout()
+                                            {
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &layout_change_notify(w),
+                                                );
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                            }
+                                        }
+                                        ClientMsg::FocusPane { pane_id } => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].focus_pane(pane_id)
+                                            {
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                            }
+                                        }
                                         ClientMsg::Identify { .. } => {}
                                         ClientMsg::ListSessions => {
                                             let list = build_session_list(&sessions, &clients);
@@ -1925,6 +1997,8 @@ pub fn run(
                                             let mut pending_affinities = None;
                                             let mut pending_notifies = Vec::new();
                                             let mut pending_status_bar = false;
+                                            let mut pending_resync: Vec<(usize, usize)> =
+                                                Vec::new();
                                             if handle_control_command(
                                                 &mut clients[client_idx],
                                                 &mut sessions,
@@ -1933,6 +2007,7 @@ pub fn run(
                                                 &mut pending_affinities,
                                                 &mut pending_notifies,
                                                 &mut pending_status_bar,
+                                                &mut pending_resync,
                                             ) {
                                                 shutdown = true;
                                             }
@@ -1941,6 +2016,15 @@ pub fn run(
                                             }
                                             if pending_status_bar {
                                                 need_status_bar_all = true;
+                                            }
+                                            for (si, wi) in pending_resync {
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
                                             }
                                             if let Some((si, value)) = pending_affinities
                                                 && migrate_affinity_sessions(
@@ -2576,7 +2660,17 @@ fn ensure_unique_session_name(base: &str, sessions: &[Session]) -> String {
 
 /// Collect window names for the status bar from a client's session.
 fn window_names(session: &Session) -> Vec<String> {
-    session.windows.iter().map(|w| w.name.clone()).collect()
+    session
+        .windows
+        .iter()
+        .map(|w| {
+            if w.zoomed {
+                format!("{}Z", w.name)
+            } else {
+                w.name.clone()
+            }
+        })
+        .collect()
 }
 
 fn window_activity_flags(session: &Session) -> Vec<bool> {
@@ -2783,6 +2877,7 @@ fn send_window_layout(client: &mut ClientConn, window: &Window) -> bool {
         cols: window.cols,
         active_pane: window.active_pane_id(),
         panes: window.pane_rects(),
+        zoomed: window.zoomed,
     });
     client_send(client, &msg)
 }
@@ -3001,6 +3096,7 @@ fn handshake_first_client(
         cols: window.cols,
         active_pane: window.active_pane_id(),
         panes: window.pane_rects(),
+        zoomed: window.zoomed,
     });
     proto::send(&mut client, &layout_msg)?;
     let (cursor_row, cursor_col, cursor_visible) = window.pane().cursor();
@@ -5296,6 +5392,7 @@ fn split_command_list(line: &str) -> Vec<&str> {
 /// a single PTY `write_input` so iTerm2's split arrow-key lists
 /// (`send -H 1b; send 0x5b; send -lt D`) arrive as one ESC [ D sequence,
 /// while still emitting one %begin/%end per sub-command for the command queue.
+#[allow(clippy::too_many_arguments)]
 fn handle_control_command(
     client: &mut ClientConn,
     sessions: &mut Vec<Session>,
@@ -5306,6 +5403,7 @@ fn handle_control_command(
     // only sees one client), and a flag requesting status-bar updates.
     pending_notifies: &mut Vec<String>,
     pending_status_bar: &mut bool,
+    pending_resync: &mut Vec<(usize, usize)>,
 ) -> bool {
     crate::log::log(crate::log::Level::Info, &format!("control cmd: {}", line));
     let line = line.trim();
@@ -5371,6 +5469,7 @@ fn handle_control_command(
             pending_affinities,
             pending_notifies,
             pending_status_bar,
+            pending_resync,
         ) {
             return true;
         }
@@ -5379,6 +5478,7 @@ fn handle_control_command(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_single_control_command(
     client: &mut ClientConn,
     sessions: &mut Vec<Session>,
@@ -5387,6 +5487,7 @@ fn handle_single_control_command(
     pending_affinities: &mut Option<(usize, String)>,
     pending_notifies: &mut Vec<String>,
     pending_status_bar: &mut bool,
+    pending_resync: &mut Vec<(usize, usize)>,
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -6289,9 +6390,7 @@ fn handle_single_control_command(
                     let w = &sessions[si].windows[wi];
                     send_control_notify(client, &layout_change_notify(w));
                     send_control_notify(client, &window_pane_changed_notify(w));
-                    // Other interactive clients viewing this window need a
-                    // fresh snapshot once TUI composite render exists; for
-                    // now status/layout is enough for -CC.
+                    pending_resync.push((si, wi));
                     *pending_status_bar = true;
                 }
             }
@@ -6307,6 +6406,115 @@ fn handle_single_control_command(
             } else {
                 respond(client, &[]);
             }
+        }
+        "resize-pane" => {
+            // iTerm2 drag: resize-pane -L|-R|-U|-D -t "%N" <cells>
+            // Also: resize-pane -Z -t "%N" (zoom).
+            let args = split_args_shell(args_str);
+            let mut dir: Option<crate::layout::FocusDir> = None;
+            let mut zoom = false;
+            let mut target: Option<String> = None;
+            let mut amount: u16 = 1;
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a.starts_with('-') && a.len() > 1 && a != "-" {
+                    let mut chars = a[1..].chars().peekable();
+                    while let Some(f) = chars.next() {
+                        match f {
+                            'L' => dir = Some(crate::layout::FocusDir::Left),
+                            'R' => dir = Some(crate::layout::FocusDir::Right),
+                            'U' => dir = Some(crate::layout::FocusDir::Up),
+                            'D' => dir = Some(crate::layout::FocusDir::Down),
+                            'Z' => zoom = true,
+                            't' => {
+                                let rest: String = chars.collect();
+                                target = Some(if !rest.is_empty() {
+                                    rest
+                                } else {
+                                    i += 1;
+                                    args.get(i).cloned().unwrap_or_default()
+                                });
+                                break;
+                            }
+                            // -x/-y absolute sizes: ignored for now (drag uses -L/R/U/D).
+                            'x' | 'y' => {
+                                let rest: String = chars.collect();
+                                if rest.is_empty() {
+                                    i += 1;
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Ok(n) = a.parse::<u16>() {
+                    amount = n.max(1);
+                }
+                i += 1;
+            }
+            let loc = resolve_pane_target(sessions, client, target.as_deref());
+            if let Some((si, wi, pi)) = loc
+                && si < sessions.len()
+                && wi < sessions[si].windows.len()
+                && pi < sessions[si].windows[wi].panes.len()
+            {
+                let pane_id = sessions[si].windows[wi].panes[pi].id;
+                let changed = if zoom {
+                    sessions[si].windows[wi].toggle_zoom()
+                } else if let Some(d) = dir {
+                    sessions[si].windows[wi].resize_pane_border(pane_id, d, amount)
+                } else {
+                    false
+                };
+                if changed {
+                    let w = &sessions[si].windows[wi];
+                    send_control_notify(client, &layout_change_notify(w));
+                    pending_resync.push((si, wi));
+                    *pending_status_bar = true;
+                }
+            }
+            respond(client, &[]);
+        }
+        "select-layout" => {
+            // iTerm2 / tmux: select-layout -t @N even-horizontal|tiled|…
+            // Raw layout strings (checksum,WxH,…) are ignored — drag uses resize-pane.
+            let args = split_args_shell(args_str);
+            let mut target: Option<String> = None;
+            let mut name: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                let a = &args[i];
+                if a == "-t" || a == "-target" {
+                    target = args.get(i + 1).cloned();
+                    i += 1;
+                } else if let Some(rest) = a.strip_prefix("-t") {
+                    if !rest.is_empty() {
+                        target = Some(rest.to_string());
+                    } else {
+                        target = args.get(i + 1).cloned();
+                        i += 1;
+                    }
+                } else if a.starts_with('-') && a.len() > 1 {
+                    // -E etc. ignored
+                } else {
+                    name = Some(a.clone());
+                }
+                i += 1;
+            }
+            let loc = resolve_target(sessions, client, target.as_deref());
+            if let (Some((si, wi)), Some(name)) = (loc, name.as_deref())
+                && si < sessions.len()
+                && wi < sessions[si].windows.len()
+                && !name.contains(',')
+                && sessions[si].windows[wi].select_layout_named(name)
+            {
+                let w = &sessions[si].windows[wi];
+                send_control_notify(client, &layout_change_notify(w));
+                pending_resync.push((si, wi));
+                *pending_status_bar = true;
+            }
+            respond(client, &[]);
         }
         "rename-window" => {
             // rename-window [-t target] <name>. An explicit rename locks
