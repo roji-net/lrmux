@@ -414,7 +414,7 @@ fn format_node(node: &Node, rects: &[(u32, Rect)]) -> String {
                 SplitDir::Horizontal => {
                     let x = r1.x.min(r2.x);
                     let y = r1.y.min(r2.y);
-                    let cols = r2.x + r2.cols - x;
+                    let cols = r2.x.saturating_add(r2.cols).saturating_sub(x);
                     let rows = r1.rows.max(r2.rows);
                     (x, y, cols, rows)
                 }
@@ -422,7 +422,7 @@ fn format_node(node: &Node, rects: &[(u32, Rect)]) -> String {
                     let x = r1.x.min(r2.x);
                     let y = r1.y.min(r2.y);
                     let cols = r1.cols.max(r2.cols);
-                    let rows = r2.y + r2.rows - y;
+                    let rows = r2.y.saturating_add(r2.rows).saturating_sub(y);
                     (x, y, cols, rows)
                 }
             };
@@ -449,28 +449,30 @@ fn node_outer_rect(node: &Node, rects: &[(u32, Rect)]) -> Rect {
             let a = node_outer_rect(first, rects);
             let b = node_outer_rect(second, rects);
             match dir {
-                SplitDir::Horizontal => Rect::new(
-                    a.x.min(b.x),
-                    a.y.min(b.y),
-                    b.x + b.cols - a.x.min(b.x),
-                    a.rows.max(b.rows),
-                ),
-                SplitDir::Vertical => Rect::new(
-                    a.x.min(b.x),
-                    a.y.min(b.y),
-                    a.cols.max(b.cols),
-                    b.y + b.rows - a.y.min(b.y),
-                ),
+                SplitDir::Horizontal => {
+                    let x = a.x.min(b.x);
+                    let end = b.x.saturating_add(b.cols);
+                    Rect::new(x, a.y.min(b.y), end.saturating_sub(x), a.rows.max(b.rows))
+                }
+                SplitDir::Vertical => {
+                    let y = a.y.min(b.y);
+                    let end = b.y.saturating_add(b.rows);
+                    Rect::new(a.x.min(b.x), y, a.cols.max(b.cols), end.saturating_sub(y))
+                }
             }
         }
     }
 }
 
 /// tmux `layout_checksum`: 16-bit rotate-and-add over the layout body.
+/// Uses wrapping arithmetic — tmux's C impl overflows silently; debug
+/// Rust must not panic on long layout strings (many panes / nested splits).
 fn layout_checksum(layout: &str) -> u16 {
     let mut csum: u16 = 0;
     for b in layout.bytes() {
-        csum = (csum >> 1) + ((csum & 1) << 15) + u16::from(b);
+        csum = (csum >> 1)
+            .wrapping_add((csum & 1) << 15)
+            .wrapping_add(u16::from(b));
     }
     csum
 }
@@ -544,6 +546,20 @@ mod tests {
         let (_, b) = rects[1];
         assert_eq!(a.cols + 1 + b.cols, 81);
         assert!(a.cols < b.cols, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn layout_checksum_wraps_instead_of_panicking() {
+        // Long body that overflows u16 mid-fold in debug without wrapping.
+        let body: String = std::iter::repeat_n('x', 10_000).collect();
+        let _ = layout_checksum(&body);
+        // Nested many-pane layout string path (to_tmux_str → checksum).
+        let ids: Vec<u32> = (1..=32).collect();
+        let (layout, _) = Layout::cycle_preset(&ids, 2);
+        let s = layout.to_tmux_str(200, 60);
+        assert!(s.len() > 5, "{s}");
+        let (csum, body) = s.split_once(',').unwrap();
+        assert_eq!(csum, format!("{:04x}", layout_checksum(body)));
     }
 
     #[test]
