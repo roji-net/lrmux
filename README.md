@@ -32,7 +32,7 @@ Other goals:
 | TCP attach + UDP discovery | ✓ (off by default; see Remote) |
 | TLS + PSK for TCP | ✓ (`tls = auto`, `safe_networks`, `psk`) |
 | WebSocket + browser client | ✓ (`ws_listen` / `--ws`, `web/`) |
-| Pane splits / layouts | Not yet |
+| Pane splits / layouts | ✓ |
 
 ## Install
 
