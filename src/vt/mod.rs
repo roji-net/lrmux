@@ -228,6 +228,7 @@ impl Perform for VtHandler<'_> {
                     for m in &p {
                         match *m {
                             1 => self.grid.app_cursor_keys = true,
+                            7 => self.grid.auto_wrap = true, // DECAWM
                             25 => self.grid.cursor_visible = true,
                             1000 => self.grid.mouse_tracking |= 1,
                             1002 => self.grid.mouse_tracking |= 2,
@@ -246,6 +247,7 @@ impl Perform for VtHandler<'_> {
                     for m in &p {
                         match *m {
                             1 => self.grid.app_cursor_keys = false,
+                            7 => self.grid.auto_wrap = false, // DECAWM
                             25 => self.grid.cursor_visible = false,
                             1000 => self.grid.mouse_tracking &= !1,
                             1002 => self.grid.mouse_tracking &= !2,
@@ -526,6 +528,28 @@ mod tests {
         assert_eq!(grid.mouse_fmt, 0);
         assert!(!grid.wants_mouse());
         assert!(grid.mouse_altscroll); // 1007 untouched
+    }
+
+    #[test]
+    fn decawm_default_on_and_toggle() {
+        let mut grid = Grid::new(2, 4, 10);
+        let mut parser = vte::Parser::new();
+        assert!(grid.auto_wrap);
+        // Five chars on a 4-col grid → wrap to row 1.
+        parse_bytes(&mut parser, &mut grid, b"abcde");
+        assert_eq!(row_text(&grid, 0), "abcd");
+        assert_eq!(row_text(&grid, 1), "e");
+
+        // DECAWM off: stay on last column and overwrite.
+        let mut grid = Grid::new(2, 4, 10);
+        let mut parser = vte::Parser::new();
+        parse_bytes(&mut parser, &mut grid, b"\x1b[?7l");
+        assert!(!grid.auto_wrap);
+        parse_bytes(&mut parser, &mut grid, b"abcde");
+        assert_eq!(row_text(&grid, 0), "abce");
+        assert_eq!(row_text(&grid, 1), "");
+        parse_bytes(&mut parser, &mut grid, b"\x1b[?7h");
+        assert!(grid.auto_wrap);
     }
     #[test]
     fn sgr_combined_fg_bg_extended_colors() {

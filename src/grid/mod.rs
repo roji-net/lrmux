@@ -34,6 +34,9 @@ pub struct Grid {
     pub scroll_bottom: usize,
     /// Whether the next print should wrap to the next line.
     wrap_pending: bool,
+    /// DECAWM (DECSET 7): auto-wrap at the right margin. Default on —
+    /// matches xterm/tmux. When off, prints at the last column overwrite.
+    pub auto_wrap: bool,
     /// Saved cursor position (for DECSC/DECRC).
     saved_cursor: Option<(usize, usize)>,
     /// Application cursor keys mode (DECCKM). When true, arrow keys
@@ -90,6 +93,7 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom: rows,
             wrap_pending: false,
+            auto_wrap: true,
             saved_cursor: None,
             app_cursor_keys: false,
             mouse_tracking: 0,
@@ -265,9 +269,15 @@ impl Grid {
         // Advance cursor.
         self.cursor_col += 1;
         if self.cursor_col >= self.cols {
-            // Wrap to next line on next print.
-            self.cursor_col = self.cols.saturating_sub(1);
-            self.wrap_pending = true;
+            if self.auto_wrap {
+                // Wrap to next line on next print (DECAWM on).
+                self.cursor_col = self.cols.saturating_sub(1);
+                self.wrap_pending = true;
+            } else {
+                // Stay on the last column; further prints overwrite.
+                self.cursor_col = self.cols.saturating_sub(1);
+                self.wrap_pending = false;
+            }
         }
     }
 
