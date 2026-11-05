@@ -240,6 +240,46 @@ impl Window {
         true
     }
 
+    /// Apply a named tmux layout preset (even-horizontal, tiled, …).
+    pub fn select_layout_named(&mut self, name: &str) -> bool {
+        if self.panes.len() <= 1 {
+            return false;
+        }
+        self.unzoom();
+        let ids = self.layout.pane_ids();
+        let Some(layout) = Layout::named_preset(&ids, name) else {
+            return false;
+        };
+        self.layout_kind = match name {
+            "even-horizontal" | "eh" => 0,
+            "even-vertical" | "ev" => 1,
+            _ => 2,
+        };
+        self.layout = layout;
+        self.reflow_panes();
+        true
+    }
+
+    /// tmux `resize-pane -L/-R/-U/-D [adjustment]` on a pane id.
+    pub fn resize_pane_border(
+        &mut self,
+        pane_id: u32,
+        dir: crate::layout::FocusDir,
+        amount: u16,
+    ) -> bool {
+        if self.zoomed || amount == 0 || self.panes.len() <= 1 {
+            return false;
+        }
+        if !self
+            .layout
+            .resize_border(pane_id, dir, amount as i32, self.cols, self.rows)
+        {
+            return false;
+        }
+        self.reflow_panes();
+        true
+    }
+
     fn apply_zoom_size(&mut self) {
         let rows = self.rows.max(1);
         let cols = self.cols.max(1);

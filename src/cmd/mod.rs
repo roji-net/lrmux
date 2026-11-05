@@ -572,6 +572,8 @@ pub fn canonical_name(name: &str) -> &str {
         "setw" | "set-window-option" => "set-window-option",
         "neww" => "new-window",
         "killw" => "kill-window",
+        "resizep" => "resize-pane",
+        "selectl" => "select-layout",
         other => other,
     }
 }

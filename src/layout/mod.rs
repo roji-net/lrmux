@@ -134,6 +134,53 @@ impl Layout {
         (layout, next)
     }
 
+    /// Named tmux presets (`even-horizontal`, `even-vertical`, `tiled`,
+    /// `main-horizontal`, `main-vertical`). Returns `None` if unknown.
+    pub fn named_preset(ids: &[u32], name: &str) -> Option<Self> {
+        if ids.is_empty() {
+            return None;
+        }
+        Some(match name {
+            "even-horizontal" | "eh" => even_rebuild(ids, SplitDir::Horizontal),
+            "even-vertical" | "ev" => even_rebuild(ids, SplitDir::Vertical),
+            "tiled" | "tiled-layout" => tiled_rebuild(ids),
+            "main-horizontal" | "mh" => main_rebuild(ids, SplitDir::Vertical),
+            "main-vertical" | "mv" => main_rebuild(ids, SplitDir::Horizontal),
+            _ => return None,
+        })
+    }
+
+    /// Move the border of `pane` in `dir` by `amount` cells (tmux
+    /// `resize-pane -L/-R/-U/-D`). Adjusts the shared ancestor split's ratio.
+    pub fn resize_border(
+        &mut self,
+        pane_id: u32,
+        dir: FocusDir,
+        amount: i32,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
+        if amount == 0 || !self.contains(pane_id) {
+            return false;
+        }
+        let Some(neighbor) = self.neighbor(pane_id, dir, cols, rows) else {
+            return false;
+        };
+        let want_dir = match dir {
+            FocusDir::Left | FocusDir::Right => SplitDir::Horizontal,
+            FocusDir::Up | FocusDir::Down => SplitDir::Vertical,
+        };
+        // Positive amount = pane grows into `dir` (neighbor shrinks).
+        resize_border_node(
+            &mut self.root,
+            pane_id,
+            neighbor,
+            want_dir,
+            amount,
+            Rect::new(0, 0, cols.max(1), rows.max(1)),
+        )
+    }
+
     /// Pane adjacent to `from` in `dir` (tmux `select-pane -UDLR`).
     /// Prefers overlapping neighbors closest along the travel axis.
     pub fn neighbor(&self, from: u32, dir: FocusDir, cols: u16, rows: u16) -> Option<u32> {
@@ -264,6 +311,99 @@ fn stack_nodes(nodes: &[Node], dir: SplitDir) -> Node {
         ratio: mid as f64 / nodes.len() as f64,
         first: Box::new(stack_nodes(&nodes[..mid], dir)),
         second: Box::new(stack_nodes(&nodes[mid..], dir)),
+    }
+}
+
+/// Main pane (first id) takes ~half; remaining panes share the other half.
+fn main_rebuild(ids: &[u32], main_axis: SplitDir) -> Layout {
+    if ids.len() <= 1 {
+        return Layout::single(ids.first().copied().unwrap_or(0));
+    }
+    let rest_dir = match main_axis {
+        SplitDir::Horizontal => SplitDir::Vertical,
+        SplitDir::Vertical => SplitDir::Horizontal,
+    };
+    Layout {
+        root: Node::Split {
+            dir: main_axis,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf { pane_id: ids[0] }),
+            second: Box::new(even_node(&ids[1..], rest_dir)),
+        },
+    }
+}
+
+fn contains_node_id(node: &Node, pane_id: u32) -> bool {
+    contains_node(node, pane_id)
+}
+
+/// Adjust the split between `pane` and `neighbor` so `pane` grows by
+/// `amount` cells along `want_dir`.
+fn resize_border_node(
+    node: &mut Node,
+    pane: u32,
+    neighbor: u32,
+    want_dir: SplitDir,
+    amount: i32,
+    area: Rect,
+) -> bool {
+    match node {
+        Node::Leaf { .. } => false,
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a, b) = split_rect(area, *dir, *ratio);
+            let in_first_p = contains_node_id(first, pane);
+            let in_second_p = contains_node_id(second, pane);
+            let in_first_n = contains_node_id(first, neighbor);
+            let in_second_n = contains_node_id(second, neighbor);
+
+            // This split separates the two panes on the right axis.
+            if *dir == want_dir && ((in_first_p && in_second_n) || (in_second_p && in_first_n)) {
+                let usable = match want_dir {
+                    SplitDir::Horizontal => {
+                        if area.cols <= 2 {
+                            return false;
+                        }
+                        area.cols - 1
+                    }
+                    SplitDir::Vertical => {
+                        if area.rows <= 2 {
+                            return false;
+                        }
+                        area.rows - 1
+                    }
+                };
+                let first_size = match want_dir {
+                    SplitDir::Horizontal => a.cols,
+                    SplitDir::Vertical => a.rows,
+                } as i32;
+                // Pane in first grows → first_size += amount; pane in second
+                // grows → first_size -= amount.
+                let delta = if in_first_p { amount } else { -amount };
+                let new_first = (first_size + delta).clamp(1, usable as i32 - 1) as u16;
+                if new_first as i32 == first_size {
+                    return false;
+                }
+                *ratio = new_first as f64 / usable as f64;
+                return true;
+            }
+
+            if (in_first_p || in_first_n)
+                && resize_border_node(first, pane, neighbor, want_dir, amount, a)
+            {
+                return true;
+            }
+            if (in_second_p || in_second_n)
+                && resize_border_node(second, pane, neighbor, want_dir, amount, b)
+            {
+                return true;
+            }
+            false
+        }
     }
 }
 
@@ -546,6 +686,34 @@ mod tests {
         let (_, b) = rects[1];
         assert_eq!(a.cols + 1 + b.cols, 81);
         assert!(a.cols < b.cols, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn resize_border_moves_divider() {
+        let mut layout = Layout::single(1);
+        assert!(layout.split(1, SplitDir::Horizontal, 2, 0.5));
+        let before = layout.reflow(81, 24);
+        assert_eq!(before[0].1.cols, 40);
+        assert_eq!(before[1].1.cols, 40);
+        // Grow left pane to the right by 10.
+        assert!(layout.resize_border(1, FocusDir::Right, 10, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 50);
+        assert_eq!(after[1].1.cols, 30);
+        // Grow right pane to the left by 5.
+        assert!(layout.resize_border(2, FocusDir::Left, 5, 81, 24));
+        let after = layout.reflow(81, 24);
+        assert_eq!(after[0].1.cols, 45);
+        assert_eq!(after[1].1.cols, 35);
+    }
+
+    #[test]
+    fn named_preset_even_horizontal() {
+        let ids = [1u32, 2, 3];
+        let layout = Layout::named_preset(&ids, "even-horizontal").unwrap();
+        let rects = layout.reflow(82, 10);
+        assert_eq!(rects.len(), 3);
+        assert!(rects.iter().all(|(_, r)| r.y == 0 && r.rows == 10));
     }
 
     #[test]
