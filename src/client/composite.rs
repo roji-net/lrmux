@@ -22,6 +22,8 @@ pub struct WindowView {
     pub active_pane: u32,
     pub panes: HashMap<u32, PaneView>,
     pub composite: Grid,
+    /// Active pane fills the window; other pane grids are kept but hidden.
+    pub zoomed: bool,
 }
 
 impl std::ops::Deref for WindowView {
@@ -61,6 +63,7 @@ impl WindowView {
             active_pane: id,
             panes,
             composite: Grid::new(rows.max(1), cols.max(1), 10_000),
+            zoomed: false,
         }
     }
 
@@ -78,10 +81,20 @@ impl WindowView {
 
     /// Apply a [`ServerMsg::WindowLayout`](crate::proto::ServerMsg::WindowLayout).
     /// Keeps existing pane grids when ids match; creates blank grids for new ids.
-    pub fn apply_layout(&mut self, rows: u16, cols: u16, active: u32, rects: &[PaneRect]) {
+    /// When `zoomed`, panes missing from `rects` are kept (hidden) so unzoom
+    /// can restore them without a blank flash.
+    pub fn apply_layout(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        active: u32,
+        rects: &[PaneRect],
+        zoomed: bool,
+    ) {
         self.win_rows = rows.max(1) as usize;
         self.win_cols = cols.max(1) as usize;
         self.active_pane = active;
+        self.zoomed = zoomed;
 
         let mut next = HashMap::new();
         for r in rects {
@@ -96,6 +109,12 @@ impl WindowView {
                 Grid::new(pr, pc, 10_000)
             };
             next.insert(r.pane_id, PaneView { rect: *r, grid });
+        }
+        if zoomed {
+            // Preserve hidden panes' grids across zoom.
+            for (id, pv) in self.panes.drain() {
+                next.entry(id).or_insert(pv);
+            }
         }
         self.panes = next;
         if self.composite.rows() != self.win_rows || self.composite.cols() != self.win_cols {
@@ -183,22 +202,25 @@ impl WindowView {
         p.grid.cursor_visible = cursor_visible;
         p.grid.set_mouse_flags(mouse_flags);
         let rect = p.rect;
-        let inactive = pid != self.active_pane && self.panes.len() > 1;
-        // Blit only dirty rows into composite.
-        for (row, _) in dirty {
-            let pr = *row as usize;
-            if let Some(src) = self.panes.get(&pid).and_then(|p| p.grid.row(pr)) {
-                let cy = rect.y as usize + pr;
-                if cy < self.composite.rows()
-                    && let Some(dst) = self.composite.row_mut(cy)
-                {
-                    let x0 = rect.x as usize;
-                    for (i, cell) in src.iter().enumerate() {
-                        if x0 + i < dst.len() {
-                            dst[x0 + i] = composite_cell(cell, inactive);
+        let inactive = !self.zoomed && pid != self.active_pane && self.panes.len() > 1;
+        // While zoomed, only the active pane is on screen — still update
+        // hidden pane grids above, but don't blit them onto the composite.
+        if !self.zoomed || pid == self.active_pane {
+            for (row, _) in dirty {
+                let pr = *row as usize;
+                if let Some(src) = self.panes.get(&pid).and_then(|p| p.grid.row(pr)) {
+                    let cy = rect.y as usize + pr;
+                    if cy < self.composite.rows()
+                        && let Some(dst) = self.composite.row_mut(cy)
+                    {
+                        let x0 = rect.x as usize;
+                        for (i, cell) in src.iter().enumerate() {
+                            if x0 + i < dst.len() {
+                                dst[x0 + i] = composite_cell(cell, inactive);
+                            }
                         }
+                        self.composite.mark_dirty(cy);
                     }
-                    self.composite.mark_dirty(cy);
                 }
             }
         }
@@ -233,17 +255,23 @@ impl WindowView {
                 }
             }
         }
-        let ids: Vec<u32> = self.panes.keys().copied().collect();
-        for id in ids {
+        if self.zoomed {
+            // Full-window active pane only — no borders / inactive tint.
+            let id = self.active_pane;
             self.blit_pane(id);
+        } else {
+            let ids: Vec<u32> = self.panes.keys().copied().collect();
+            for id in ids {
+                self.blit_pane(id);
+            }
+            self.paint_borders();
         }
-        self.paint_borders();
         self.sync_active_cursor();
         self.composite.mark_all_dirty();
     }
 
     fn blit_pane(&mut self, pane_id: u32) {
-        let inactive = pane_id != self.active_pane && self.panes.len() > 1;
+        let inactive = !self.zoomed && pane_id != self.active_pane && self.panes.len() > 1;
         let Some(p) = self.panes.get(&pane_id) else {
             return;
         };
@@ -275,7 +303,7 @@ impl WindowView {
     /// *toward* the focus (tmux-like "which side is active?"); junctions
     /// keep box-drawing. Active-adjacent borders are bold cyan.
     fn paint_borders(&mut self) {
-        if self.panes.len() <= 1 {
+        if self.zoomed || self.panes.len() <= 1 {
             return;
         }
         // Collect occupied pane cells; anything left blank in the composite
@@ -484,6 +512,7 @@ mod tests {
                     rows: 12,
                 },
             ],
+            false,
         );
         assert_eq!(w.pane_count(), 2);
         assert_eq!(w.win_rows, 25);
@@ -516,6 +545,7 @@ mod tests {
                     rows: 12,
                 },
             ],
+            false,
         );
         let gap = w.composite.cell(12, 5).unwrap();
         assert_eq!(gap.ch, 'v', "border should point down toward active");
@@ -548,6 +578,7 @@ mod tests {
                     rows: 12,
                 },
             ],
+            false,
         );
         assert_eq!(w.composite.cell(12, 5).unwrap().ch, '^');
         assert_eq!(w.composite.cell(0, 0).unwrap().bg, Color::Default);
@@ -577,6 +608,7 @@ mod tests {
                     rows: 24,
                 },
             ],
+            false,
         );
         assert_eq!(w.composite.cell(5, 40).unwrap().ch, '<');
         w.apply_layout(
@@ -599,7 +631,57 @@ mod tests {
                     rows: 24,
                 },
             ],
+            false,
         );
         assert_eq!(w.composite.cell(5, 40).unwrap().ch, '>');
+    }
+
+    #[test]
+    fn zoom_keeps_hidden_panes_and_fills_window() {
+        let mut w = WindowView::single(24, 80);
+        w.apply_layout(
+            25,
+            80,
+            2,
+            &[
+                PaneRect {
+                    pane_id: 1,
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 12,
+                },
+                PaneRect {
+                    pane_id: 2,
+                    x: 0,
+                    y: 13,
+                    cols: 80,
+                    rows: 12,
+                },
+            ],
+            false,
+        );
+        w.apply_layout(
+            25,
+            80,
+            2,
+            &[PaneRect {
+                pane_id: 2,
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 25,
+            }],
+            true,
+        );
+        assert!(w.zoomed);
+        assert_eq!(w.pane_count(), 2, "hidden pane grid must be retained");
+        assert!(w.panes.contains_key(&1));
+        // No directional/box border — active fills the composite.
+        let ch = w.composite.cell(12, 0).unwrap().ch;
+        assert!(
+            !matches!(ch, 'v' | '^' | '<' | '>' | '─' | '│' | '┼'),
+            "unexpected border glyph {ch:?}"
+        );
     }
 }

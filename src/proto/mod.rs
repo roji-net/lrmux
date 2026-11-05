@@ -187,6 +187,12 @@ pub enum ClientMsg {
     FocusPrev,
     /// Focus the adjacent pane. `dir`: 0=up, 1=down, 2=left, 3=right.
     FocusDir { dir: u8 },
+    /// Toggle zoom on the active pane (no-op with a single pane).
+    ToggleZoom,
+    /// Cycle the window layout (even-horizontal → even-vertical → tiled → …).
+    NextLayout,
+    /// Focus pane by id (display-panes / click).
+    FocusPane { pane_id: u32 },
 }
 
 /// Geometry of one pane inside a window (cells, origin top-left).
@@ -256,6 +262,8 @@ pub enum ServerMsg {
         cols: u16,
         active_pane: u32,
         panes: Vec<PaneRect>,
+        /// Active pane fills the window; omitted/0 from older servers = false.
+        zoomed: bool,
     },
     /// Child process exited.
     PaneExit { code: u8 },
@@ -372,6 +380,9 @@ const C_SPLIT_PANE: u8 = 0x20;
 const C_FOCUS_NEXT: u8 = 0x21;
 const C_FOCUS_PREV: u8 = 0x22;
 const C_FOCUS_DIR: u8 = 0x23;
+const C_TOGGLE_ZOOM: u8 = 0x24;
+const C_NEXT_LAYOUT: u8 = 0x25;
+const C_FOCUS_PANE: u8 = 0x26;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -709,6 +720,16 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.push(C_FOCUS_DIR);
             payload.push(*dir);
         }
+        ClientMsg::ToggleZoom => {
+            payload.push(C_TOGGLE_ZOOM);
+        }
+        ClientMsg::NextLayout => {
+            payload.push(C_NEXT_LAYOUT);
+        }
+        ClientMsg::FocusPane { pane_id } => {
+            payload.push(C_FOCUS_PANE);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+        }
     }
     frame(payload)
 }
@@ -804,6 +825,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             cols,
             active_pane,
             panes,
+            zoomed,
         } => {
             payload.push(S_WINDOW_LAYOUT);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -817,6 +839,7 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(&p.cols.to_le_bytes());
                 payload.extend_from_slice(&p.rows.to_le_bytes());
             }
+            payload.push(if *zoomed { 1 } else { 0 });
         }
         ServerMsg::PaneExit { code } => {
             payload.push(S_PANE_EXIT);
@@ -1368,6 +1391,12 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
             let dir = read_u8(&mut r)?;
             Ok(ClientMsg::FocusDir { dir })
         }
+        C_TOGGLE_ZOOM => Ok(ClientMsg::ToggleZoom),
+        C_NEXT_LAYOUT => Ok(ClientMsg::NextLayout),
+        C_FOCUS_PANE => {
+            let pane_id = read_u32(&mut r)?;
+            Ok(ClientMsg::FocusPane { pane_id })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -1502,11 +1531,17 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                     rows: read_u16(&mut r)?,
                 });
             }
+            let zoomed = if r.is_empty() {
+                false
+            } else {
+                read_u8(&mut r)? != 0
+            };
             Ok(ServerMsg::WindowLayout {
                 rows,
                 cols,
                 active_pane,
                 panes,
+                zoomed,
             })
         }
         S_PANE_EXIT => {
@@ -2182,6 +2217,7 @@ mod tests {
                     rows: 11,
                 },
             ],
+            zoomed: true,
         });
         match decode_server(&mut &layout[..]).unwrap() {
             ServerMsg::WindowLayout {
@@ -2189,10 +2225,12 @@ mod tests {
                 cols,
                 active_pane,
                 panes,
+                zoomed,
             } => {
                 assert_eq!((rows, cols, active_pane), (24, 80, 2));
                 assert_eq!(panes.len(), 2);
                 assert_eq!(panes[1].y, 13);
+                assert!(zoomed);
             }
             other => panic!("unexpected {other:?}"),
         }

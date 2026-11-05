@@ -1558,6 +1558,78 @@ pub fn run(
                                                 }
                                             }
                                         }
+                                        ClientMsg::ToggleZoom => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].toggle_zoom()
+                                            {
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &layout_change_notify(w),
+                                                );
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                                need_status_bar_all = true;
+                                            }
+                                        }
+                                        ClientMsg::NextLayout => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].next_layout()
+                                            {
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &layout_change_notify(w),
+                                                );
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                            }
+                                        }
+                                        ClientMsg::FocusPane { pane_id } => {
+                                            let si = clients[client_idx].session_idx;
+                                            let wi = clients[client_idx].active_window;
+                                            if si < sessions.len()
+                                                && wi < sessions[si].windows.len()
+                                                && sessions[si].windows[wi].focus_pane(pane_id)
+                                            {
+                                                let w = &sessions[si].windows[wi];
+                                                broadcast_control_notify(
+                                                    &mut clients,
+                                                    &window_pane_changed_notify(w),
+                                                );
+                                                resync_window_viewers(
+                                                    &mut clients,
+                                                    &sessions,
+                                                    si,
+                                                    wi,
+                                                    &mut need_snapshot,
+                                                );
+                                            }
+                                        }
                                         ClientMsg::Identify { .. } => {}
                                         ClientMsg::ListSessions => {
                                             let list = build_session_list(&sessions, &clients);
@@ -2576,7 +2648,17 @@ fn ensure_unique_session_name(base: &str, sessions: &[Session]) -> String {
 
 /// Collect window names for the status bar from a client's session.
 fn window_names(session: &Session) -> Vec<String> {
-    session.windows.iter().map(|w| w.name.clone()).collect()
+    session
+        .windows
+        .iter()
+        .map(|w| {
+            if w.zoomed {
+                format!("{}Z", w.name)
+            } else {
+                w.name.clone()
+            }
+        })
+        .collect()
 }
 
 fn window_activity_flags(session: &Session) -> Vec<bool> {
@@ -2783,6 +2865,7 @@ fn send_window_layout(client: &mut ClientConn, window: &Window) -> bool {
         cols: window.cols,
         active_pane: window.active_pane_id(),
         panes: window.pane_rects(),
+        zoomed: window.zoomed,
     });
     client_send(client, &msg)
 }
@@ -3001,6 +3084,7 @@ fn handshake_first_client(
         cols: window.cols,
         active_pane: window.active_pane_id(),
         panes: window.pane_rects(),
+        zoomed: window.zoomed,
     });
     proto::send(&mut client, &layout_msg)?;
     let (cursor_row, cursor_col, cursor_visible) = window.pane().cursor();

@@ -29,6 +29,11 @@ pub struct Window {
     /// Name was set explicitly (rename-window or `new-window -n`) —
     /// automatic-rename must not overwrite it.
     pub name_locked: bool,
+    /// Active pane temporarily fills the window (tmux zoom). The layout
+    /// tree is preserved; unzoom reflows every pane back into place.
+    pub zoomed: bool,
+    /// Preset index for [`Window::next_layout`] cycling (0=even-h, 1=even-v, 2=tiled).
+    pub layout_kind: u8,
 }
 
 impl Window {
@@ -70,6 +75,8 @@ impl Window {
             activity: false,
             remain_on_exit: false,
             name_locked: false,
+            zoomed: false,
+            layout_kind: 0,
         }
     }
 
@@ -118,7 +125,18 @@ impl Window {
     }
 
     /// Pane rectangles from the current layout (for client composite).
+    /// When zoomed, only the active pane is reported (full window).
     pub fn pane_rects(&self) -> Vec<crate::proto::PaneRect> {
+        if self.zoomed {
+            let id = self.active_pane_id();
+            return vec![crate::proto::PaneRect {
+                pane_id: id,
+                x: 0,
+                y: 0,
+                cols: self.cols.max(1),
+                rows: self.rows.max(1),
+            }];
+        }
         self.layout
             .reflow(self.cols, self.rows)
             .into_iter()
@@ -172,17 +190,72 @@ impl Window {
     }
 
     /// Focus a pane by id. Returns false if missing.
+    /// While zoomed, the newly focused pane fills the window.
     pub fn focus_pane(&mut self, pane_id: u32) -> bool {
         if let Some(i) = self.pane_index_by_id(pane_id) {
             self.active_pane = i;
+            if self.zoomed {
+                self.apply_zoom_size();
+            }
             true
         } else {
             false
         }
     }
 
+    /// Toggle zoom on the active pane. No-op (returns false) with <2 panes.
+    pub fn toggle_zoom(&mut self) -> bool {
+        if self.panes.len() <= 1 {
+            self.zoomed = false;
+            return false;
+        }
+        self.zoomed = !self.zoomed;
+        if self.zoomed {
+            self.apply_zoom_size();
+        } else {
+            self.reflow_panes();
+        }
+        true
+    }
+
+    /// Force-clear zoom and restore layout geometry (e.g. before split).
+    pub fn unzoom(&mut self) {
+        if self.zoomed {
+            self.zoomed = false;
+            self.reflow_panes();
+        }
+    }
+
+    /// Cycle even-horizontal → even-vertical → tiled. Unzooms first.
+    pub fn next_layout(&mut self) -> bool {
+        if self.panes.len() <= 1 {
+            return false;
+        }
+        self.unzoom();
+        let ids = self.layout.pane_ids();
+        let (layout, kind) = Layout::cycle_preset(&ids, self.layout_kind);
+        self.layout = layout;
+        self.layout_kind = kind;
+        self.reflow_panes();
+        true
+    }
+
+    fn apply_zoom_size(&mut self) {
+        let rows = self.rows.max(1);
+        let cols = self.cols.max(1);
+        let p = self.pane_mut();
+        if p.rows != rows || p.cols != cols {
+            p.resize(rows, cols);
+            p.trace_event(&format!("zoom → {cols}x{rows}"));
+        }
+    }
+
     /// Apply layout geometry to every pane (PTY SIGWINCH + grid resize).
     pub fn reflow_panes(&mut self) {
+        if self.zoomed {
+            self.apply_zoom_size();
+            return;
+        }
         let geom = self.layout.reflow(self.cols, self.rows);
         for (pane_id, rect) in geom {
             if let Some(p) = self.pane_by_id_mut(pane_id)
@@ -213,6 +286,8 @@ impl Window {
         target_pane: Option<u32>,
         cwd: Option<&str>,
     ) -> Option<u32> {
+        // tmux: splitting while zoomed cancels zoom first.
+        self.unzoom();
         let target = target_pane.unwrap_or_else(|| self.pane().id);
         if !self.layout.contains(target) {
             return None;
@@ -253,6 +328,10 @@ impl Window {
             self.active_pane = self.panes.len() - 1;
         } else if self.active_pane > idx {
             self.active_pane -= 1;
+        }
+        // Zoom with one pane left is meaningless.
+        if self.panes.len() <= 1 {
+            self.zoomed = false;
         }
         self.reflow_panes();
         Some(Removed::Pane)

@@ -122,6 +122,18 @@ impl Layout {
         format!("{csum:04x},{body}")
     }
 
+    /// Cycle presets: even-horizontal → even-vertical → tiled → …
+    /// `kind` is the current preset index; returns `(new_layout, new_kind)`.
+    pub fn cycle_preset(ids: &[u32], kind: u8) -> (Self, u8) {
+        let next = (kind + 1) % 3;
+        let layout = match next {
+            0 => even_rebuild(ids, SplitDir::Horizontal),
+            1 => even_rebuild(ids, SplitDir::Vertical),
+            _ => tiled_rebuild(ids),
+        };
+        (layout, next)
+    }
+
     /// Pane adjacent to `from` in `dir` (tmux `select-pane -UDLR`).
     /// Prefers overlapping neighbors closest along the travel axis.
     pub fn neighbor(&self, from: u32, dir: FocusDir, cols: u16, rows: u16) -> Option<u32> {
@@ -194,6 +206,65 @@ fn ranges_overlap(a0: u16, a_len: u16, b0: u16, b_len: u16) -> bool {
     let a1 = a0.saturating_add(a_len);
     let b1 = b0.saturating_add(b_len);
     a0 < b1 && b0 < a1
+}
+
+/// Balanced binary tree along `dir` with ratios matching leaf counts.
+fn even_rebuild(ids: &[u32], dir: SplitDir) -> Layout {
+    if ids.is_empty() {
+        return Layout::single(0);
+    }
+    Layout {
+        root: even_node(ids, dir),
+    }
+}
+
+fn even_node(ids: &[u32], dir: SplitDir) -> Node {
+    debug_assert!(!ids.is_empty());
+    if ids.len() == 1 {
+        return Node::Leaf { pane_id: ids[0] };
+    }
+    let mid = ids.len() / 2;
+    let mid = mid.max(1);
+    let (left, right) = ids.split_at(mid);
+    Node::Split {
+        dir,
+        ratio: left.len() as f64 / ids.len() as f64,
+        first: Box::new(even_node(left, dir)),
+        second: Box::new(even_node(right, dir)),
+    }
+}
+
+/// Grid-ish: rows of even-horizontal, stacked even-vertical.
+fn tiled_rebuild(ids: &[u32]) -> Layout {
+    if ids.is_empty() {
+        return Layout::single(0);
+    }
+    if ids.len() == 1 {
+        return Layout::single(ids[0]);
+    }
+    let cols = (ids.len() as f64).sqrt().ceil() as usize;
+    let cols = cols.max(1);
+    let row_nodes: Vec<Node> = ids
+        .chunks(cols)
+        .map(|row| even_node(row, SplitDir::Horizontal))
+        .collect();
+    Layout {
+        root: stack_nodes(&row_nodes, SplitDir::Vertical),
+    }
+}
+
+fn stack_nodes(nodes: &[Node], dir: SplitDir) -> Node {
+    debug_assert!(!nodes.is_empty());
+    if nodes.len() == 1 {
+        return nodes[0].clone();
+    }
+    let mid = (nodes.len() / 2).max(1);
+    Node::Split {
+        dir,
+        ratio: mid as f64 / nodes.len() as f64,
+        first: Box::new(stack_nodes(&nodes[..mid], dir)),
+        second: Box::new(stack_nodes(&nodes[mid..], dir)),
+    }
 }
 
 fn split_node(node: &mut Node, target: u32, dir: SplitDir, new_pane: u32, ratio: f64) -> bool {
@@ -473,6 +544,27 @@ mod tests {
         let (_, b) = rects[1];
         assert_eq!(a.cols + 1 + b.cols, 81);
         assert!(a.cols < b.cols, "{a:?} {b:?}");
+    }
+
+    #[test]
+    fn cycle_preset_even_and_tiled() {
+        let ids = [1u32, 2, 3, 4];
+        let (h, k0) = Layout::cycle_preset(&ids, 2); // → even-horizontal
+        assert_eq!(k0, 0);
+        assert_eq!(h.pane_ids(), ids);
+        let rects = h.reflow(81, 24);
+        assert_eq!(rects.len(), 4);
+        // All share the same row band in an even-horizontal layout.
+        assert!(rects.iter().all(|(_, r)| r.y == 0 && r.rows == 24));
+
+        let (v, k1) = Layout::cycle_preset(&ids, 0); // → even-vertical
+        assert_eq!(k1, 1);
+        let rects = v.reflow(80, 25);
+        assert!(rects.iter().all(|(_, r)| r.x == 0 && r.cols == 80));
+
+        let (t, k2) = Layout::cycle_preset(&ids, 1); // → tiled
+        assert_eq!(k2, 2);
+        assert_eq!(t.pane_count(), 4);
     }
 
     #[test]
