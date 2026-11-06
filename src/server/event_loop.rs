@@ -2523,37 +2523,51 @@ fn default_window_name() -> String {
     "shell".to_string()
 }
 
-/// Translate normal cursor keys to application cursor keys when the mode is active.
-/// When `app_cursor_keys` is true:
-/// - \x1b[A/B/C/D → \x1bOA/B/C/D (arrow keys)
-/// - \x1b[H → \x1bOH (Home)
-/// - \x1b[F → \x1bOF (End)
+/// Rewrite cursor / Home / End sequences for the pane.
 ///
-/// This handles the DECCKM (cursor key mode) that programs like htop and zsh enable.
+/// iTerm `-CC` treats us as `screen` and injects Home/End as `\x1b[1~` /
+/// `\x1b[4~`. The pane's TERM is the outer terminal (xterm), whose shell
+/// bindings are `\x1b[H` / `\x1b[F`, or `\x1bOH` / `\x1bOF` once the child
+/// has turned on DECCKM. Arrows get the same `[` → `O` rewrite.
 fn translate_cursor_keys(data: &[u8], app_cursor_keys: bool) -> Vec<u8> {
-    if !app_cursor_keys {
-        return data.to_vec();
-    }
-    // Look for \x1b[A, \x1b[B, \x1b[C, \x1b[D (arrows) and \x1b[H, \x1b[F (Home/End).
-    // Translate the intermediate '[' to 'O' when in application cursor keys mode.
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
+        // screen/tmux Home and End: ESC [ 1 ~ / ESC [ 4 ~
+        if i + 3 < data.len()
+            && data[i] == 0x1b
+            && data[i + 1] == b'['
+            && data[i + 3] == b'~'
+            && matches!(data[i + 2], b'1' | b'4')
+        {
+            let final_byte = if data[i + 2] == b'1' { b'H' } else { b'F' };
+            push_cursor_key(&mut result, final_byte, app_cursor_keys);
+            i += 4;
+            continue;
+        }
         if i + 2 < data.len()
             && data[i] == 0x1b
             && data[i + 1] == b'['
             && matches!(data[i + 2], b'A' | b'B' | b'C' | b'D' | b'H' | b'F')
         {
-            result.push(0x1b);
-            result.push(b'O');
-            result.push(data[i + 2]);
+            push_cursor_key(&mut result, data[i + 2], app_cursor_keys);
             i += 3;
-        } else {
-            result.push(data[i]);
-            i += 1;
+            continue;
         }
+        result.push(data[i]);
+        i += 1;
     }
     result
+}
+
+fn push_cursor_key(out: &mut Vec<u8>, final_byte: u8, app_cursor_keys: bool) {
+    out.push(0x1b);
+    if app_cursor_keys {
+        out.push(b'O');
+    } else {
+        out.push(b'[');
+    }
+    out.push(final_byte);
 }
 
 /// Generate a default session name based on the current directory.
@@ -5387,7 +5401,6 @@ fn format_var(
         // fine, live %output does not).
         "alternate_on"
         | "insert_flag"
-        | "keypad_cursor_flag"
         | "keypad_flag"
         | "mouse_standard_flag"
         | "mouse_button_flag"
@@ -5399,6 +5412,10 @@ fn format_var(
         "wrap_flag" => p
             .map(|p| if p.grid.auto_wrap { "1" } else { "0" }.to_string())
             .unwrap_or_else(|| "1".to_string()),
+        // DECCKM. iTerm uses this to choose `\eOH` vs `\e[H` for Home.
+        "keypad_cursor_flag" => p
+            .map(|p| if p.grid.app_cursor_keys { "1" } else { "0" }.to_string())
+            .unwrap_or_else(|| "0".to_string()),
         "cursor_flag" => p
             .map(|p| {
                 if p.grid.cursor_visible {
@@ -5556,7 +5573,9 @@ fn handle_control_command(
             if let Some((si, wi, pi)) = group_loc {
                 let window = &mut sessions[si].windows[wi];
                 if pi < window.panes.len() && !window.panes[pi].exited && !coalesced.is_empty() {
-                    let _ = window.panes[pi].write_input(&coalesced);
+                    let translated =
+                        translate_cursor_keys(&coalesced, window.panes[pi].grid.app_cursor_keys);
+                    let _ = window.panes[pi].write_input(&translated);
                 }
             }
             for _ in 0..n_respond {
@@ -5676,7 +5695,11 @@ fn handle_single_control_command(
                     respond(client, &[val.as_str()]);
                 }
             } else if args_str.contains("default-terminal") {
-                respond(client, &["screen-256color"]);
+                // The pane inherits the outer TERM (xterm-256color from
+                // iTerm). Advertising `screen` makes iTerm's -CC emulator
+                // screen-like, so Home/End become `\e[1~` / `\e[4~` — which
+                // an xterm shell does not bind (beep, stray `~`).
+                respond(client, &["xterm-256color"]);
             } else if args_str.contains("focus-events") {
                 respond(client, &["off"]);
             } else if args_str.contains("status") {
@@ -6126,7 +6149,9 @@ fn handle_single_control_command(
             };
             let window = &mut sessions[si].windows[wi];
             if pi < window.panes.len() && !window.panes[pi].exited {
-                let _ = window.panes[pi].write_input(&keys);
+                let translated =
+                    translate_cursor_keys(&keys, window.panes[pi].grid.app_cursor_keys);
+                let _ = window.panes[pi].write_input(&translated);
             }
             respond(client, &[]);
         }
@@ -6859,6 +6884,31 @@ fn window_pane_changed_notify(window: &Window) -> String {
         window.id_str(),
         window.pane().id
     )
+}
+
+#[cfg(test)]
+mod cursor_key_tests {
+    use super::translate_cursor_keys;
+
+    #[test]
+    fn screen_home_end_become_xterm_ss3_when_app_cursor() {
+        assert_eq!(translate_cursor_keys(b"\x1b[1~", true), b"\x1bOH".to_vec());
+        assert_eq!(translate_cursor_keys(b"\x1b[4~", true), b"\x1bOF".to_vec());
+    }
+
+    #[test]
+    fn screen_home_end_become_csi_when_normal_cursor() {
+        assert_eq!(
+            translate_cursor_keys(b"\x1b[1~\x1b[4~", false),
+            b"\x1b[H\x1b[F".to_vec()
+        );
+    }
+
+    #[test]
+    fn arrows_only_rewrite_in_app_cursor_mode() {
+        assert_eq!(translate_cursor_keys(b"\x1b[D", false), b"\x1b[D".to_vec());
+        assert_eq!(translate_cursor_keys(b"\x1b[D", true), b"\x1bOD".to_vec());
+    }
 }
 
 #[cfg(test)]
