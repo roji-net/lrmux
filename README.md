@@ -43,7 +43,7 @@ cargo install lrmux
 ```
 
 **From GitHub Releases** (prebuilt binaries, no Rust required) — macOS ARM,
-Linux amd64, and Linux ARM:
+Linux amd64, Linux ARM, and iSH / iPad (`i686-unknown-linux-musl`):
 
 ```sh
 # Example: macOS Apple Silicon
@@ -55,8 +55,8 @@ sudo install -m 755 lrmux-*/lrmux /usr/local/bin/lrmux
 
 Replace `VERSION` and the target triple to match the asset on the
 [Releases](https://github.com/roji-net/lrmux/releases) page
-(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, or
-`aarch64-apple-darwin`).
+(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`aarch64-apple-darwin`, or `i686-unknown-linux-musl` for iSH).
 
 **From source:**
 
