@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 
 use crate::ipc;
-use crate::proto::{self, ClientMsg, ServerMsg, SessionInfo};
+use crate::proto::{self, ClientMsg, ServerMsg, SessionAttachment, SessionInfo};
 use crate::pty;
 use crate::server::pane::Pane;
 use crate::server::session::{Session, unix_now};
@@ -31,6 +31,9 @@ struct ClientConn {
     /// Whether this is a control mode client (tmux -CC).
     /// Control clients receive text notifications instead of grid updates.
     is_control: bool,
+    /// Client-reported hostname (from Identify env / IdentifyControl).
+    /// Used with peer_addr to label attachments in session lists.
+    hostname: String,
     /// Buffered outbound data. Client sockets are non-blocking: when a
     /// client stops reading, sends accumulate here and are flushed on
     /// POLLOUT. If the buffer exceeds CLIENT_OUTBUF_CAP the client is
@@ -85,6 +88,7 @@ impl ClientConn {
             active_window: 0,
             attach,
             is_control: false,
+            hostname: String::new(),
             outbuf: Vec::new(),
             control_seq: 0,
             close_when_idle: false,
@@ -94,6 +98,18 @@ impl ClientConn {
             relay_peer: None,
             relay_in: Vec::new(),
         }
+    }
+
+    /// Origin label for session lists: hostname, else peer IP, else `local`.
+    fn origin_label(&self) -> String {
+        let host = self.hostname.trim();
+        if !host.is_empty() {
+            return host.split('.').next().unwrap_or(host).to_string();
+        }
+        if let Some(addr) = self.stream.peer_addr() {
+            return addr.ip().to_string();
+        }
+        "local".to_string()
     }
 }
 
@@ -1963,6 +1979,8 @@ pub fn run(
                                             rows,
                                             cols,
                                             auth_token,
+                                            hostname,
+                                            attach,
                                         } => {
                                             if !check_tcp_auth(&clients[client_idx], &auth_token) {
                                                 let msg = proto::encode_server(&ServerMsg::Error {
@@ -1975,8 +1993,13 @@ pub fn run(
                                             // Control mode client: mark as control
                                             // and emit the initial state right away,
                                             // like real tmux -CC does after the DCS.
+                                            // `attach` distinguishes long-lived -CC
+                                            // from short-lived tmux-shim commands.
                                             clients[client_idx].is_control = true;
-                                            clients[client_idx].attach = false;
+                                            clients[client_idx].attach = attach;
+                                            if !hostname.is_empty() {
+                                                clients[client_idx].hostname = hostname;
+                                            }
                                             // Send IdentifyAck with the requested grid size.
                                             let msg =
                                                 proto::encode_server(&ServerMsg::IdentifyAck {
@@ -2754,16 +2777,25 @@ fn build_session_list(sessions: &[Session], clients: &[ClientConn]) -> Vec<Sessi
         .iter()
         .enumerate()
         .map(|(si, s)| {
-            let attached = clients
+            // Long-lived attachments only: interactive TUI (`attach && !control`)
+            // or -CC (`attach && control`). Transient tmux-shim commands use
+            // IdentifyControl with attach=false and must not appear here.
+            let attachments: Vec<SessionAttachment> = clients
                 .iter()
-                .filter(|c| c.attach && !c.is_control && c.session_idx == si)
-                .count() as u16;
+                .filter(|c| c.attach && c.session_idx == si)
+                .map(|c| SessionAttachment {
+                    origin: c.origin_label(),
+                    is_control: c.is_control,
+                })
+                .collect();
+            let attached = attachments.len() as u16;
             SessionInfo {
                 name: s.name.clone(),
                 attached,
                 created: s.created_at,
                 last_activity: s.last_activity,
                 has_activity: s.has_activity(),
+                attachments,
             }
         })
         .collect()
@@ -3434,7 +3466,7 @@ fn accept_new_client(
             } else {
                 decode_client_prefixed(&mut stream, sniffed, std::time::Duration::from_secs(2))
             };
-            let (attach, is_control, auth_token) = match first {
+            let (attach, is_control, auth_token, hostname) = match first {
                 Ok(ClientMsg::Identify {
                     attach: a,
                     auth_token,
@@ -3449,9 +3481,19 @@ fn accept_new_client(
                     if a {
                         apply_client_env(&env);
                     }
-                    (a, false, auth_token)
+                    let hostname = env
+                        .iter()
+                        .find(|(k, _)| k == "HOSTNAME")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    (a, false, auth_token, hostname)
                 }
-                Ok(ClientMsg::IdentifyControl { auth_token, .. }) => (false, true, auth_token),
+                Ok(ClientMsg::IdentifyControl {
+                    auth_token,
+                    hostname,
+                    attach,
+                    ..
+                }) => (attach, true, auth_token, hostname),
                 Ok(ClientMsg::ListSessions) => {
                     // Lightweight query: respond with session list and close.
                     let list = build_session_list(sessions, clients);
@@ -3516,6 +3558,7 @@ fn accept_new_client(
             conn.session_idx = session_idx;
             conn.active_window = active;
             conn.is_control = is_control;
+            conn.hostname = hostname;
             crate::log::info(&format!(
                 "client connected: session_idx={session_idx}, window={active}, total clients={}",
                 clients.len() + 1
@@ -3525,12 +3568,11 @@ fn accept_new_client(
             let _ = conn.stream.set_nonblocking(true);
             clients.push(conn);
             let ci = clients.len() - 1;
-            // Only send snapshot + status bar to interactive clients
-            // (attach=true). CLI commands (attach=false) only need the
-            // IdentifyAck. send_snapshot_to_client is the same path window
-            // switches use — it also replays pane scrollback so a fresh
-            // attach has history for copy mode.
-            if attach {
+            // Snapshot + status bar only for interactive TUI clients.
+            // Control-mode (`-CC`) uses attach=true for session-list
+            // accounting but speaks %notifications, not grid updates.
+            // CLI commands (attach=false) only need the IdentifyAck.
+            if attach && !is_control {
                 if send_snapshot_to_client(&mut clients[ci], sessions).is_err() {
                     clients.remove(ci);
                     return Ok(());
@@ -4541,7 +4583,7 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
         }
         0x15 => ClientMsg::GetLog,
         0x16 => {
-            // IdentifyControl: rows (u16) + cols (u16)
+            // IdentifyControl: rows + cols + auth_token [+ hostname + attach]
             if data.len() < 4 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -4550,20 +4592,30 @@ fn try_parse_frame(buf: &mut Vec<u8>) -> io::Result<Option<ClientMsg>> {
             }
             let rows = u16::from_le_bytes([data[0], data[1]]);
             let cols = u16::from_le_bytes([data[2], data[3]]);
-            let auth_token = if data.len() >= 8 {
-                let len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-                if data.len() >= 8 + len {
-                    String::from_utf8_lossy(&data[8..8 + len]).into_owned()
-                } else {
-                    String::new()
+            let mut off = 4usize;
+            let take_str = |d: &[u8], off: &mut usize| -> String {
+                if d.len() < *off + 4 {
+                    return String::new();
                 }
-            } else {
-                String::new()
+                let len =
+                    u32::from_le_bytes([d[*off], d[*off + 1], d[*off + 2], d[*off + 3]]) as usize;
+                *off += 4;
+                if d.len() < *off + len {
+                    return String::new();
+                }
+                let s = String::from_utf8_lossy(&d[*off..*off + len]).into_owned();
+                *off += len;
+                s
             };
+            let auth_token = take_str(data, &mut off);
+            let hostname = take_str(data, &mut off);
+            let attach = off < data.len() && data[off] != 0;
             ClientMsg::IdentifyControl {
                 rows,
                 cols,
                 auth_token,
+                hostname,
+                attach,
             }
         }
         0x17 => {
@@ -6294,10 +6346,12 @@ fn handle_single_control_command(
                 let layout_notify = layout_change_notify(&win);
                 let pane_notify = window_pane_changed_notify(&win);
                 session.windows.push(win);
-                send_control_notify(client, &format!("%window-add {}", wid_str));
-                send_control_notify(client, &format!("%window-renamed {} {}", wid_str, wname));
-                send_control_notify(client, &layout_notify);
-                send_control_notify(client, &pane_notify);
+                // Broadcast so a long-lived -CC client learns about windows
+                // created by a transient tmux/CLI control connection.
+                pending_notifies.push(format!("%window-add {wid_str}"));
+                pending_notifies.push(format!("%window-renamed {wid_str} {wname}"));
+                pending_notifies.push(layout_notify);
+                pending_notifies.push(pane_notify);
             }
             if !wid_str.is_empty() {
                 refresh_affinity_options(sessions);
@@ -6348,7 +6402,7 @@ fn handle_single_control_command(
                 let wid = window.id_str();
                 sessions[si].windows.remove(wi);
                 refresh_affinity_options(sessions);
-                send_control_notify(client, &format!("%window-close {}", wid));
+                pending_notifies.push(format!("%window-close {wid}"));
                 if client.session_idx == si && client.active_window >= sessions[si].windows.len() {
                     client.active_window = sessions[si].windows.len().saturating_sub(1);
                 }
@@ -6385,13 +6439,13 @@ fn handle_single_control_command(
                 match sessions[si].windows[wi].remove_pane(pane_id) {
                     Some(Removed::Pane) => {
                         let w = &sessions[si].windows[wi];
-                        send_control_notify(client, &layout_change_notify(w));
-                        send_control_notify(client, &window_pane_changed_notify(w));
+                        pending_notifies.push(layout_change_notify(w));
+                        pending_notifies.push(window_pane_changed_notify(w));
                     }
                     Some(Removed::WindowEmpty) | None => {
                         sessions[si].windows.remove(wi);
                         refresh_affinity_options(sessions);
-                        send_control_notify(client, &format!("%window-close {}", wid));
+                        pending_notifies.push(format!("%window-close {wid}"));
                         if client.session_idx == si
                             && client.active_window >= sessions[si].windows.len()
                         {
