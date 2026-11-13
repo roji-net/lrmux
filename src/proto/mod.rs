@@ -7,11 +7,20 @@ use std::io::{self, Read, Write};
 
 use crate::grid::{Attr, Cell, Color};
 
+/// One live attachment reported in a `SessionList` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttachment {
+    /// Client origin: hostname, peer IP, or `local` for Unix sockets.
+    pub origin: String,
+    /// True when this is a tmux control-mode (`-CC`) client.
+    pub is_control: bool,
+}
+
 /// Metadata for one session in a `SessionList` response.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub name: String,
-    /// Number of interactive (non-control) attached clients.
+    /// Number of attached clients (TUI + long-lived `-CC`).
     pub attached: u16,
     /// Unix epoch seconds when the session was created.
     pub created: u64,
@@ -19,6 +28,39 @@ pub struct SessionInfo {
     pub last_activity: u64,
     /// True if any window has output the user may not have seen.
     pub has_activity: bool,
+    /// Per-client attachment descriptors for display (`attached@host -CC`).
+    pub attachments: Vec<SessionAttachment>,
+}
+
+impl SessionInfo {
+    /// Human-readable attach status for `ls` / selector / discover.
+    ///
+    /// Examples: `detached`, `attached@local`, `attached@mbp -CC`,
+    /// `attached@local, 10.0.0.5 -CC`, `attached@a, b, c +2`.
+    pub fn status_label(&self) -> String {
+        if self.attachments.is_empty() {
+            return "detached".to_string();
+        }
+        const CAP: usize = 3;
+        let parts: Vec<String> = self
+            .attachments
+            .iter()
+            .take(CAP)
+            .map(|a| {
+                if a.is_control {
+                    format!("{} -CC", a.origin)
+                } else {
+                    a.origin.clone()
+                }
+            })
+            .collect();
+        let mut label = format!("attached@{}", parts.join(", "));
+        let extra = self.attachments.len().saturating_sub(CAP);
+        if extra > 0 {
+            label.push_str(&format!(" +{extra}"));
+        }
+        label
+    }
 }
 
 /// One peer in a `PeerList` response — a flattened view of the
@@ -139,10 +181,15 @@ pub enum ClientMsg {
     GetLog,
     /// Control mode client identifies itself.
     /// The server will send text notifications instead of grid updates.
+    /// `attach` is true for a long-lived `-CC` session (iTerm); false for
+    /// short-lived CLI/tmux-shim command connections.
+    /// `hostname` is optional client-reported identity for session lists.
     IdentifyControl {
         rows: u16,
         cols: u16,
         auth_token: String,
+        hostname: String,
+        attach: bool,
     },
     /// Control mode client sends a tmux-style command line.
     /// The server parses it using the cmd module and executes it.
@@ -638,12 +685,17 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             rows,
             cols,
             auth_token,
+            hostname,
+            attach,
         } => {
             payload.push(C_IDENTIFY_CONTROL);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
             payload.extend_from_slice(&(auth_token.len() as u32).to_le_bytes());
             payload.extend_from_slice(auth_token.as_bytes());
+            payload.extend_from_slice(&(hostname.len() as u32).to_le_bytes());
+            payload.extend_from_slice(hostname.as_bytes());
+            payload.push(if *attach { 1 } else { 0 });
         }
         ClientMsg::ControlCommand { line } => {
             payload.push(C_CONTROL_COMMAND);
@@ -890,6 +942,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(&info.created.to_le_bytes());
                 payload.extend_from_slice(&info.last_activity.to_le_bytes());
                 payload.push(info.has_activity as u8);
+                payload.extend_from_slice(&(info.attachments.len() as u32).to_le_bytes());
+                for a in &info.attachments {
+                    payload.extend_from_slice(&(a.origin.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(a.origin.as_bytes());
+                    payload.push(a.is_control as u8);
+                }
             }
             payload.extend_from_slice(&(address.len() as u32).to_le_bytes());
             payload.extend_from_slice(address.as_bytes());
@@ -1305,10 +1363,19 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
             let rows = read_u16(&mut r)?;
             let cols = read_u16(&mut r)?;
             let auth_token = read_optional_string(&mut r)?;
+            // Trailing fields are optional for older clients.
+            let hostname = read_optional_string(&mut r)?;
+            let attach = if r.is_empty() {
+                false
+            } else {
+                read_u8(&mut r)? != 0
+            };
             Ok(ClientMsg::IdentifyControl {
                 rows,
                 cols,
                 auth_token,
+                hostname,
+                attach,
             })
         }
         C_CONTROL_COMMAND => {
@@ -1624,12 +1691,28 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 let created = read_u64(&mut r)?;
                 let last_activity = read_u64(&mut r)?;
                 let has_activity = read_u8(&mut r)? != 0;
+                let n_att = read_u32(&mut r)? as usize;
+                let mut attachments = Vec::with_capacity(n_att);
+                for _ in 0..n_att {
+                    let olen = read_u32(&mut r)? as usize;
+                    if r.len() < olen + 1 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated session attachment",
+                        ));
+                    }
+                    let origin = String::from_utf8_lossy(&r[..olen]).into_owned();
+                    r = &r[olen..];
+                    let is_control = read_u8(&mut r)? != 0;
+                    attachments.push(SessionAttachment { origin, is_control });
+                }
                 sessions.push(SessionInfo {
                     name,
                     attached,
                     created,
                     last_activity,
                     has_activity,
+                    attachments,
                 });
             }
             let address = if r.is_empty() {
@@ -1911,6 +1994,16 @@ mod tests {
                 created: 1_700_000_000,
                 last_activity: 1_700_000_100,
                 has_activity: true,
+                attachments: vec![
+                    SessionAttachment {
+                        origin: "local".into(),
+                        is_control: false,
+                    },
+                    SessionAttachment {
+                        origin: "10.0.0.5".into(),
+                        is_control: true,
+                    },
+                ],
             }],
             address: "/tmp/lrmux-1/default".into(),
         };
@@ -1922,9 +2015,38 @@ mod tests {
                 assert_eq!(sessions[0].name, "dev");
                 assert_eq!(sessions[0].attached, 2);
                 assert!(sessions[0].has_activity);
+                assert_eq!(sessions[0].status_label(), "attached@local, 10.0.0.5 -CC");
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_info_status_label_caps_and_detached() {
+        let detached = SessionInfo {
+            name: "x".into(),
+            attached: 0,
+            created: 0,
+            last_activity: 0,
+            has_activity: false,
+            attachments: vec![],
+        };
+        assert_eq!(detached.status_label(), "detached");
+
+        let many = SessionInfo {
+            name: "x".into(),
+            attached: 5,
+            created: 0,
+            last_activity: 0,
+            has_activity: false,
+            attachments: (0..5)
+                .map(|i| SessionAttachment {
+                    origin: format!("h{i}"),
+                    is_control: i % 2 == 1,
+                })
+                .collect(),
+        };
+        assert_eq!(many.status_label(), "attached@h0, h1 -CC, h2 +2");
     }
 
     #[test]

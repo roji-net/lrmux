@@ -107,10 +107,14 @@ fn dispatch(socket: &str, session_id: Option<&str>, cmd_args: &[String]) -> io::
     let mut stream = ipc::connect_any(std::path::Path::new(socket))
         .map_err(|e| io::Error::new(e.kind(), format!("error connecting to {socket} ({e})")))?;
 
+    // attach=false: short-lived command client — must not count as a
+    // session attachment in `lrmux ls`.
     let msg = proto::encode_client(&ClientMsg::IdentifyControl {
         rows: 24,
         cols: 80,
         auth_token: crate::config::effective_psk(),
+        hostname: crate::compat::hostname(),
+        attach: false,
     });
     proto::send(&mut stream, &msg)?;
 

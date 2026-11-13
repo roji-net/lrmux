@@ -90,11 +90,13 @@ pub fn run(socket_path: &std::path::Path) -> io::Result<()> {
     // in that case, just continue without the guard.
     let _term_guard = ControlModeGuard::enter(libc::STDIN_FILENO).ok();
 
-    // Send IdentifyControl.
+    // Send IdentifyControl (attach=true: long-lived iTerm -CC session).
     let msg = proto::encode_client(&ClientMsg::IdentifyControl {
         rows,
         cols,
         auth_token: crate::config::effective_psk(),
+        hostname: crate::compat::hostname(),
+        attach: true,
     });
     proto::send(&mut stream, &msg)?;
 

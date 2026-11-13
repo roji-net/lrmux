@@ -1667,11 +1667,7 @@ fn cmd_discover() -> io::Result<()> {
     for e in lan {
         println!("{}", e.display_label());
         for s in &e.sessions {
-            let status = if s.attached > 0 {
-                "attached"
-            } else {
-                "detached"
-            };
+            let status = s.status_label();
             let act = if s.has_activity { " ●" } else { "" };
             println!("  {} ({status}){act}", s.name);
         }
@@ -1806,11 +1802,7 @@ fn list_sessions(server: Option<&str>) -> io::Result<()> {
         for s in &e.sessions {
             any = true;
             let tag = if e.is_this_machine() { "local" } else { "lan" };
-            let status = if s.attached > 0 {
-                "attached"
-            } else {
-                "detached"
-            };
+            let status = s.status_label();
             let act = if s.has_activity { " ●" } else { "" };
             if multi {
                 println!(

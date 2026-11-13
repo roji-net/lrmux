@@ -118,10 +118,18 @@ pub fn terminal_env_overlay() -> Vec<(String, String)> {
         "TERMINAL_EMULATOR",
         "WEZTERM_EXECUTABLE",
         "KITTY_WINDOW_ID",
+        "HOSTNAME",
     ];
-    KEYS.iter()
+    let mut env: Vec<(String, String)> = KEYS
+        .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect()
+        .collect();
+    // Always advertise a hostname so session lists can show attached@host
+    // even when HOSTNAME is unset in the client environment.
+    if !env.iter().any(|(k, _)| k == "HOSTNAME") {
+        env.push(("HOSTNAME".into(), crate::compat::hostname()));
+    }
+    env
 }
 
 /// Capture a pane's contents from a server. `tcp` overrides the local

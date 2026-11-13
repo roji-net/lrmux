@@ -372,6 +372,7 @@ fn merge_peer_list(entries: &mut Vec<ServerEntry>, peers: Vec<proto::PeerInfo>) 
                     created: 0,
                     last_activity: 0,
                     has_activity: false,
+                    attachments: Vec::new(),
                 })
                 .collect(),
             address: p.addr,
