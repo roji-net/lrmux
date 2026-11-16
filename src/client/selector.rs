@@ -48,6 +48,8 @@ struct Entry {
     /// ListSessions failed. Enter reports this and stays in the selector.
     unreachable: Option<String>,
     attached: u16,
+    /// Pre-formatted attach status (`detached`, `attached@host -CC`, …).
+    status: String,
     created: u64,
     last_activity: u64,
     has_activity: bool,
@@ -70,15 +72,13 @@ impl Entry {
         )
     }
 
-    fn status_label(&self) -> &'static str {
+    fn status_label(&self) -> &str {
         if self.unreachable.is_some() {
             "unreachable"
         } else if self.session == "(no sessions)" {
             "empty"
-        } else if self.attached > 0 {
-            "attached"
         } else {
-            "detached"
+            self.status.as_str()
         }
     }
 
@@ -258,6 +258,7 @@ fn push_server_entries(
             addr,
             unreachable: Some(err.clone()),
             attached: 0,
+            status: "unreachable".into(),
             created: 0,
             last_activity: 0,
             has_activity: false,
@@ -275,6 +276,7 @@ fn push_server_entries(
             addr,
             unreachable: None,
             attached: 0,
+            status: "empty".into(),
             created: 0,
             last_activity: 0,
             has_activity: false,
@@ -313,6 +315,7 @@ fn entry_from_info(
         addr,
         unreachable: None,
         attached: info.attached,
+        status: info.status_label(),
         created: info.created,
         last_activity: info.last_activity,
         has_activity: info.has_activity,
@@ -492,7 +495,8 @@ fn interactive_selector(
         const W_NUM: usize = 3;
         const W_ACT: usize = 2;
         const W_SESS: usize = 34;
-        const W_STAT: usize = 11;
+        // Wide enough for `attached@host -CC` / a couple of origins.
+        const W_STAT: usize = 28;
         const W_CREATED: usize = 12;
         const W_LAST: usize = 12;
         let w_addr = if entries.iter().any(|e| e.addr.is_some()) {
@@ -564,11 +568,14 @@ fn interactive_selector(
 
                 let status_cell = {
                     let plain = pad_visible(status, W_STAT);
-                    match status {
-                        "attached" => format!("\x1b[32m{plain}\x1b[0m"),
-                        "detached" => format!("\x1b[90m{plain}\x1b[0m"),
-                        "unreachable" => format!("\x1b[31m{plain}\x1b[0m"),
-                        _ => plain,
+                    if status == "detached" || status == "empty" {
+                        format!("\x1b[90m{plain}\x1b[0m")
+                    } else if status == "unreachable" {
+                        format!("\x1b[31m{plain}\x1b[0m")
+                    } else if status.starts_with("attached") {
+                        format!("\x1b[32m{plain}\x1b[0m")
+                    } else {
+                        plain
                     }
                 };
 

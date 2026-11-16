@@ -118,10 +118,18 @@ pub fn terminal_env_overlay() -> Vec<(String, String)> {
         "TERMINAL_EMULATOR",
         "WEZTERM_EXECUTABLE",
         "KITTY_WINDOW_ID",
+        "HOSTNAME",
     ];
-    KEYS.iter()
+    let mut env: Vec<(String, String)> = KEYS
+        .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect()
+        .collect();
+    // Always advertise a hostname so session lists can show attached@host
+    // even when HOSTNAME is unset in the client environment.
+    if !env.iter().any(|(k, _)| k == "HOSTNAME") {
+        env.push(("HOSTNAME".into(), crate::compat::hostname()));
+    }
+    env
 }
 
 /// Capture a pane's contents from a server. `tcp` overrides the local
@@ -237,34 +245,63 @@ pub fn run(
     proto::send(&mut stream, &identify)?;
 
     // Wait for IdentifyAck to get grid dimensions and server version.
-    let (grid_rows, grid_cols, server_version) = match proto::decode_server(&mut stream) {
-        Ok(ServerMsg::IdentifyAck {
-            rows,
-            cols,
-            version,
-            address: _,
-        }) => {
-            if version != "unknown" && version != version::VERSION {
-                eprintln!("\rlrmux: WARNING — server is running a different version: {version}");
+    let (grid_rows, grid_cols, server_version, negotiated_proto, server_proto_range) =
+        match proto::decode_server(&mut stream) {
+            Ok(ServerMsg::IdentifyAck {
+                rows,
+                cols,
+                version,
+                address: _,
+                proto: negotiated,
+                proto_min,
+                proto_max,
+            }) => {
+                if negotiated < proto::PROTO_MIN {
+                    restore_terminal();
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!(
+                            "server speaks protocol v{negotiated}, this client requires \
+                             ≥v{}; upgrade the server",
+                            proto::PROTO_MIN
+                        ),
+                    ));
+                }
+                if version != "unknown" && version != version::VERSION {
+                    eprintln!(
+                        "\rlrmux: WARNING — server is running a different version: {version}"
+                    );
+                }
+                if negotiated < proto::PROTO_MAX {
+                    eprintln!("\rlrmux: protocol downgraded to v{negotiated}");
+                }
+                (
+                    rows as usize,
+                    cols as usize,
+                    version,
+                    negotiated,
+                    proto::ProtoRange {
+                        min: proto_min,
+                        max: proto_max,
+                    },
+                )
             }
-            (rows as usize, cols as usize, version)
-        }
-        Ok(ServerMsg::Error { msg }) => {
-            restore_terminal();
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg));
-        }
-        Ok(_) => {
-            restore_terminal();
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected IdentifyAck",
-            ));
-        }
-        Err(e) => {
-            restore_terminal();
-            return Err(e);
-        }
-    };
+            Ok(ServerMsg::Error { msg }) => {
+                restore_terminal();
+                return Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg));
+            }
+            Ok(_) => {
+                restore_terminal();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected IdentifyAck",
+                ));
+            }
+            Err(e) => {
+                restore_terminal();
+                return Err(e);
+            }
+        };
 
     // Filter for terminal replies arriving on stdin — late OSC/CSI/DCS
     // responses to our probes are client-side traffic, not pane input.
@@ -973,26 +1010,16 @@ pub fn run(
                         );
                     }
                     if show_help {
-                        show_help_overlay(&server_version);
-                        // Invalidate the renderer so the screen is fully redrawn.
-                        renderer.invalidate();
-                        // Re-establish the scroll region and re-render.
-                        let view_rows = term_rows.saturating_sub(1);
-                        let mut stdout = client_stdout();
-                        write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
-                        renderer.render(&mut stdout, &mut grid)?;
-                        render_status_bar(
-                            &mut stdout,
+                        show_help_overlay(&server_version, negotiated_proto, server_proto_range);
+                        restore_after_overlay(
+                            &mut renderer,
+                            &mut grid,
                             &status_text,
                             term_rows,
                             term_cols,
-                            &grid,
-                            mouse_reporting_on(applied_mouse),
+                            applied_mouse,
+                            &mut stream,
                         )?;
-                        // Ask the server for a fresh snapshot too — a plain
-                        // re-render can leave stale rows after the overlay
-                        // cleared the screen.
-                        send_cmd(&mut stream, &ClientMsg::Refresh)?;
                     }
                     if request_session_chooser {
                         pending_session_chooser = true;
@@ -1441,24 +1468,29 @@ pub fn run(
                                     });
                                     let _ = proto::send(&mut stream, &msg);
                                 }
-                                // Invalidate the renderer so the screen is fully redrawn.
-                                renderer.invalidate();
-                                let view_rows = term_rows.saturating_sub(1);
-                                let mut stdout = client_stdout();
-                                write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
-                                renderer.render(&mut stdout, &mut grid)?;
+                                restore_after_overlay(
+                                    &mut renderer,
+                                    &mut grid,
+                                    &status_text,
+                                    term_rows,
+                                    term_cols,
+                                    applied_mouse,
+                                    &mut stream,
+                                )?;
                             }
                         }
                         ServerMsg::WindowCapture { .. } => {}
                         ServerMsg::LogContent { lines } => {
                             show_log_overlay(&lines);
-                            // Invalidate the renderer so the screen is fully redrawn.
-                            renderer.invalidate();
-                            // Re-establish the scroll region and re-render.
-                            let view_rows = term_rows.saturating_sub(1);
-                            let mut stdout = client_stdout();
-                            write!(stdout, "\x1b[1;{}r", view_rows.max(1)).ok();
-                            renderer.render(&mut stdout, &mut grid)?;
+                            restore_after_overlay(
+                                &mut renderer,
+                                &mut grid,
+                                &status_text,
+                                term_rows,
+                                term_cols,
+                                applied_mouse,
+                                &mut stream,
+                            )?;
                         }
                         ServerMsg::Error { msg } => {
                             exit_reason = Some(format!("server error: {msg}"));
@@ -2731,6 +2763,44 @@ fn try_parse_server_frame(buf: &mut Vec<u8>) -> io::Result<Option<ServerMsg>> {
     Ok(Some(msg))
 }
 
+/// Restore the pane view after a full-screen overlay (help, server log,
+/// session chooser) is dismissed. Re-establishes the scroll region,
+/// forces a full repaint + status bar, then asks the server for a fresh
+/// snapshot — a plain re-render can leave stale rows after the overlay
+/// cleared the screen.
+fn restore_after_overlay(
+    renderer: &mut render::Renderer,
+    grid: &mut composite::WindowView,
+    status_text: &str,
+    term_rows: usize,
+    term_cols: usize,
+    applied_mouse: Option<u8>,
+    stream: &mut ipc::ConnStream,
+) -> io::Result<()> {
+    renderer.invalidate();
+    grid.mark_all_dirty();
+    let view_rows = term_rows.saturating_sub(1);
+    let mut stdout = client_stdout();
+    write!(stdout, "\x1b[1;{}r", view_rows.max(1))?;
+    renderer.render(&mut stdout, &mut grid.composite)?;
+    render_filler(
+        &mut stdout,
+        grid.win_rows,
+        grid.win_cols,
+        term_rows,
+        term_cols,
+    )?;
+    render_status_bar(
+        &mut stdout,
+        status_text,
+        term_rows,
+        term_cols,
+        &grid.composite,
+        mouse_reporting_on(applied_mouse),
+    )?;
+    send_cmd(stream, &ClientMsg::Refresh)
+}
+
 /// Show the server ring log as a temporary overlay.
 /// Waits for any key to dismiss.
 fn show_log_overlay(lines: &[String]) {
@@ -2876,7 +2946,11 @@ fn show_pane_numbers_overlay(
 
 /// Show the keybindings help as a temporary overlay.
 /// Waits for any key to dismiss.
-fn show_help_overlay(server_version: &str) {
+fn show_help_overlay(
+    server_version: &str,
+    negotiated_proto: u16,
+    server_proto_range: proto::ProtoRange,
+) {
     use std::io::Read;
     let mut stdout = client_stdout();
     let (rows, _cols) = terminal::get_size();
@@ -2886,11 +2960,24 @@ fn show_help_overlay(server_version: &str) {
 
     let title = "lrmux keybindings (press any key to dismiss)";
     write!(stdout, "\x1b[1;36m{title}\x1b[0m\r\n").ok();
+    let client_range = proto::proto_range();
     write!(
         stdout,
-        "  client: \x1b[33m{}\x1b[0m  server: \x1b[33m{}\x1b[0m\r\n",
+        "  client: \x1b[33m{}\x1b[0m  \x1b[36m(Proto Versions: v{}-v{})\x1b[0m\r\n",
         version::VERSION,
-        server_version
+        client_range.min,
+        client_range.max
+    )
+    .ok();
+    write!(
+        stdout,
+        "  server: \x1b[33m{}\x1b[0m  \x1b[36m(Proto Versions: v{}-v{})\x1b[0m\r\n",
+        server_version, server_proto_range.min, server_proto_range.max
+    )
+    .ok();
+    write!(
+        stdout,
+        "  Negotiated Protocol Version: \x1b[33mv{negotiated_proto}\x1b[0m\r\n"
     )
     .ok();
     write!(stdout, "\r\n").ok();

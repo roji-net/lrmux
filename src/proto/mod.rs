@@ -4,14 +4,97 @@
 // Length = 1 (type) + payload length.
 
 use std::io::{self, Read, Write};
+use std::sync::OnceLock;
 
 use crate::grid::{Attr, Cell, Color};
+
+// ── Protocol version ────────────────────────────────────────────────
+//
+// Docker-style version negotiation: the client advertises a supported
+// range in Identify/IdentifyControl, the server replies with the
+// negotiated version in IdentifyAck (`min(client_max, server_max)` when
+// it satisfies both minimums). Peers that send no version fields are
+// assumed to speak PROTO_LEGACY.
+//
+// INVARIANT: the first-flight handshake messages (Identify,
+// IdentifyControl, IdentifyAck) may only ever grow by appending
+// optional trailing fields — changing their existing layout would break
+// version negotiation itself. Lightweight probe messages (bare
+// ListSessions/KillServer without an Identify) cannot negotiate and
+// must stay wire-stable.
+
+/// Oldest wire protocol version this build can still speak.
+pub const PROTO_MIN: u16 = 1;
+/// Newest wire protocol version this build speaks. Bump when the wire
+/// format changes in a way trailing optional fields can't cover.
+pub const PROTO_MAX: u16 = 1;
+/// Version assumed for peers that send no proto fields
+/// (pre-versioning builds).
+pub const PROTO_LEGACY: u16 = 1;
+
+/// A peer's advertised protocol-version range (inclusive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtoRange {
+    pub min: u16,
+    pub max: u16,
+}
+
+impl ProtoRange {
+    /// Range attributed to pre-versioning peers and to non-hello
+    /// messages (probe clients never negotiate).
+    pub const LEGACY: ProtoRange = ProtoRange {
+        min: PROTO_LEGACY,
+        max: PROTO_LEGACY,
+    };
+}
+
+/// Highest protocol version two ranges have in common: the smaller max,
+/// provided it satisfies both minimums. `None` = no common version.
+pub fn negotiate_range(a: ProtoRange, b: ProtoRange) -> Option<u16> {
+    let v = a.max.min(b.max);
+    (v >= a.min.max(b.min)).then_some(v)
+}
+
+/// This build's advertised protocol range. `LRMUX_PROTO_MIN` /
+/// `LRMUX_PROTO_MAX` env vars clamp it (test/debug escape hatch, like
+/// Docker's DOCKER_API_VERSION); values outside the compiled range are
+/// ignored.
+pub fn proto_range() -> ProtoRange {
+    static RANGE: OnceLock<ProtoRange> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let parse = |key: &str, default: u16| -> u16 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let min = parse("LRMUX_PROTO_MIN", PROTO_MIN).clamp(PROTO_MIN, PROTO_MAX);
+        let max = parse("LRMUX_PROTO_MAX", PROTO_MAX).clamp(min, PROTO_MAX);
+        ProtoRange { min, max }
+    })
+}
+
+/// Write the protocol range trailer appended to Identify/IdentifyControl.
+fn push_proto_range(payload: &mut Vec<u8>) {
+    let range = proto_range();
+    payload.extend_from_slice(&range.min.to_le_bytes());
+    payload.extend_from_slice(&range.max.to_le_bytes());
+}
+
+/// One live attachment reported in a `SessionList` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttachment {
+    /// Client origin: hostname, peer IP, or `local` for Unix sockets.
+    pub origin: String,
+    /// True when this is a tmux control-mode (`-CC`) client.
+    pub is_control: bool,
+}
 
 /// Metadata for one session in a `SessionList` response.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub name: String,
-    /// Number of interactive (non-control) attached clients.
+    /// Number of attached clients (TUI + long-lived `-CC`).
     pub attached: u16,
     /// Unix epoch seconds when the session was created.
     pub created: u64,
@@ -19,6 +102,39 @@ pub struct SessionInfo {
     pub last_activity: u64,
     /// True if any window has output the user may not have seen.
     pub has_activity: bool,
+    /// Per-client attachment descriptors for display (`attached@host -CC`).
+    pub attachments: Vec<SessionAttachment>,
+}
+
+impl SessionInfo {
+    /// Human-readable attach status for `ls` / selector / discover.
+    ///
+    /// Examples: `detached`, `attached@local`, `attached@mbp -CC`,
+    /// `attached@local, 10.0.0.5 -CC`, `attached@a, b, c +2`.
+    pub fn status_label(&self) -> String {
+        if self.attachments.is_empty() {
+            return "detached".to_string();
+        }
+        const CAP: usize = 3;
+        let parts: Vec<String> = self
+            .attachments
+            .iter()
+            .take(CAP)
+            .map(|a| {
+                if a.is_control {
+                    format!("{} -CC", a.origin)
+                } else {
+                    a.origin.clone()
+                }
+            })
+            .collect();
+        let mut label = format!("attached@{}", parts.join(", "));
+        let extra = self.attachments.len().saturating_sub(CAP);
+        if extra > 0 {
+            label.push_str(&format!(" +{extra}"));
+        }
+        label
+    }
 }
 
 /// One peer in a `PeerList` response — a flattened view of the
@@ -49,6 +165,8 @@ pub enum ClientMsg {
     /// `attach: false` for CLI commands (no snapshot needed).
     /// `auth_token` is required on TCP when the server has one configured;
     /// ignored for Unix-socket clients.
+    /// On the wire the encoder appends the client's protocol-version
+    /// range after `env` (see the "Protocol version" section).
     Identify {
         rows: u16,
         cols: u16,
@@ -139,10 +257,15 @@ pub enum ClientMsg {
     GetLog,
     /// Control mode client identifies itself.
     /// The server will send text notifications instead of grid updates.
+    /// `attach` is true for a long-lived `-CC` session (iTerm); false for
+    /// short-lived CLI/tmux-shim command connections.
+    /// `hostname` is optional client-reported identity for session lists.
     IdentifyControl {
         rows: u16,
         cols: u16,
         auth_token: String,
+        hostname: String,
+        attach: bool,
     },
     /// Control mode client sends a tmux-style command line.
     /// The server parses it using the cmd module and executes it.
@@ -209,11 +332,17 @@ pub struct PaneRect {
 #[derive(Debug)]
 pub enum ServerMsg {
     /// Acknowledge identify, send initial grid dimensions, version, and address.
+    /// `proto` is the negotiated protocol version and `proto_min`/`proto_max`
+    /// the server's supported range (see the "Protocol version" section);
+    /// absent on pre-versioning servers → PROTO_LEGACY.
     IdentifyAck {
         rows: u16,
         cols: u16,
         version: String,
         address: String,
+        proto: u16,
+        proto_min: u16,
+        proto_max: u16,
     },
     /// Full grid snapshot (sent on first connect, window switch, or after resize).
     /// With multi-pane, one snapshot is sent per pane after [`WindowLayout`].
@@ -430,6 +559,8 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
                 payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 payload.extend_from_slice(v.as_bytes());
             }
+            // Trailing protocol-version range — ignored by older servers.
+            push_proto_range(&mut payload);
         }
         ClientMsg::PaneInput { data } => {
             payload.push(C_PANE_INPUT);
@@ -638,12 +769,19 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             rows,
             cols,
             auth_token,
+            hostname,
+            attach,
         } => {
             payload.push(C_IDENTIFY_CONTROL);
             payload.extend_from_slice(&rows.to_le_bytes());
             payload.extend_from_slice(&cols.to_le_bytes());
             payload.extend_from_slice(&(auth_token.len() as u32).to_le_bytes());
             payload.extend_from_slice(auth_token.as_bytes());
+            payload.extend_from_slice(&(hostname.len() as u32).to_le_bytes());
+            payload.extend_from_slice(hostname.as_bytes());
+            payload.push(if *attach { 1 } else { 0 });
+            // Trailing protocol-version range — ignored by older servers.
+            push_proto_range(&mut payload);
         }
         ClientMsg::ControlCommand { line } => {
             payload.push(C_CONTROL_COMMAND);
@@ -743,6 +881,9 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             cols,
             version,
             address,
+            proto,
+            proto_min,
+            proto_max,
         } => {
             payload.push(S_IDENTIFY_ACK);
             payload.extend_from_slice(&rows.to_le_bytes());
@@ -751,6 +892,11 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(version.as_bytes());
             payload.extend_from_slice(&(address.len() as u32).to_le_bytes());
             payload.extend_from_slice(address.as_bytes());
+            // Trailing negotiated protocol version + server range —
+            // ignored by older clients.
+            payload.extend_from_slice(&proto.to_le_bytes());
+            payload.extend_from_slice(&proto_min.to_le_bytes());
+            payload.extend_from_slice(&proto_max.to_le_bytes());
         }
         ServerMsg::GridSnapshot {
             rows,
@@ -890,6 +1036,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
                 payload.extend_from_slice(&info.created.to_le_bytes());
                 payload.extend_from_slice(&info.last_activity.to_le_bytes());
                 payload.push(info.has_activity as u8);
+                payload.extend_from_slice(&(info.attachments.len() as u32).to_le_bytes());
+                for a in &info.attachments {
+                    payload.extend_from_slice(&(a.origin.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(a.origin.as_bytes());
+                    payload.push(a.is_control as u8);
+                }
             }
             payload.extend_from_slice(&(address.len() as u32).to_le_bytes());
             payload.extend_from_slice(address.as_bytes());
@@ -1044,37 +1196,106 @@ fn read_frame<R: Read + ?Sized>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
     Ok((msg_type, payload[1..].to_vec()))
 }
 
+/// Optional trailing protocol-version range (absent → PROTO_LEGACY).
+fn read_proto_range(r: &mut &[u8]) -> io::Result<ProtoRange> {
+    if r.len() >= 4 {
+        Ok(ProtoRange {
+            min: read_u16(r)?,
+            max: read_u16(r)?,
+        })
+    } else {
+        Ok(ProtoRange::LEGACY)
+    }
+}
+
+/// Decode an Identify payload, including the trailing protocol range.
+fn decode_identify(r: &mut &[u8]) -> io::Result<(ClientMsg, ProtoRange)> {
+    let rows = read_u16(r)?;
+    let cols = read_u16(r)?;
+    let attach = r.first().copied().unwrap_or(1) != 0;
+    if !r.is_empty() {
+        *r = &r[1..];
+    }
+    let auth_token = read_optional_string(r)?;
+    // Trailing env pairs (newer clients; absent on old ones).
+    let mut env: Vec<(String, String)> = Vec::new();
+    if r.len() >= 4 {
+        let count = read_u32(r)? as usize;
+        for _ in 0..count.min(64) {
+            let k = read_optional_string(r)?;
+            let v = read_optional_string(r)?;
+            env.push((k, v));
+        }
+    }
+    // Trailing protocol range (newest; absent on pre-versioning clients).
+    let range = read_proto_range(r)?;
+    Ok((
+        ClientMsg::Identify {
+            rows,
+            cols,
+            attach,
+            auth_token,
+            env,
+        },
+        range,
+    ))
+}
+
+/// Decode an IdentifyControl payload, including the trailing protocol range.
+fn decode_identify_control(r: &mut &[u8]) -> io::Result<(ClientMsg, ProtoRange)> {
+    let rows = read_u16(r)?;
+    let cols = read_u16(r)?;
+    let auth_token = read_optional_string(r)?;
+    // Trailing fields are optional for older clients.
+    let hostname = read_optional_string(r)?;
+    let attach = if r.is_empty() {
+        false
+    } else {
+        read_u8(r)? != 0
+    };
+    let range = read_proto_range(r)?;
+    Ok((
+        ClientMsg::IdentifyControl {
+            rows,
+            cols,
+            auth_token,
+            hostname,
+            attach,
+        },
+        range,
+    ))
+}
+
 /// Read and decode a client message from a stream.
+///
+/// Protocol-version fields on Identify/IdentifyControl are parsed but
+/// dropped — mid-connection code never renegotiates. Handshake paths
+/// use [`decode_client_hello`] to see the client's advertised range.
 pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> {
+    let (tag, data) = read_frame(reader)?;
+    decode_client_body(tag, &data)
+}
+
+/// Handshake decode: like [`decode_client`], but also returns the
+/// client's advertised protocol-version range. Pre-versioning clients
+/// and non-hello messages (bare ListSessions/KillServer probes) decode
+/// as [`ProtoRange::LEGACY`].
+pub fn decode_client_hello<R: Read + ?Sized>(
+    reader: &mut R,
+) -> io::Result<(ClientMsg, ProtoRange)> {
     let (tag, data) = read_frame(reader)?;
     let mut r = &data[..];
     match tag {
-        C_IDENTIFY => {
-            let rows = read_u16(&mut r)?;
-            let cols = read_u16(&mut r)?;
-            let attach = r.first().copied().unwrap_or(1) != 0;
-            if !r.is_empty() {
-                r = &r[1..];
-            }
-            let auth_token = read_optional_string(&mut r)?;
-            // Trailing env pairs (newer clients; absent on old ones).
-            let mut env: Vec<(String, String)> = Vec::new();
-            if r.len() >= 4 {
-                let count = read_u32(&mut r)? as usize;
-                for _ in 0..count.min(64) {
-                    let k = read_optional_string(&mut r)?;
-                    let v = read_optional_string(&mut r)?;
-                    env.push((k, v));
-                }
-            }
-            Ok(ClientMsg::Identify {
-                rows,
-                cols,
-                attach,
-                auth_token,
-                env,
-            })
-        }
+        C_IDENTIFY => decode_identify(&mut r),
+        C_IDENTIFY_CONTROL => decode_identify_control(&mut r),
+        _ => decode_client_body(tag, &data).map(|m| (m, ProtoRange::LEGACY)),
+    }
+}
+
+fn decode_client_body(tag: u8, data: &[u8]) -> io::Result<ClientMsg> {
+    let mut r = data;
+    match tag {
+        C_IDENTIFY => decode_identify(&mut r).map(|(m, _)| m),
         C_PANE_INPUT => Ok(ClientMsg::PaneInput { data: r.to_vec() }),
         C_RESIZE => {
             let rows = read_u16(&mut r)?;
@@ -1301,16 +1522,7 @@ pub fn decode_client<R: Read + ?Sized>(reader: &mut R) -> io::Result<ClientMsg> 
             })
         }
         C_GET_LOG => Ok(ClientMsg::GetLog),
-        C_IDENTIFY_CONTROL => {
-            let rows = read_u16(&mut r)?;
-            let cols = read_u16(&mut r)?;
-            let auth_token = read_optional_string(&mut r)?;
-            Ok(ClientMsg::IdentifyControl {
-                rows,
-                cols,
-                auth_token,
-            })
-        }
+        C_IDENTIFY_CONTROL => decode_identify_control(&mut r).map(|(m, _)| m),
         C_CONTROL_COMMAND => {
             let len = read_u32(&mut r)? as usize;
             let line = String::from_utf8_lossy(&r[..len]).into_owned();
@@ -1424,13 +1636,30 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 "unknown".to_string()
             } else {
                 let len = read_u32(&mut r)? as usize;
-                String::from_utf8_lossy(&r[..len]).into_owned()
+                let s = String::from_utf8_lossy(&r[..len]).into_owned();
+                r = &r[len..];
+                s
+            };
+            // Trailing negotiated protocol version + server range —
+            // absent on older servers.
+            let proto = if r.len() >= 2 {
+                read_u16(&mut r)?
+            } else {
+                PROTO_LEGACY
+            };
+            let (proto_min, proto_max) = if r.len() >= 4 {
+                (read_u16(&mut r)?, read_u16(&mut r)?)
+            } else {
+                (PROTO_LEGACY, PROTO_LEGACY)
             };
             Ok(ServerMsg::IdentifyAck {
                 rows,
                 cols,
                 version,
                 address,
+                proto,
+                proto_min,
+                proto_max,
             })
         }
         S_GRID_SNAPSHOT => {
@@ -1624,12 +1853,50 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
                 let created = read_u64(&mut r)?;
                 let last_activity = read_u64(&mut r)?;
                 let has_activity = read_u8(&mut r)? != 0;
+                // Trailing per-attachment list — absent on pre-attachment
+                // servers, where the next field (another session's name
+                // len, or the final address len) sits where n_att would.
+                // Ambiguity is resolved by trial: if the attachment parse
+                // fails, rewind and treat the session as having none.
+                let save = r;
+                let parsed: io::Result<Vec<SessionAttachment>> = (|| {
+                    let n_att = read_u32(&mut r)? as usize;
+                    if n_att > 1024 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "implausible attachment count",
+                        ));
+                    }
+                    let mut atts = Vec::with_capacity(n_att.min(16));
+                    for _ in 0..n_att {
+                        let olen = read_u32(&mut r)? as usize;
+                        if r.len() < olen + 1 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "truncated session attachment",
+                            ));
+                        }
+                        let origin = String::from_utf8_lossy(&r[..olen]).into_owned();
+                        r = &r[olen..];
+                        let is_control = read_u8(&mut r)? != 0;
+                        atts.push(SessionAttachment { origin, is_control });
+                    }
+                    Ok(atts)
+                })();
+                let attachments = match parsed {
+                    Ok(a) => a,
+                    Err(_) => {
+                        r = save;
+                        Vec::new()
+                    }
+                };
                 sessions.push(SessionInfo {
                     name,
                     attached,
                     created,
                     last_activity,
                     has_activity,
+                    attachments,
                 });
             }
             let address = if r.is_empty() {
@@ -1911,6 +2178,16 @@ mod tests {
                 created: 1_700_000_000,
                 last_activity: 1_700_000_100,
                 has_activity: true,
+                attachments: vec![
+                    SessionAttachment {
+                        origin: "local".into(),
+                        is_control: false,
+                    },
+                    SessionAttachment {
+                        origin: "10.0.0.5".into(),
+                        is_control: true,
+                    },
+                ],
             }],
             address: "/tmp/lrmux-1/default".into(),
         };
@@ -1922,9 +2199,38 @@ mod tests {
                 assert_eq!(sessions[0].name, "dev");
                 assert_eq!(sessions[0].attached, 2);
                 assert!(sessions[0].has_activity);
+                assert_eq!(sessions[0].status_label(), "attached@local, 10.0.0.5 -CC");
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_info_status_label_caps_and_detached() {
+        let detached = SessionInfo {
+            name: "x".into(),
+            attached: 0,
+            created: 0,
+            last_activity: 0,
+            has_activity: false,
+            attachments: vec![],
+        };
+        assert_eq!(detached.status_label(), "detached");
+
+        let many = SessionInfo {
+            name: "x".into(),
+            attached: 5,
+            created: 0,
+            last_activity: 0,
+            has_activity: false,
+            attachments: (0..5)
+                .map(|i| SessionAttachment {
+                    origin: format!("h{i}"),
+                    is_control: i % 2 == 1,
+                })
+                .collect(),
+        };
+        assert_eq!(many.status_label(), "attached@h0, h1 -CC, h2 +2");
     }
 
     #[test]
@@ -2261,5 +2567,178 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn identify_roundtrip_carries_proto_range() {
+        let bytes = encode_client(&ClientMsg::Identify {
+            rows: 24,
+            cols: 80,
+            attach: true,
+            auth_token: "tok".into(),
+            env: vec![("TERM_PROGRAM".into(), "lrmux".into())],
+        });
+        let (msg, range) = decode_client_hello(&mut &bytes[..]).unwrap();
+        match msg {
+            ClientMsg::Identify {
+                rows,
+                cols,
+                attach,
+                auth_token,
+                env,
+            } => {
+                assert_eq!((rows, cols, attach), (24, 80, true));
+                assert_eq!(auth_token, "tok");
+                assert_eq!(env.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(range, proto_range());
+        // The plain decoder drops the range but still parses.
+        match decode_client(&mut &bytes[..]).unwrap() {
+            ClientMsg::Identify { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_identify_decodes_as_legacy_range() {
+        // A pre-versioning client: Identify ends after the env count.
+        let mut payload = vec![C_IDENTIFY];
+        payload.extend_from_slice(&24u16.to_le_bytes());
+        payload.extend_from_slice(&80u16.to_le_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // auth_token
+        payload.extend_from_slice(&0u32.to_le_bytes()); // env count
+        let bytes = frame(payload);
+        let (msg, range) = decode_client_hello(&mut &bytes[..]).unwrap();
+        assert_eq!(range, ProtoRange::LEGACY);
+        match msg {
+            ClientMsg::Identify { rows, cols, .. } => assert_eq!((rows, cols), (24, 80)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_control_roundtrip_carries_proto_range() {
+        let bytes = encode_client(&ClientMsg::IdentifyControl {
+            rows: 24,
+            cols: 80,
+            auth_token: String::new(),
+            hostname: "host".into(),
+            attach: true,
+        });
+        let (msg, range) = decode_client_hello(&mut &bytes[..]).unwrap();
+        assert_eq!(range, proto_range());
+        match msg {
+            ClientMsg::IdentifyControl {
+                hostname, attach, ..
+            } => {
+                assert_eq!(hostname, "host");
+                assert!(attach);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_hello_messages_decode_as_legacy_range() {
+        let bytes = encode_client(&ClientMsg::ListSessions);
+        let (msg, range) = decode_client_hello(&mut &bytes[..]).unwrap();
+        assert_eq!(range, ProtoRange::LEGACY);
+        match msg {
+            ClientMsg::ListSessions => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identify_ack_proto_roundtrip_and_legacy() {
+        let bytes = encode_server(&ServerMsg::IdentifyAck {
+            rows: 24,
+            cols: 80,
+            version: "v1".into(),
+            address: "/tmp/x".into(),
+            proto: 7,
+            proto_min: 5,
+            proto_max: 9,
+        });
+        match decode_server(&mut &bytes[..]).unwrap() {
+            ServerMsg::IdentifyAck {
+                proto,
+                proto_min,
+                proto_max,
+                address,
+                ..
+            } => {
+                assert_eq!((proto, proto_min, proto_max), (7, 5, 9));
+                assert_eq!(address, "/tmp/x");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Legacy ack: no trailing proto field.
+        let mut payload = vec![S_IDENTIFY_ACK];
+        payload.extend_from_slice(&24u16.to_le_bytes());
+        payload.extend_from_slice(&80u16.to_le_bytes());
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(b"v1");
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(b"/x/");
+        let legacy = frame(payload);
+        match decode_server(&mut &legacy[..]).unwrap() {
+            ServerMsg::IdentifyAck { proto, address, .. } => {
+                assert_eq!(proto, PROTO_LEGACY);
+                assert_eq!(address, "/x/");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_session_list_without_attachments_decodes() {
+        // Pre-attachments server: each session ends at has_activity and
+        // the message ends with the address string.
+        let mut payload = vec![S_SESSION_LIST];
+        payload.extend_from_slice(&2u32.to_le_bytes()); // count
+        for name in ["dev", "ops"] {
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes()); // attached
+            payload.extend_from_slice(&1_700_000_000u64.to_le_bytes());
+            payload.extend_from_slice(&1_700_000_100u64.to_le_bytes());
+            payload.push(0); // has_activity
+        }
+        let addr = "/tmp/lrmux-1/old";
+        payload.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+        payload.extend_from_slice(addr.as_bytes());
+        let bytes = frame(payload);
+        match decode_server(&mut &bytes[..]).unwrap() {
+            ServerMsg::SessionList { sessions, address } => {
+                assert_eq!(address, addr);
+                assert_eq!(sessions.len(), 2);
+                assert_eq!(sessions[0].name, "dev");
+                assert_eq!(sessions[1].name, "ops");
+                assert!(sessions.iter().all(|s| s.attachments.is_empty()));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_range_picks_highest_common_version() {
+        let r = |min, max| ProtoRange { min, max };
+        // Docker's example: server 10–20, client 15–25 → 20.
+        assert_eq!(negotiate_range(r(15, 25), r(10, 20)), Some(20));
+        // Equal ranges.
+        assert_eq!(negotiate_range(r(1, 1), r(1, 1)), Some(1));
+        // Client newer, server caps it.
+        assert_eq!(negotiate_range(r(1, 9), r(1, 3)), Some(3));
+        assert_eq!(negotiate_range(r(1, 3), r(1, 9)), Some(3));
+        // No overlap in either direction.
+        assert_eq!(negotiate_range(r(1, 2), r(3, 5)), None); // client too old
+        assert_eq!(negotiate_range(r(3, 5), r(1, 2)), None); // server too old
+        // Touching boundary counts as overlap.
+        assert_eq!(negotiate_range(r(1, 3), r(3, 5)), Some(3));
     }
 }

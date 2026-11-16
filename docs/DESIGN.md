@@ -298,6 +298,8 @@ Length-prefixed binary messages between client and server. Each message: a 4-byt
 | S → C | `StatusBarUpdate` | Status bar content |
 | S → C | `Error` | Error message |
 
+**Version negotiation** (Docker-style): `Identify`/`IdentifyControl` end with a trailing `proto_min`/`proto_max` u16 range advertising the client's supported protocol versions; `IdentifyAck` ends with the negotiated version — `min(client_max, server_max)`, valid only when it satisfies both minimums. On no overlap the server answers `Error` and drops the connection. Peers that send no version trailer are pre-versioning builds and are treated as v1. The negotiated version is stored per connection (`ClientConn::proto`) so send sites can gate version-dependent messages (`conn.proto >= N`). Invariant: the handshake messages may only ever grow by appending optional trailing fields — changing their existing layout would break negotiation itself. Lightweight probes (bare `ListSessions`/`KillServer` without an `Identify`) cannot negotiate and must stay wire-stable.
+
 ### 4.4 Event loop
 
 - **Single-threaded** event loop in the server using `poll(2)` (portable) or `kqueue` (macOS/BSD) / `epoll` (Linux) via `nix::sys::event`.

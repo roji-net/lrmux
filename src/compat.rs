@@ -1,6 +1,34 @@
 //! Platform shims for environments with incomplete syscall tables (notably iSH).
 
+use std::ffi::CStr;
 use std::time::Duration;
+
+/// Short hostname for this machine (`HOSTNAME` env, else `gethostname`).
+/// Drops a trailing domain so `host.local` → `host`.
+pub fn hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        let h = h.trim();
+        if !h.is_empty() {
+            return short_host(h);
+        }
+    }
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc == 0
+        && let Ok(c) = CStr::from_bytes_until_nul(&buf)
+        && let Ok(s) = c.to_str()
+    {
+        let s = s.trim();
+        if !s.is_empty() {
+            return short_host(s);
+        }
+    }
+    "local".to_string()
+}
+
+fn short_host(h: &str) -> String {
+    h.split('.').next().unwrap_or(h).to_string()
+}
 
 /// Block for approximately `dur`.
 ///
