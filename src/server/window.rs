@@ -120,8 +120,31 @@ impl Window {
     }
 
     /// tmux layout string for `%layout-change` / `#{window_layout}`.
+    /// Always the full layout tree (unchanged while zoomed).
     pub fn layout_str(&self) -> String {
         self.layout.to_tmux_str(self.cols, self.rows)
+    }
+
+    /// tmux `#{window_visible_layout}`: full tree normally; when zoomed,
+    /// a single-pane layout filling the window (active pane only).
+    /// iTerm2 uses the difference vs `window_layout` plus the `Z` flag
+    /// to show/hide sibling panes after title-bar double-click.
+    pub fn visible_layout_str(&self) -> String {
+        if self.zoomed {
+            Layout::single(self.active_pane_id()).to_tmux_str(self.cols, self.rows)
+        } else {
+            self.layout_str()
+        }
+    }
+
+    /// tmux `#{window_flags}` fragment. We always mark `*` (active) like
+    /// the previous stub; append `Z` while zoomed so -CC clients redraw.
+    pub fn flags_str(&self) -> String {
+        if self.zoomed {
+            "*Z".to_string()
+        } else {
+            "*".to_string()
+        }
     }
 
     /// Pane rectangles from the current layout (for client composite).

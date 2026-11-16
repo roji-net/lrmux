@@ -624,6 +624,19 @@ mod tests {
     }
 
     #[test]
+    fn zoomed_visible_layout_differs_from_split_tree() {
+        // iTerm compares window_layout (full tree) vs window_visible_layout
+        // (active pane alone) to render zoom after resize-pane -Z.
+        let mut full = Layout::single(1);
+        assert!(full.split(1, SplitDir::Horizontal, 2, 0.5));
+        let layout = full.to_tmux_str(80, 24);
+        let visible = Layout::single(1).to_tmux_str(80, 24);
+        assert_ne!(layout, visible);
+        assert!(layout.contains('{'), "{layout}");
+        assert!(visible.ends_with(",80x24,0,0,1"), "{visible}");
+    }
+
+    #[test]
     fn horizontal_split_leaves_gap() {
         let mut layout = Layout::single(1);
         assert!(layout.split(1, SplitDir::Horizontal, 2, 0.5));

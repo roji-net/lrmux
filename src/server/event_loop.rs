@@ -5538,10 +5538,11 @@ fn format_var(
             })
             .unwrap_or_else(|| "1".to_string()),
         "window_active" | "session_attached" => "1".to_string(),
-        "window_layout" | "window_visible_layout" => {
-            window.map(window_layout_str).unwrap_or_default()
-        }
-        "window_flags" => "*".to_string(),
+        "window_layout" => window.map(window_layout_str).unwrap_or_default(),
+        "window_visible_layout" => window
+            .map(|w| w.visible_layout_str())
+            .unwrap_or_default(),
+        "window_flags" => window.map(|w| w.flags_str()).unwrap_or_else(|| "*".to_string()),
         "pane_border_status" | "pane-border-status" => "off".to_string(),
         // Fields requested by iTerm2's TmuxStateParser via
         // `list-panes -F "key=#{key}..."`. Values we don't track are
@@ -6748,7 +6749,20 @@ fn handle_single_control_command(
             {
                 let pane_id = sessions[si].windows[wi].panes[pi].id;
                 let changed = if zoom {
-                    sessions[si].windows[wi].toggle_zoom()
+                    // tmux: -Z on the zoomed pane unzooms; on another pane
+                    // switches zoom focus; otherwise zooms the target.
+                    let w = &mut sessions[si].windows[wi];
+                    if w.panes.len() <= 1 {
+                        false
+                    } else if w.zoomed && w.active_pane_id() == pane_id {
+                        w.toggle_zoom()
+                    } else if w.zoomed {
+                        w.focus_pane(pane_id);
+                        true
+                    } else {
+                        w.focus_pane(pane_id);
+                        w.toggle_zoom()
+                    }
                 } else if let Some(d) = dir {
                     sessions[si].windows[wi].resize_pane_border(pane_id, d, amount)
                 } else {
@@ -7028,8 +7042,13 @@ fn resolve_pane_target(
 /// `%layout-change` notification in the form iTerm2 expects:
 /// `%layout-change window-id layout visible-layout flags`
 fn layout_change_notify(window: &Window) -> String {
-    let layout = window.layout_str();
-    format!("%layout-change {} {} {} *", window.id_str(), layout, layout)
+    format!(
+        "%layout-change {} {} {} {}",
+        window.id_str(),
+        window.layout_str(),
+        window.visible_layout_str(),
+        window.flags_str()
+    )
 }
 
 fn window_pane_changed_notify(window: &Window) -> String {
@@ -7062,6 +7081,24 @@ mod cursor_key_tests {
     fn arrows_only_rewrite_in_app_cursor_mode() {
         assert_eq!(translate_cursor_keys(b"\x1b[D", false), b"\x1b[D".to_vec());
         assert_eq!(translate_cursor_keys(b"\x1b[D", true), b"\x1bOD".to_vec());
+    }
+}
+
+#[cfg(test)]
+mod layout_change_tests {
+    #[test]
+    fn layout_change_line_shape_with_zoom_flag() {
+        // Mirrors layout_change_notify: visible layout + Z when zoomed.
+        let layout = "aaaa,80x24,0,0,1{40x24,0,0,1,40x24,41,0,2}";
+        let visible = "bbbb,80x24,0,0,1";
+        let line = format!("%layout-change @7 {layout} {visible} *Z");
+        let parts: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(parts[0], "%layout-change");
+        assert_eq!(parts[1], "@7");
+        assert_eq!(parts[2], layout);
+        assert_eq!(parts[3], visible);
+        assert_eq!(parts[4], "*Z");
+        assert_ne!(parts[2], parts[3]);
     }
 }
 
