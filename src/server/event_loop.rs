@@ -5543,6 +5543,9 @@ fn format_var(
             .map(|w| w.visible_layout_str())
             .unwrap_or_default(),
         "window_flags" => window.map(|w| w.flags_str()).unwrap_or_else(|| "*".to_string()),
+        "window_zoomed_flag" => window
+            .map(|w| if w.zoomed { "1" } else { "0" }.to_string())
+            .unwrap_or_else(|| "0".to_string()),
         "pane_border_status" | "pane-border-status" => "off".to_string(),
         // Fields requested by iTerm2's TmuxStateParser via
         // `list-panes -F "key=#{key}..."`. Values we don't track are
@@ -6749,28 +6752,25 @@ fn handle_single_control_command(
             {
                 let pane_id = sessions[si].windows[wi].panes[pi].id;
                 let changed = if zoom {
-                    // tmux: -Z on the zoomed pane unzooms; on another pane
-                    // switches zoom focus; otherwise zooms the target.
-                    let w = &mut sessions[si].windows[wi];
-                    if w.panes.len() <= 1 {
-                        false
-                    } else if w.zoomed && w.active_pane_id() == pane_id {
-                        w.toggle_zoom()
-                    } else if w.zoomed {
-                        w.focus_pane(pane_id);
-                        true
-                    } else {
-                        w.focus_pane(pane_id);
-                        w.toggle_zoom()
-                    }
+                    // Must focus the -t pane (not whatever iTerm had
+                    // selected) and emit %window-pane-changed — otherwise
+                    // iTerm keeps the old active pane and appears to zoom
+                    // the focused one / fails to unzoom on the next -Z.
+                    sessions[si].windows[wi].zoom_pane(pane_id)
                 } else if let Some(d) = dir {
                     sessions[si].windows[wi].resize_pane_border(pane_id, d, amount)
                 } else {
                     false
                 };
                 if changed {
+                    client.session_idx = si;
+                    client.active_window = wi;
                     let w = &sessions[si].windows[wi];
+                    // Emit before the chained `list-windows` in the same
+                    // control line so iTerm adopts the new active pane
+                    // (and Z flag) before it parses the window list.
                     send_control_notify(client, &layout_change_notify(w));
+                    send_control_notify(client, &window_pane_changed_notify(w));
                     pending_resync.push((si, wi));
                     *pending_status_bar = true;
                 }
@@ -7099,6 +7099,26 @@ mod layout_change_tests {
         assert_eq!(parts[3], visible);
         assert_eq!(parts[4], "*Z");
         assert_ne!(parts[2], parts[3]);
+    }
+
+    #[test]
+    fn zoom_action_matrix_matches_tmux() {
+        // (zoomed, active, target) → stay zoomed? same active?
+        // not zoomed + target → zoom target
+        // zoomed + same → unzoom
+        // zoomed + other → stay zoomed, active=other
+        fn decide(zoomed: bool, active: u32, target: u32) -> (bool, u32) {
+            if zoomed && active == target {
+                (false, active)
+            } else if zoomed {
+                (true, target)
+            } else {
+                (true, target)
+            }
+        }
+        assert_eq!(decide(false, 0, 1), (true, 1));
+        assert_eq!(decide(true, 1, 1), (false, 1));
+        assert_eq!(decide(true, 1, 0), (true, 0));
     }
 }
 
