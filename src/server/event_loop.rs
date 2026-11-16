@@ -4966,8 +4966,7 @@ fn refresh_affinity_options(sessions: &mut [Session]) {
 
 /// True when `classes` fully partitions some multi-window session into
 /// singleton (or otherwise non-co-located) classes — the typical stale
-/// iTerm2 open-each-window-as-OS-window pattern. Cmd+N keeps the remaining
-/// windows of the source session in one shared class, so it is allowed.
+/// iTerm2 open-each-window-as-OS-window pattern.
 fn affinities_would_atomize(session_window_ids: &[Vec<u32>], classes: &[Vec<u32>]) -> bool {
     for ids in session_window_ids {
         if ids.len() < 2 {
@@ -4984,6 +4983,34 @@ fn affinities_would_atomize(session_window_ids: &[Vec<u32>], classes: &[Vec<u32>
             }
         }
         if touching > 1 && max_together < 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `classes` would split any live multi-window session across
+/// more than one affinity class (siblings no longer co-located).
+///
+/// After `%window-add` / control `new-window`, iTerm often opens the new
+/// window as its own macOS window and `set`s `@affinities` with that id
+/// alone — the same shape as a user ⌘N peel. Honoring it moves the window
+/// into a brand-new session (blank OS chrome, missing tab). Session tree
+/// is source of truth: one session = one OS window (tabs = windows).
+/// Merges across sessions and rearranging singleton sessions stay allowed.
+fn affinities_would_peel_siblings(session_window_ids: &[Vec<u32>], classes: &[Vec<u32>]) -> bool {
+    for ids in session_window_ids {
+        if ids.len() < 2 {
+            continue;
+        }
+        let set: HashSet<u32> = ids.iter().copied().collect();
+        let mut class_idxs: HashSet<usize> = HashSet::new();
+        for (ci, c) in classes.iter().enumerate() {
+            if c.iter().any(|id| set.contains(id)) {
+                class_idxs.insert(ci);
+            }
+        }
+        if class_idxs.len() > 1 {
             return true;
         }
     }
@@ -5012,10 +5039,11 @@ fn decode_iterm_encoded(value: &str, prefix: &str) -> String {
 /// user option `@affinities` as `a_<hex>`. Decoded, the value is a
 /// space-separated list of `id1,id2,...,GUID;opts` classes.
 ///
-/// lrmux maps one iTerm2 window to one session, so a tmux window that lands
-/// in a class of its own (⌘N, "new OS window") is moved into a new session;
-/// conversely, a window dragged into another class joins that class's
-/// session, and sessions left empty are removed.
+/// lrmux maps one iTerm2 window to one session. A window dragged into
+/// another class joins that class's session; sessions left empty are
+/// removed. Sibling peels (new window alone after `%window-add`) are
+/// refused — a new OS window is a new session (`new-session` / Ctrl-A C),
+/// not an affinity echo.
 ///
 /// Returns true if any window changed session (callers should emit
 /// %sessions-changed).
@@ -5045,16 +5073,20 @@ fn migrate_affinity_sessions(
         return false;
     }
 
-    // Refuse updates that would split every window of a multi-window session
-    // into its own OS window. That usually means iTerm opened before (or
-    // without) our synthesized affinities; applying it would lock in the
-    // wrong session↔window model. Genuine ⌘N keeps sibling windows together.
+    // Refuse updates that would split a multi-window session across OS
+    // windows. Full atomize = stale iTerm open-each-as-window; sibling
+    // peel = iTerm's post-%window-add echo (looks like ⌘N but orphans the
+    // new tab into another session).
     let session_ids: Vec<Vec<u32>> = sessions
         .iter()
         .map(|s| s.windows.iter().map(|w| w.id).collect())
         .collect();
     if affinities_would_atomize(&session_ids, &classes) {
         crate::log::info("affinities: ignoring atomizing update (keeping session windows as tabs)");
+        return false;
+    }
+    if affinities_would_peel_siblings(&session_ids, &classes) {
+        crate::log::info("affinities: ignoring sibling peel (keeping session windows as tabs)");
         return false;
     }
 
@@ -7035,7 +7067,9 @@ mod cursor_key_tests {
 
 #[cfg(test)]
 mod affinity_tests {
-    use super::{affinities_would_atomize, synthesize_affinity_classes};
+    use super::{
+        affinities_would_atomize, affinities_would_peel_siblings, synthesize_affinity_classes,
+    };
 
     #[test]
     fn synthesize_one_class_per_session() {
@@ -7054,22 +7088,45 @@ mod affinity_tests {
             &[vec![8, 12]],
             &[vec![8], vec![12]]
         ));
-    }
-
-    #[test]
-    fn atomize_allows_cmd_n_peel() {
-        // ⌘N: new window alone in its class; siblings stay together.
-        assert!(!affinities_would_atomize(
-            &[vec![8, 12, 15]],
-            &[vec![8, 12], vec![15]]
+        assert!(affinities_would_peel_siblings(
+            &[vec![8, 12]],
+            &[vec![8], vec![12]]
         ));
     }
 
     #[test]
-    fn atomize_allows_merge_across_sessions() {
+    fn peel_detects_post_window_add_echo() {
+        // After %window-add, iTerm parks the new id alone; siblings stay
+        // together. Same shape as ⌘N — must refuse so the tab stays put.
+        assert!(!affinities_would_atomize(
+            &[vec![8, 12, 15]],
+            &[vec![8, 12], vec![15]]
+        ));
+        assert!(affinities_would_peel_siblings(
+            &[vec![8, 12, 15]],
+            &[vec![8, 12], vec![15]]
+        ));
+        // Log repro: server-provisioning windows + new @7 alone.
+        assert!(affinities_would_peel_siblings(
+            &[vec![0, 1, 2, 7], vec![3, 4, 5], vec![8, 11]],
+            &[vec![1, 2], vec![3, 4, 6], vec![7]]
+        ));
+    }
+
+    #[test]
+    fn peel_allows_merge_and_singleton_moves() {
         assert!(!affinities_would_atomize(
             &[vec![8], vec![12]],
             &[vec![8, 12]]
+        ));
+        assert!(!affinities_would_peel_siblings(
+            &[vec![8], vec![12]],
+            &[vec![8, 12]]
+        ));
+        // Singleton session relocated into another class — not a sibling peel.
+        assert!(!affinities_would_peel_siblings(
+            &[vec![8, 12], vec![15]],
+            &[vec![8, 12, 15]]
         ));
     }
 }
