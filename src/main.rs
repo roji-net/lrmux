@@ -1030,7 +1030,12 @@ fn run() -> io::Result<()> {
             Ok(())
         }
         CliAction::ClientVersion => {
-            println!("lrmux {}", crate::version::VERSION);
+            println!(
+                "lrmux {} (protocol v{}–v{})",
+                crate::version::VERSION,
+                crate::proto::PROTO_MIN,
+                crate::proto::PROTO_MAX
+            );
             Ok(())
         }
         CliAction::ControlMode { target } => run_control_mode(target.as_deref()),

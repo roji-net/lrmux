@@ -65,6 +65,9 @@ struct ClientConn {
     relay_peer: Option<std::net::TcpStream>,
     /// Client→peer bytes pending a peer POLLOUT.
     relay_in: Vec<u8>,
+    /// Negotiated client↔server protocol version (set at Identify).
+    /// Gate version-dependent behavior with `conn.proto >= N`.
+    proto: u16,
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
@@ -97,6 +100,7 @@ impl ClientConn {
             is_tcp,
             relay_peer: None,
             relay_in: Vec::new(),
+            proto: crate::proto::PROTO_LEGACY,
         }
     }
 
@@ -2001,6 +2005,7 @@ pub fn run(
                                                 clients[client_idx].hostname = hostname;
                                             }
                                             // Send IdentifyAck with the requested grid size.
+                                            let ours = proto::proto_range();
                                             let msg =
                                                 proto::encode_server(&ServerMsg::IdentifyAck {
                                                     rows,
@@ -2008,6 +2013,9 @@ pub fn run(
                                                     version: crate::version::VERSION.to_string(),
                                                     address: crate::server::server_address()
                                                         .to_string(),
+                                                    proto: clients[client_idx].proto,
+                                                    proto_min: ours.min,
+                                                    proto_max: ours.max,
                                                 });
                                             let _ = client_send(&mut clients[client_idx], &msg);
                                             send_control_initial_state(
@@ -3073,7 +3081,7 @@ fn handshake_first_client(
             crate::ipc::stream::decode_with_deadline(
                 &mut client,
                 std::time::Duration::from_secs(5),
-                |r| proto::decode_client(r),
+                |r| proto::decode_client_hello(r),
             )
         } else {
             decode_client_prefixed(&mut client, prefix, std::time::Duration::from_secs(5))
@@ -3082,20 +3090,23 @@ fn handshake_first_client(
         crate::ipc::stream::decode_with_deadline(
             &mut client,
             std::time::Duration::from_secs(5),
-            |r| proto::decode_client(r),
+            |r| proto::decode_client_hello(r),
         )
     };
     // Bound the handshake read: a client that connects and stays silent
     // must not stall server startup forever. decode_with_deadline polls
     // the fd, which works where SO_RCVTIMEO is unavailable.
-    let (client_rows, client_cols, auth_token) = match first {
-        Ok(ClientMsg::Identify {
-            rows,
-            cols,
-            auth_token,
-            ..
-        }) => (rows, cols, auth_token),
-        Ok(ClientMsg::ListSessions) => {
+    let (client_rows, client_cols, auth_token, client_range) = match first {
+        Ok((
+            ClientMsg::Identify {
+                rows,
+                cols,
+                auth_token,
+                ..
+            },
+            range,
+        )) => (rows, cols, auth_token, range),
+        Ok((ClientMsg::ListSessions, _)) => {
             // Respond with empty session list (no sessions yet) and signal retry.
             let msg = proto::encode_server(&ServerMsg::SessionList {
                 sessions: vec![],
@@ -3107,7 +3118,7 @@ fn handshake_first_client(
                 "ListSessions query during initial handshake",
             ));
         }
-        Ok(ClientMsg::KillServer) => {
+        Ok((ClientMsg::KillServer, _)) => {
             eprintln!("lrmux: KillServer received during initial handshake, shutting down.");
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -3141,6 +3152,16 @@ fn handshake_first_client(
         ));
     }
 
+    let negotiated = match negotiate_proto(&mut client, client_range)? {
+        Some(v) => v,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "protocol version mismatch",
+            ));
+        }
+    };
+
     // Reserve 1 row for the status bar.
     let grid_rows = client_rows.saturating_sub(1);
     let grid_cols = client_cols;
@@ -3158,11 +3179,15 @@ fn handshake_first_client(
     let window = &mut session.windows[0];
 
     // Send IdentifyAck with grid dimensions (not client dimensions).
+    let ours = proto::proto_range();
     let ack = proto::encode_server(&ServerMsg::IdentifyAck {
         rows: grid_rows,
         cols: grid_cols,
         version: crate::version::VERSION.to_string(),
         address: crate::server::server_address().to_string(),
+        proto: negotiated,
+        proto_min: ours.min,
+        proto_max: ours.max,
     });
     proto::send(&mut client, &ack)?;
 
@@ -3199,6 +3224,7 @@ fn handshake_first_client(
     let mut conn = ClientConn::new(client, true);
     conn.session_idx = 0;
     conn.active_window = 0;
+    conn.proto = negotiated;
 
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
@@ -3215,6 +3241,33 @@ fn tcp_auth_ok(is_tcp: bool, token: &str) -> bool {
         return true;
     }
     token == required
+}
+
+/// Pick the highest protocol version both sides support
+/// (`min(client_max, server_max)` when ≥ both minimums). On mismatch,
+/// send an explanatory Error frame and return `Ok(None)` — the caller
+/// should drop the connection.
+fn negotiate_proto(
+    client: &mut crate::ipc::ConnStream,
+    client_range: proto::ProtoRange,
+) -> io::Result<Option<u16>> {
+    let ours = proto::proto_range();
+    match proto::negotiate_range(client_range, ours) {
+        Some(v) => Ok(Some(v)),
+        None => {
+            let _ = proto::send(
+                client,
+                &proto::encode_server(&ServerMsg::Error {
+                    msg: format!(
+                        "protocol version mismatch: client supports v{}–v{}, \
+                         server supports v{}–v{} — upgrade lrmux",
+                        client_range.min, client_range.max, ours.min, ours.max
+                    ),
+                }),
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Read the first bytes of a connection to classify the protocol: binary
@@ -3257,12 +3310,12 @@ fn decode_client_prefixed(
     stream: &mut crate::ipc::ConnStream,
     prefix: Vec<u8>,
     timeout: std::time::Duration,
-) -> io::Result<ClientMsg> {
+) -> io::Result<(ClientMsg, proto::ProtoRange)> {
     stream.set_nonblocking(true)?;
     let res = {
         let rd = crate::ipc::stream::DeadlineReader::new(stream, timeout);
         let mut chain = io::Cursor::new(prefix).chain(rd);
-        proto::decode_client(&mut chain)
+        proto::decode_client_hello(&mut chain)
     };
     let _ = stream.set_nonblocking(false);
     res
@@ -3459,20 +3512,23 @@ fn accept_new_client(
                 let r = ipc::stream::decode_with_deadline(
                     &mut stream,
                     std::time::Duration::from_secs(2),
-                    |r| proto::decode_client(r),
+                    |r| proto::decode_client_hello(r),
                 );
                 let _ = stream.set_nonblocking(false);
                 r
             } else {
                 decode_client_prefixed(&mut stream, sniffed, std::time::Duration::from_secs(2))
             };
-            let (attach, is_control, auth_token, hostname) = match first {
-                Ok(ClientMsg::Identify {
-                    attach: a,
-                    auth_token,
-                    env,
-                    ..
-                }) => {
+            let (attach, is_control, auth_token, hostname, client_range) = match first {
+                Ok((
+                    ClientMsg::Identify {
+                        attach: a,
+                        auth_token,
+                        env,
+                        ..
+                    },
+                    range,
+                )) => {
                     // tmux `update-environment`: an interactive attach
                     // refreshes terminal-identity vars in the server's
                     // env, so panes spawned later inherit the freshest
@@ -3486,15 +3542,18 @@ fn accept_new_client(
                         .find(|(k, _)| k == "HOSTNAME")
                         .map(|(_, v)| v.clone())
                         .unwrap_or_default();
-                    (a, false, auth_token, hostname)
+                    (a, false, auth_token, hostname, range)
                 }
-                Ok(ClientMsg::IdentifyControl {
-                    auth_token,
-                    hostname,
-                    attach,
-                    ..
-                }) => (attach, true, auth_token, hostname),
-                Ok(ClientMsg::ListSessions) => {
+                Ok((
+                    ClientMsg::IdentifyControl {
+                        auth_token,
+                        hostname,
+                        attach,
+                        ..
+                    },
+                    range,
+                )) => (attach, true, auth_token, hostname, range),
+                Ok((ClientMsg::ListSessions, _)) => {
                     // Lightweight query: respond with session list and close.
                     let list = build_session_list(sessions, clients);
                     let msg = proto::encode_server(&ServerMsg::SessionList {
@@ -3504,7 +3563,7 @@ fn accept_new_client(
                     let _ = proto::send(&mut stream, &msg);
                     return Ok(());
                 }
-                Ok(ClientMsg::KillServer) => {
+                Ok((ClientMsg::KillServer, _)) => {
                     crate::log::info("KillServer received, shutting down");
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
@@ -3532,12 +3591,20 @@ fn accept_new_client(
                 return Ok(());
             }
 
+            let Some(negotiated) = negotiate_proto(&mut stream, client_range)? else {
+                return Ok(());
+            };
+
             // Send IdentifyAck with grid dimensions.
+            let ours = proto::proto_range();
             let ack = proto::encode_server(&ServerMsg::IdentifyAck {
                 rows: grid_rows,
                 cols: grid_cols,
                 version: crate::version::VERSION.to_string(),
                 address: crate::server::server_address().to_string(),
+                proto: negotiated,
+                proto_min: ours.min,
+                proto_max: ours.max,
             });
             if proto::send(&mut stream, &ack).is_err() {
                 return Ok(());
@@ -3559,8 +3626,9 @@ fn accept_new_client(
             conn.active_window = active;
             conn.is_control = is_control;
             conn.hostname = hostname;
+            conn.proto = negotiated;
             crate::log::info(&format!(
-                "client connected: session_idx={session_idx}, window={active}, total clients={}",
+                "client connected: session_idx={session_idx}, window={active}, proto=v{negotiated}, total clients={}",
                 clients.len() + 1
             ));
             // Non-blocking from here on: sends go through the client's
