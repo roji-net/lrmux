@@ -5538,10 +5538,14 @@ fn format_var(
             })
             .unwrap_or_else(|| "1".to_string()),
         "window_active" | "session_attached" => "1".to_string(),
-        "window_layout" | "window_visible_layout" => {
-            window.map(window_layout_str).unwrap_or_default()
-        }
-        "window_flags" => "*".to_string(),
+        "window_layout" => window.map(window_layout_str).unwrap_or_default(),
+        "window_visible_layout" => window.map(|w| w.visible_layout_str()).unwrap_or_default(),
+        "window_flags" => window
+            .map(|w| w.flags_str())
+            .unwrap_or_else(|| "*".to_string()),
+        "window_zoomed_flag" => window
+            .map(|w| if w.zoomed { "1" } else { "0" }.to_string())
+            .unwrap_or_else(|| "0".to_string()),
         "pane_border_status" | "pane-border-status" => "off".to_string(),
         // Fields requested by iTerm2's TmuxStateParser via
         // `list-panes -F "key=#{key}..."`. Values we don't track are
@@ -6748,15 +6752,25 @@ fn handle_single_control_command(
             {
                 let pane_id = sessions[si].windows[wi].panes[pi].id;
                 let changed = if zoom {
-                    sessions[si].windows[wi].toggle_zoom()
+                    // Must focus the -t pane (not whatever iTerm had
+                    // selected) and emit %window-pane-changed — otherwise
+                    // iTerm keeps the old active pane and appears to zoom
+                    // the focused one / fails to unzoom on the next -Z.
+                    sessions[si].windows[wi].zoom_pane(pane_id)
                 } else if let Some(d) = dir {
                     sessions[si].windows[wi].resize_pane_border(pane_id, d, amount)
                 } else {
                     false
                 };
                 if changed {
+                    client.session_idx = si;
+                    client.active_window = wi;
                     let w = &sessions[si].windows[wi];
+                    // Emit before the chained `list-windows` in the same
+                    // control line so iTerm adopts the new active pane
+                    // (and Z flag) before it parses the window list.
                     send_control_notify(client, &layout_change_notify(w));
+                    send_control_notify(client, &window_pane_changed_notify(w));
                     pending_resync.push((si, wi));
                     *pending_status_bar = true;
                 }
@@ -7028,8 +7042,13 @@ fn resolve_pane_target(
 /// `%layout-change` notification in the form iTerm2 expects:
 /// `%layout-change window-id layout visible-layout flags`
 fn layout_change_notify(window: &Window) -> String {
-    let layout = window.layout_str();
-    format!("%layout-change {} {} {} *", window.id_str(), layout, layout)
+    format!(
+        "%layout-change {} {} {} {}",
+        window.id_str(),
+        window.layout_str(),
+        window.visible_layout_str(),
+        window.flags_str()
+    )
 }
 
 fn window_pane_changed_notify(window: &Window) -> String {
@@ -7062,6 +7081,44 @@ mod cursor_key_tests {
     fn arrows_only_rewrite_in_app_cursor_mode() {
         assert_eq!(translate_cursor_keys(b"\x1b[D", false), b"\x1b[D".to_vec());
         assert_eq!(translate_cursor_keys(b"\x1b[D", true), b"\x1bOD".to_vec());
+    }
+}
+
+#[cfg(test)]
+mod layout_change_tests {
+    #[test]
+    fn layout_change_line_shape_with_zoom_flag() {
+        // Mirrors layout_change_notify: visible layout + Z when zoomed.
+        let layout = "aaaa,80x24,0,0,1{40x24,0,0,1,40x24,41,0,2}";
+        let visible = "bbbb,80x24,0,0,1";
+        let line = format!("%layout-change @7 {layout} {visible} *Z");
+        let parts: Vec<_> = line.split_whitespace().collect();
+        assert_eq!(parts[0], "%layout-change");
+        assert_eq!(parts[1], "@7");
+        assert_eq!(parts[2], layout);
+        assert_eq!(parts[3], visible);
+        assert_eq!(parts[4], "*Z");
+        assert_ne!(parts[2], parts[3]);
+    }
+
+    #[test]
+    fn zoom_action_matrix_matches_tmux() {
+        // (zoomed, active, target) → stay zoomed? same active?
+        // not zoomed + target → zoom target
+        // zoomed + same → unzoom
+        // zoomed + other → stay zoomed, active=other
+        fn decide(zoomed: bool, active: u32, target: u32) -> (bool, u32) {
+            if zoomed && active == target {
+                (false, active)
+            } else if zoomed {
+                (true, target)
+            } else {
+                (true, target)
+            }
+        }
+        assert_eq!(decide(false, 0, 1), (true, 1));
+        assert_eq!(decide(true, 1, 1), (false, 1));
+        assert_eq!(decide(true, 1, 0), (true, 0));
     }
 }
 

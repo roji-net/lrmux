@@ -120,8 +120,31 @@ impl Window {
     }
 
     /// tmux layout string for `%layout-change` / `#{window_layout}`.
+    /// Always the full layout tree (unchanged while zoomed).
     pub fn layout_str(&self) -> String {
         self.layout.to_tmux_str(self.cols, self.rows)
+    }
+
+    /// tmux `#{window_visible_layout}`: full tree normally; when zoomed,
+    /// a single-pane layout filling the window (active pane only).
+    /// iTerm2 uses the difference vs `window_layout` plus the `Z` flag
+    /// to show/hide sibling panes after title-bar double-click.
+    pub fn visible_layout_str(&self) -> String {
+        if self.zoomed {
+            Layout::single(self.active_pane_id()).to_tmux_str(self.cols, self.rows)
+        } else {
+            self.layout_str()
+        }
+    }
+
+    /// tmux `#{window_flags}` fragment. We always mark `*` (active) like
+    /// the previous stub; append `Z` while zoomed so -CC clients redraw.
+    pub fn flags_str(&self) -> String {
+        if self.zoomed {
+            "*Z".to_string()
+        } else {
+            "*".to_string()
+        }
     }
 
     /// Pane rectangles from the current layout (for client composite).
@@ -205,15 +228,35 @@ impl Window {
 
     /// Toggle zoom on the active pane. No-op (returns false) with <2 panes.
     pub fn toggle_zoom(&mut self) -> bool {
+        let id = self.active_pane_id();
+        self.zoom_pane(id)
+    }
+
+    /// tmux `resize-pane -Z -t %id`:
+    /// - not zoomed → focus `pane_id` and zoom it
+    /// - zoomed on `pane_id` → unzoom
+    /// - zoomed on another pane → switch zoom focus to `pane_id`
+    ///
+    /// Returns false when there is no such pane or only one pane (zoom
+    /// is meaningless). Always leaves `active_pane` on the target when
+    /// true so -CC `%window-pane-changed` matches the visible layout.
+    pub fn zoom_pane(&mut self, pane_id: u32) -> bool {
         if self.panes.len() <= 1 {
             self.zoomed = false;
             return false;
         }
-        self.zoomed = !self.zoomed;
-        if self.zoomed {
-            self.apply_zoom_size();
-        } else {
+        if self.pane_index_by_id(pane_id).is_none() {
+            return false;
+        }
+        if self.zoomed && self.active_pane_id() == pane_id {
+            self.zoomed = false;
             self.reflow_panes();
+            return true;
+        }
+        self.focus_pane(pane_id);
+        if !self.zoomed {
+            self.zoomed = true;
+            self.apply_zoom_size();
         }
         true
     }
