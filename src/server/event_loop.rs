@@ -5539,10 +5539,10 @@ fn format_var(
             .unwrap_or_else(|| "1".to_string()),
         "window_active" | "session_attached" => "1".to_string(),
         "window_layout" => window.map(window_layout_str).unwrap_or_default(),
-        "window_visible_layout" => window
-            .map(|w| w.visible_layout_str())
-            .unwrap_or_default(),
-        "window_flags" => window.map(|w| w.flags_str()).unwrap_or_else(|| "*".to_string()),
+        "window_visible_layout" => window.map(|w| w.visible_layout_str()).unwrap_or_default(),
+        "window_flags" => window
+            .map(|w| w.flags_str())
+            .unwrap_or_else(|| "*".to_string()),
         "window_zoomed_flag" => window
             .map(|w| if w.zoomed { "1" } else { "0" }.to_string())
             .unwrap_or_else(|| "0".to_string()),
