@@ -217,6 +217,23 @@ pub struct NetworkConfig {
     /// For remote/HTTPS pages put a reverse proxy in front for WSS (Caddy/nginx).
     #[serde(default)]
     pub ws_listen: String,
+    /// Seconds between application keepalive Ping probes when a connection
+    /// is idle. `0` disables keepalive. Requires negotiated proto ≥
+    /// [`crate::proto::PROTO_KEEPALIVE`].
+    #[serde(default = "default_keepalive_secs")]
+    pub keepalive_secs: u64,
+    /// After sending a Ping, disconnect (server) or enter reconnect
+    /// overlay (client) if no traffic arrives within this many seconds.
+    #[serde(default = "default_keepalive_timeout_secs")]
+    pub keepalive_timeout_secs: u64,
+}
+
+fn default_keepalive_secs() -> u64 {
+    60
+}
+
+fn default_keepalive_timeout_secs() -> u64 {
+    15
 }
 
 fn default_discovery_port() -> u16 {
@@ -280,6 +297,8 @@ impl Default for NetworkConfig {
             tls_cert: String::new(),
             tls_key: String::new(),
             ws_listen: String::new(),
+            keepalive_secs: default_keepalive_secs(),
+            keepalive_timeout_secs: default_keepalive_timeout_secs(),
         }
     }
 }
