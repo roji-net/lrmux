@@ -27,10 +27,12 @@ use crate::grid::{Attr, Cell, Color};
 pub const PROTO_MIN: u16 = 1;
 /// Newest wire protocol version this build speaks. Bump when the wire
 /// format changes in a way trailing optional fields can't cover.
-pub const PROTO_MAX: u16 = 1;
+pub const PROTO_MAX: u16 = 2;
 /// Version assumed for peers that send no proto fields
 /// (pre-versioning builds).
 pub const PROTO_LEGACY: u16 = 1;
+/// First version that speaks application-level Ping/Pong keepalive.
+pub const PROTO_KEEPALIVE: u16 = 2;
 
 /// A peer's advertised protocol-version range (inclusive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +318,10 @@ pub enum ClientMsg {
     NextLayout,
     /// Focus pane by id (display-panes / click).
     FocusPane { pane_id: u32 },
+    /// Keepalive probe (proto ≥ [`PROTO_KEEPALIVE`]). Peer replies with Pong.
+    Ping,
+    /// Keepalive reply to a server Ping.
+    Pong,
 }
 
 /// Geometry of one pane inside a window (cells, origin top-left).
@@ -449,6 +455,10 @@ pub enum ServerMsg {
     /// Acknowledge SendEvent — same contract as SendKeysAck.
     /// Missing from older servers; clients should bound the wait.
     SendEventAck { ok: bool, reason: String },
+    /// Keepalive probe (proto ≥ [`PROTO_KEEPALIVE`]). Peer replies with Pong.
+    Ping,
+    /// Keepalive reply to a client Ping.
+    Pong,
 }
 
 /// A synthetic input event carried by `ClientMsg::SendEvent`.
@@ -512,6 +522,8 @@ const C_FOCUS_DIR: u8 = 0x23;
 const C_TOGGLE_ZOOM: u8 = 0x24;
 const C_NEXT_LAYOUT: u8 = 0x25;
 const C_FOCUS_PANE: u8 = 0x26;
+const C_PING: u8 = 0x27;
+const C_PONG: u8 = 0x28;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -532,6 +544,8 @@ const S_RELAY_ACK: u8 = 0x1f;
 const S_SEND_KEYS_ACK: u8 = 0x20;
 const S_SEND_EVENT_ACK: u8 = 0x21;
 const S_WINDOW_LAYOUT: u8 = 0x22;
+const S_PING: u8 = 0x23;
+const S_PONG: u8 = 0x24;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -868,6 +882,12 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
             payload.push(C_FOCUS_PANE);
             payload.extend_from_slice(&pane_id.to_le_bytes());
         }
+        ClientMsg::Ping => {
+            payload.push(C_PING);
+        }
+        ClientMsg::Pong => {
+            payload.push(C_PONG);
+        }
     }
     frame(payload)
 }
@@ -1123,6 +1143,12 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.push(if *ok { 1 } else { 0 });
             payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             payload.extend_from_slice(reason.as_bytes());
+        }
+        ServerMsg::Ping => {
+            payload.push(S_PING);
+        }
+        ServerMsg::Pong => {
+            payload.push(S_PONG);
         }
     }
     frame(payload)
@@ -1609,6 +1635,8 @@ fn decode_client_body(tag: u8, data: &[u8]) -> io::Result<ClientMsg> {
             let pane_id = read_u32(&mut r)?;
             Ok(ClientMsg::FocusPane { pane_id })
         }
+        C_PING => Ok(ClientMsg::Ping),
+        C_PONG => Ok(ClientMsg::Pong),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -1999,6 +2027,8 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let reason = read_len_string(&mut r)?;
             Ok(ServerMsg::SendEventAck { ok, reason })
         }
+        S_PING => Ok(ServerMsg::Ping),
+        S_PONG => Ok(ServerMsg::Pong),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown server msg type: {tag}"),
@@ -2723,6 +2753,28 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn ping_pong_roundtrip() {
+        match decode_client(&mut &encode_client(&ClientMsg::Ping)[..]).unwrap() {
+            ClientMsg::Ping => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        match decode_client(&mut &encode_client(&ClientMsg::Pong)[..]).unwrap() {
+            ClientMsg::Pong => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        match decode_server(&mut &encode_server(&ServerMsg::Ping)[..]).unwrap() {
+            ServerMsg::Ping => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        match decode_server(&mut &encode_server(&ServerMsg::Pong)[..]).unwrap() {
+            ServerMsg::Pong => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(PROTO_KEEPALIVE, 2);
+        assert!(PROTO_MAX >= PROTO_KEEPALIVE);
     }
 
     #[test]

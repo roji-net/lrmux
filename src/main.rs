@@ -11,6 +11,7 @@ mod compat;
 mod config;
 mod grid;
 mod ipc;
+mod keepalive;
 mod keys;
 mod layout;
 mod log;

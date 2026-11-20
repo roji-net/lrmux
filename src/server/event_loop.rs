@@ -68,6 +68,8 @@ struct ClientConn {
     /// Negotiated client↔server protocol version (set at Identify).
     /// Gate version-dependent behavior with `conn.proto >= N`.
     proto: u16,
+    /// Application keepalive (None when disabled or proto too old).
+    keepalive: Option<crate::keepalive::Keepalive>,
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
@@ -101,6 +103,7 @@ impl ClientConn {
             relay_peer: None,
             relay_in: Vec::new(),
             proto: crate::proto::PROTO_LEGACY,
+            keepalive: None,
         }
     }
 
@@ -114,6 +117,16 @@ impl ClientConn {
             return addr.ip().to_string();
         }
         "local".to_string()
+    }
+
+    /// Arm or clear application keepalive from config + negotiated proto.
+    fn arm_keepalive(&mut self) {
+        let net = crate::server::network();
+        self.keepalive = crate::keepalive::Keepalive::maybe(
+            net.keepalive_secs,
+            net.keepalive_timeout_secs,
+            self.proto,
+        );
     }
 }
 
@@ -576,6 +589,16 @@ pub fn run(
         if replies_deferred && !(0..=10).contains(&timeout_ms) {
             timeout_ms = 10;
         }
+        // Bound idle waits by the soonest keepalive ping/timeout.
+        let now_ka = std::time::Instant::now();
+        for c in &clients {
+            if let Some(ref ka) = c.keepalive {
+                let ms = ka.poll_timeout_ms(now_ka);
+                if timeout_ms < 0 || ms < timeout_ms {
+                    timeout_ms = ms;
+                }
+            }
+        }
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -927,6 +950,42 @@ pub fn run(
         let mut need_snapshot: Vec<usize> = Vec::new();
         // need_status_bar_all may already be set by PTY activity marking.
 
+        // Application keepalive: ping idle clients; drop those that miss.
+        {
+            let now = std::time::Instant::now();
+            let mut actions: Vec<(usize, crate::keepalive::Action)> = Vec::new();
+            for (i, c) in clients.iter().enumerate() {
+                if let Some(ref ka) = c.keepalive
+                    && let Some(action) = ka.poll(now)
+                {
+                    actions.push((i, action));
+                }
+            }
+            for (i, action) in actions {
+                match action {
+                    crate::keepalive::Action::SendPing => {
+                        let msg = proto::encode_server(&ServerMsg::Ping);
+                        if client_send(&mut clients[i], &msg) {
+                            if let Some(ref mut ka) = clients[i].keepalive {
+                                ka.note_ping_sent();
+                            }
+                        } else if !to_remove.contains(&i) {
+                            to_remove.push(i);
+                        }
+                    }
+                    crate::keepalive::Action::TimedOut => {
+                        crate::log::warn(&format!(
+                            "client fd {} keepalive timeout — disconnecting",
+                            clients[i].fd
+                        ));
+                        if !to_remove.contains(&i) {
+                            to_remove.push(i);
+                        }
+                    }
+                }
+            }
+        }
+
         for client_idx in 0..polled_clients {
             // Clients may have been removed during PTY processing (write
             // failures). Bounds-check before indexing.
@@ -958,7 +1017,20 @@ pub fn run(
                         loop {
                             match try_parse_frame(&mut clients[client_idx].buf) {
                                 Ok(Some(msg)) => {
+                                    if let Some(ka) = clients[client_idx].keepalive.as_mut() {
+                                        ka.note_rx();
+                                    }
                                     match msg {
+                                        ClientMsg::Ping => {
+                                            let msg = proto::encode_server(&ServerMsg::Pong);
+                                            if !client_send(&mut clients[client_idx], &msg) {
+                                                to_remove.push(client_idx);
+                                                break;
+                                            }
+                                        }
+                                        ClientMsg::Pong => {
+                                            // note_rx already recorded liveness.
+                                        }
                                         ClientMsg::PaneInput { data } => {
                                             let si = clients[client_idx].session_idx;
                                             let aw = clients[client_idx].active_window;
@@ -3225,6 +3297,7 @@ fn handshake_first_client(
     conn.session_idx = 0;
     conn.active_window = 0;
     conn.proto = negotiated;
+    conn.arm_keepalive();
 
     Ok((grid_rows, grid_cols, vec![session], vec![conn]))
 }
@@ -3627,6 +3700,7 @@ fn accept_new_client(
             conn.is_control = is_control;
             conn.hostname = hostname;
             conn.proto = negotiated;
+            conn.arm_keepalive();
             crate::log::info(&format!(
                 "client connected: session_idx={session_idx}, window={active}, proto=v{negotiated}, total clients={}",
                 clients.len() + 1

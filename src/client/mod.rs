@@ -215,7 +215,6 @@ pub fn run(
 ) -> io::Result<ClientExit> {
     // Connect to the server (Unix socket, or TCP when --tcp is set).
     let mut stream = ipc::connect_any(socket_path)?;
-    let stream_fd = stream.as_raw_fd();
 
     // Enter raw mode on the controlling terminal.
     let _raw_guard = terminal::enter_raw_mode()?;
@@ -245,7 +244,7 @@ pub fn run(
     proto::send(&mut stream, &identify)?;
 
     // Wait for IdentifyAck to get grid dimensions and server version.
-    let (grid_rows, grid_cols, server_version, negotiated_proto, server_proto_range) =
+    let (grid_rows, grid_cols, server_version, mut negotiated_proto, server_proto_range) =
         match proto::decode_server(&mut stream) {
             Ok(ServerMsg::IdentifyAck {
                 rows,
@@ -426,6 +425,18 @@ pub fn run(
     // Set when the exit is the session/server going away (pane exited,
     // server down, socket dropped) rather than the user leaving.
     let mut ended = false;
+    // In-process reconnect after transport loss / keepalive miss.
+    let mut reconnect: Option<ReconnectState> = None;
+    let mut keepalive = {
+        let net = &crate::config::global().network;
+        crate::keepalive::Keepalive::maybe(
+            net.keepalive_secs,
+            net.keepalive_timeout_secs,
+            negotiated_proto,
+        )
+    };
+    // stream_fd refreshed after reconnect.
+    let mut stream_fd = stream.as_raw_fd();
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -478,6 +489,94 @@ pub fn run(
             }
         }
 
+        // ── Reconnecting: dim overlay + backoff retries ─────────────
+        if let Some(ref mut rc) = reconnect {
+            render_reconnect_overlay(
+                &grid,
+                &status_text,
+                term_rows,
+                term_cols,
+                rc,
+                socket_path,
+            )?;
+            let now = std::time::Instant::now();
+            let wait = rc
+                .next_at
+                .saturating_duration_since(now)
+                .as_millis()
+                .min(500) as i32;
+            let mut pfd = libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, wait.max(50)) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                // Controlling TTY gone — leave.
+                break;
+            }
+            if pfd.revents & libc::POLLIN != 0 {
+                let mut buf = [0u8; 64];
+                match io::stdin().read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if reconnect_wants_quit(&buf[..n]) {
+                            exit_reason = Some("disconnected (quit)".to_string());
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if std::time::Instant::now() >= rc.next_at {
+                match try_reconnect(socket_path, &current_session) {
+                    Ok((new_stream, proto)) => {
+                        stream = new_stream;
+                        stream_fd = stream.as_raw_fd();
+                        negotiated_proto = proto;
+                        server_buf.clear();
+                        keepalive = {
+                            let net = &crate::config::global().network;
+                            crate::keepalive::Keepalive::maybe(
+                                net.keepalive_secs,
+                                net.keepalive_timeout_secs,
+                                negotiated_proto,
+                            )
+                        };
+                        reconnect = None;
+                        copy_mode = None;
+                        confirm_state = ConfirmState::None;
+                        prefix_state = PrefixState::Normal;
+                        renderer.invalidate();
+                        grid.mark_all_dirty();
+                        let _ = send_cmd(&mut stream, &ClientMsg::Refresh);
+                        // Brief flash that we are back.
+                        flash_msg = Some("reconnected".to_string());
+                        flash_deadline = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        rc.push_error(e.to_string());
+                        rc.attempt = rc.attempt.saturating_add(1);
+                        let delay = crate::keepalive::reconnect_backoff(rc.attempt);
+                        rc.next_at = std::time::Instant::now() + delay;
+                    }
+                }
+            }
+            continue;
+        }
+
         let mut fds = [
             libc::pollfd {
                 fd: stdin_fd,
@@ -492,12 +591,16 @@ pub fn run(
         ];
 
         // Poll timeout: 500ms for flash expiry, tightened while the
-        // input filter holds a possible partial terminal reply.
-        let timeout_ms = input_filter
+        // input filter holds a possible partial terminal reply; also
+        // bound by keepalive so probes fire on schedule.
+        let mut timeout_ms = input_filter
             .hold_remaining_ms()
             .unwrap_or(500)
             .min(mouse_decoder.hold_remaining_ms().unwrap_or(500))
             .min(500);
+        if let Some(ref ka) = keepalive {
+            timeout_ms = timeout_ms.min(ka.poll_timeout_ms(std::time::Instant::now()));
+        }
         let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -1222,6 +1325,9 @@ pub fn run(
                 break;
             }
             if total > 0 {
+                if let Some(ref mut ka) = keepalive {
+                    ka.note_rx();
+                }
                 let mut needs_render = false;
                 while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
                     match msg {
@@ -1536,6 +1642,12 @@ pub fn run(
                         | ServerMsg::RelayAck { .. }
                         | ServerMsg::SendKeysAck { .. }
                         | ServerMsg::SendEventAck { .. } => {}
+                        ServerMsg::Ping => {
+                            let _ = send_cmd(&mut stream, &ClientMsg::Pong);
+                        }
+                        ServerMsg::Pong => {
+                            // Liveness recorded via keepalive.note_rx below.
+                        }
                     }
                 }
                 // GridUpdate/Snapshot carry the child's mouse flags — keep
@@ -1572,23 +1684,26 @@ pub fn run(
                     }
                 }
             } else if last == 0 {
-                // Server closed the connection (EOF).
-                ended = true;
-                let sock_path = socket_path.to_string_lossy();
-                if !std::path::Path::new(&*sock_path).exists() {
-                    exit_reason = Some("server shut down".to_string());
-                } else {
-                    let log_hint = server_log_path(socket_path);
-                    exit_reason = Some(format!(
-                        "disconnected from server (socket still present — server may have crashed, or this client was dropped for backpressure). Check log at {log_hint}"
-                    ));
-                }
-                break;
+                // Server closed the connection (EOF) — enter reconnect overlay.
+                begin_reconnect(
+                    &mut reconnect,
+                    &mut copy_mode,
+                    &mut confirm_state,
+                    &mut prefix_state,
+                    disconnect_reason(socket_path, "connection closed (EOF)"),
+                );
+                continue;
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() != io::ErrorKind::WouldBlock {
-                    exit_reason = Some(format!("read error from server: {err}"));
-                    break;
+                    begin_reconnect(
+                        &mut reconnect,
+                        &mut copy_mode,
+                        &mut confirm_state,
+                        &mut prefix_state,
+                        format!("read error from server: {err}"),
+                    );
+                    continue;
                 }
             }
         }
@@ -1598,19 +1713,46 @@ pub fn run(
             break;
         }
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            // Server socket hung up. Check if the server is still alive
-            // to give the user a clue about why we disconnected.
-            ended = true;
-            let sock_path = socket_path.to_string_lossy();
-            if !std::path::Path::new(&*sock_path).exists() {
-                exit_reason = Some("server shut down".to_string());
-            } else {
-                let log_hint = server_log_path(socket_path);
-                exit_reason = Some(format!(
-                    "disconnected from server (socket still present — server may have crashed, or this client was dropped for backpressure). Check log at {log_hint}"
-                ));
+            begin_reconnect(
+                &mut reconnect,
+                &mut copy_mode,
+                &mut confirm_state,
+                &mut prefix_state,
+                disconnect_reason(socket_path, "connection hung up"),
+            );
+            continue;
+        }
+
+        // Application keepalive while attached.
+        if let Some(ref mut ka) = keepalive {
+            let now = std::time::Instant::now();
+            match ka.poll(now) {
+                Some(crate::keepalive::Action::SendPing) => {
+                    if send_cmd(&mut stream, &ClientMsg::Ping).is_ok() {
+                        ka.note_ping_sent();
+                    } else {
+                        begin_reconnect(
+                            &mut reconnect,
+                            &mut copy_mode,
+                            &mut confirm_state,
+                            &mut prefix_state,
+                            "keepalive ping failed to send".to_string(),
+                        );
+                        continue;
+                    }
+                }
+                Some(crate::keepalive::Action::TimedOut) => {
+                    begin_reconnect(
+                        &mut reconnect,
+                        &mut copy_mode,
+                        &mut confirm_state,
+                        &mut prefix_state,
+                        "keepalive timeout".to_string(),
+                    );
+                    continue;
+                }
+                None => {}
             }
-            break;
         }
     }
 
@@ -1618,7 +1760,9 @@ pub fn run(
     // Drop the raw mode guard before printing the exit reason so the
     // terminal is in cooked mode (ONLCR) and newlines work normally.
     drop(_raw_guard);
-    if let Some(reason) = exit_reason {
+    if let Some(reason) = exit_reason
+        && reason != "disconnected (quit)"
+    {
         eprintln!("lrmux: {reason}");
     }
     let hint = || {
@@ -1646,6 +1790,228 @@ pub fn run(
     } else {
         ClientExit::Done
     })
+}
+
+/// In-process reconnect overlay state after transport loss.
+struct ReconnectState {
+    since: std::time::Instant,
+    attempt: u32,
+    next_at: std::time::Instant,
+    last_errors: std::collections::VecDeque<String>,
+    reason: String,
+}
+
+impl ReconnectState {
+    fn new(reason: String) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            since: now,
+            attempt: 0,
+            next_at: now, // try immediately
+            last_errors: std::collections::VecDeque::new(),
+            reason,
+        }
+    }
+
+    fn push_error(&mut self, err: String) {
+        if self.last_errors.len() >= 3 {
+            self.last_errors.pop_front();
+        }
+        self.last_errors.push_back(err);
+    }
+}
+
+fn begin_reconnect(
+    reconnect: &mut Option<ReconnectState>,
+    copy_mode: &mut Option<copy_mode::CopyMode>,
+    confirm_state: &mut ConfirmState,
+    prefix_state: &mut PrefixState,
+    reason: String,
+) {
+    *copy_mode = None;
+    *confirm_state = ConfirmState::None;
+    *prefix_state = PrefixState::Normal;
+    *reconnect = Some(ReconnectState::new(reason));
+}
+
+fn disconnect_reason(socket_path: &std::path::Path, detail: &str) -> String {
+    let target = crate::keepalive::connection_target(socket_path);
+    if crate::ipc::tcp_addr().is_some() {
+        format!("lost connection to {target}: {detail}")
+    } else if !socket_path.exists() {
+        format!("lost connection to {target}: server socket gone ({detail})")
+    } else {
+        let log_hint = server_log_path(socket_path);
+        format!(
+            "lost connection to {target}: {detail} (socket still present — server may have crashed or dropped this client). Check log at {log_hint}"
+        )
+    }
+}
+
+fn reconnect_wants_quit(input: &[u8]) -> bool {
+    input.iter().any(|&b| b == b'q' || b == b'Q' || b == 0x1b || b == 0x03)
+}
+
+fn try_reconnect(
+    socket_path: &std::path::Path,
+    current_session: &str,
+) -> io::Result<(ipc::ConnStream, u16)> {
+    let mut stream = if let Some(addr) = crate::ipc::tcp_addr() {
+        ipc::connect_tcp_timeout(&addr, std::time::Duration::from_secs(5))?
+    } else {
+        ipc::connect_any(socket_path)?
+    };
+    let (rows, cols) = terminal::get_size();
+    let identify = proto::encode_client(&ClientMsg::Identify {
+        rows,
+        cols,
+        attach: true,
+        auth_token: crate::config::effective_psk(),
+        env: terminal_env_overlay(),
+    });
+    proto::send(&mut stream, &identify)?;
+    let negotiated = match proto::decode_server(&mut stream)? {
+        ServerMsg::IdentifyAck {
+            proto: negotiated, ..
+        } => {
+            if negotiated < proto::PROTO_MIN {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!(
+                        "server speaks protocol v{negotiated}, this client requires ≥v{}",
+                        proto::PROTO_MIN
+                    ),
+                ));
+            }
+            negotiated
+        }
+        ServerMsg::Error { msg } => {
+            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected IdentifyAck on reconnect",
+            ));
+        }
+    };
+    if !current_session.is_empty() {
+        let msg = proto::encode_client(&ClientMsg::SelectSession {
+            name: current_session.to_string(),
+        });
+        proto::send(&mut stream, &msg)?;
+    }
+    stream.set_nonblocking(true)?;
+    Ok((stream, negotiated))
+}
+
+fn render_reconnect_overlay(
+    grid: &composite::WindowView,
+    status_text: &str,
+    term_rows: usize,
+    term_cols: usize,
+    rc: &ReconnectState,
+    socket_path: &std::path::Path,
+) -> io::Result<()> {
+    let mut stdout = client_stdout();
+    let view_rows = term_rows.saturating_sub(1).max(1);
+    // Dim the last known content in place (no alternate screen).
+    write!(stdout, "\x1b[?25l\x1b[1;{}r\x1b[H\x1b[2m", view_rows)?;
+    let rows = grid.rows().min(view_rows);
+    let cols = grid.cols().min(term_cols);
+    for r in 0..rows {
+        write!(stdout, "\x1b[{};1H", r + 1)?;
+        for c in 0..cols {
+            let ch = grid
+                .cell(r, c)
+                .map(|cell| {
+                    if cell.ch == '\0' || cell.ch == ' ' {
+                        ' '
+                    } else {
+                        cell.ch
+                    }
+                })
+                .unwrap_or(' ');
+            write!(stdout, "{ch}")?;
+        }
+    }
+    write!(stdout, "\x1b[0m")?;
+
+    let target = crate::keepalive::connection_target(socket_path);
+    let elapsed = rc.since.elapsed().as_secs();
+    let next = rc
+        .next_at
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
+    let mut lines: Vec<String> = vec![
+        "Connection lost".to_string(),
+        target,
+        format!("elapsed {elapsed}s  ·  attempt {}  ·  retry in {next}s", rc.attempt + 1),
+        rc.reason.clone(),
+    ];
+    for e in &rc.last_errors {
+        lines.push(format!("• {e}"));
+    }
+    lines.push("q / Esc / Ctrl-C to quit".to_string());
+
+    let box_w = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(20)
+        .min(term_cols.saturating_sub(4))
+        .max(24);
+    let box_h = lines.len() + 2;
+    let top = view_rows.saturating_sub(box_h) / 2;
+    let left = term_cols.saturating_sub(box_w + 2) / 2;
+    let horiz = "─".repeat(box_w);
+    write!(
+        stdout,
+        "\x1b[{};{}H\x1b[0;1;37;44m┌{}┐\x1b[0m",
+        top + 1,
+        left + 1,
+        horiz
+    )?;
+    for (i, line) in lines.iter().enumerate() {
+        let mut padded: String = line.chars().take(box_w).collect();
+        while padded.chars().count() < box_w {
+            padded.push(' ');
+        }
+        let style = if i == 0 {
+            "\x1b[1;37;44m"
+        } else if i == lines.len() - 1 {
+            "\x1b[0;36;44m"
+        } else {
+            "\x1b[0;37;44m"
+        };
+        write!(
+            stdout,
+            "\x1b[{};{}H{style}│{padded}│\x1b[0m",
+            top + 2 + i,
+            left + 1
+        )?;
+    }
+    write!(
+        stdout,
+        "\x1b[{};{}H\x1b[0;1;37;44m└{}┘\x1b[0m",
+        top + 1 + box_h,
+        left + 1,
+        horiz
+    )?;
+    // Status line reminder.
+    write!(
+        stdout,
+        "\x1b[{};1H\x1b[0;44;37m {:<width$}\x1b[0m",
+        term_rows,
+        if status_text.is_empty() {
+            "reconnecting…"
+        } else {
+            status_text
+        },
+        width = term_cols.saturating_sub(1)
+    )?;
+    stdout.flush()?;
+    Ok(())
 }
 
 /// Log file for a server socket at `/tmp/lrmux-<UID>/<name>` lives at
