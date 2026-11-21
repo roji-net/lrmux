@@ -105,10 +105,29 @@ fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEven
     // `i` omitted → 0; pane layer replaces 0 with a fresh id so unicode
     // placeholders (fg RGB) and `a=p,i=…` stay unique.
     let image_id = keys.get("i").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Feature query (`e=…`): report supported keys; no image load.
+    // Without this, clients like terminal-browser cannot discover U=1.
+    if action == GraphicsAction::Query
+        && let Some(e) = keys.get("e")
+    {
+        return vec![GraphicsEvent::QueryReply {
+            bytes: feature_query_reply(image_id, e, &keys),
+        }];
+    }
+
     match action {
         GraphicsAction::Query => {
-            let reply = format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes();
-            vec![GraphicsEvent::QueryReply { bytes: reply }]
+            // Kitty: try to load, reply OK/error, do NOT store.
+            // Lying with OK for t=s made terminal-browser commit to shm and
+            // then go blank when we dropped the frames.
+            let reply = match load_image_bytes(&keys, &payload) {
+                Ok(_) => format!("\x1b_Gi={image_id};OK\x1b\\"),
+                Err(msg) => format!("\x1b_Gi={image_id};{msg}\x1b\\"),
+            };
+            vec![GraphicsEvent::QueryReply {
+                bytes: reply.into_bytes(),
+            }]
         }
         GraphicsAction::Delete => {
             vec![GraphicsEvent::Delete { image_id }]
@@ -139,25 +158,16 @@ fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEven
             let height = keys.get("v").and_then(|s| s.parse().ok()).unwrap_or(0);
             let format = keys.get("f").and_then(|s| s.parse().ok()).unwrap_or(32);
             let zlib = keys.get("o").map(|s| s == "z").unwrap_or(false);
-            let medium = keys.get("t").map(|s| s.as_str()).unwrap_or("d");
-            let data = match medium {
-                // Direct (and stream) — payload is already image bytes.
-                "d" => payload,
-                // Local file / temporary file — payload is a path.
-                "f" | "t" => match read_path_payload(&payload) {
-                    Some(bytes) => bytes,
-                    None => {
-                        crate::log::warn(&format!(
-                            "kitty graphics: failed to read t={medium} path payload"
-                        ));
-                        return Vec::new();
+            let data = match load_image_bytes(&keys, &payload) {
+                Ok(bytes) => bytes,
+                Err(msg) => {
+                    crate::log::warn(&format!("kitty graphics: {msg}"));
+                    // With an id, clients expect a failure reply.
+                    if image_id != 0 {
+                        return vec![GraphicsEvent::QueryReply {
+                            bytes: format!("\x1b_Gi={image_id};{msg}\x1b\\").into_bytes(),
+                        }];
                     }
-                },
-                // Shared memory not supported yet.
-                other => {
-                    crate::log::warn(&format!(
-                        "kitty graphics: unsupported transmission medium t={other}"
-                    ));
                     return Vec::new();
                 }
             };
@@ -188,30 +198,139 @@ fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEven
     }
 }
 
+/// Load pixel bytes for the transmission medium in `keys` (`t=d|f|t|s`).
+fn load_image_bytes(keys: &HashMap<String, String>, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let medium = keys.get("t").map(|s| s.as_str()).unwrap_or("d");
+    match medium {
+        "d" => Ok(payload.to_vec()),
+        "f" | "t" => {
+            read_path_payload(payload).ok_or_else(|| "EBADF:Failed to open image file".to_string())
+        }
+        "s" => {
+            let size = keys.get("S").and_then(|s| s.parse().ok());
+            let offset = keys.get("O").and_then(|s| s.parse().ok()).unwrap_or(0);
+            read_shm_payload(payload, size, offset)
+                .ok_or_else(|| "EBADF:Failed to open shared memory".to_string())
+        }
+        other => Err(format!("EINVAL:unsupported transmission medium t={other}")),
+    }
+}
+
+/// Feature-query reply (`a=q,e=…`). Advertise unicode placeholders for `e=T`.
+fn feature_query_reply(image_id: u32, e: &str, keys: &HashMap<String, String>) -> Vec<u8> {
+    let mut parts = vec![format!("i={image_id}"), format!("e={e}")];
+    // Echo non-default keys we support for the queried action.
+    if e == "T" || e == "t" {
+        if keys.get("U").map(|s| s.as_str()) == Some("1") {
+            parts.push("U=1".into());
+        }
+        if keys.get("C").map(|s| s.as_str()) == Some("1") {
+            // We don't suppress cursor movement specially; omit C if unsure.
+        }
+        // Direct + file + shm + temp we can attempt.
+        if let Some(t) = keys.get("t")
+            && matches!(t.as_str(), "d" | "f" | "t" | "s")
+        {
+            parts.push(format!("t={t}"));
+        }
+    }
+    let body = parts.join(",");
+    format!("\x1b_G{body}\x1b\\").into_bytes()
+}
+
 /// Decode a `t=f`/`t=t` path payload (raw UTF-8 or base64 of the path).
 fn read_path_payload(payload: &[u8]) -> Option<Vec<u8>> {
     if payload.is_empty() {
         return None;
     }
-    let path_bytes = if payload.iter().all(|&b| b.is_ascii_graphic() || b == b'/') {
-        payload.to_vec()
-    } else {
-        // Some clients base64 the path; try decoding when raw open fails.
-        payload.to_vec()
-    };
-    let path = std::str::from_utf8(&path_bytes).ok()?.trim();
+    let path = std::str::from_utf8(payload)
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(path) = path
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        return Some(bytes);
+    }
+    // Retry as base64-encoded path (Kitty encodes the path in the payload
+    // before our chunk decoder runs — by here it's usually already decoded).
+    let decoded = base64_decode(payload);
+    let path = std::str::from_utf8(&decoded).ok()?.trim();
     if path.is_empty() {
         return None;
     }
-    match std::fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            // Retry as base64-encoded path.
-            let decoded = base64_decode(payload);
-            let path = std::str::from_utf8(&decoded).ok()?.trim();
-            std::fs::read(path).ok()
-        }
+    std::fs::read(path).ok()
+}
+
+/// Read a POSIX shared-memory object (`t=s`). Payload is the shm name
+/// (Kitty base64-decodes it before we see it). Unlinks after a successful
+/// read, per the graphics protocol.
+fn read_shm_payload(name_bytes: &[u8], size: Option<u64>, offset: u64) -> Option<Vec<u8>> {
+    let name = std::str::from_utf8(name_bytes).ok()?.trim();
+    if name.is_empty() || name.contains('\0') {
+        return None;
     }
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return None;
+    }
+    let file_size = st.st_size as u64;
+    if offset > file_size {
+        unsafe {
+            libc::close(fd);
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        return None;
+    }
+    let want = size
+        .unwrap_or(file_size.saturating_sub(offset))
+        .min(file_size.saturating_sub(offset));
+    if want == 0 || want > 64 * 1024 * 1024 {
+        unsafe {
+            libc::close(fd);
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        return None;
+    }
+    let map_len = (offset + want) as usize;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        unsafe {
+            libc::close(fd);
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        return None;
+    }
+    let mut out = vec![0u8; want as usize];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (ptr as *const u8).add(offset as usize),
+            out.as_mut_ptr(),
+            want as usize,
+        );
+        libc::munmap(ptr, map_len);
+        libc::close(fd);
+        // Protocol: terminal unlinks after reading.
+        let _ = libc::shm_unlink(c_name.as_ptr());
+    }
+    Some(out)
 }
 
 fn split_keys_payload(body: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -497,5 +616,87 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod shm_smoke {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn posix_shm_roundtrip() {
+        let name = CString::new(format!("/lrmux_shm_{}", std::process::id())).unwrap();
+        unsafe {
+            libc::shm_unlink(name.as_ptr());
+        }
+        let fd = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            // Some environments (sandbox / older Darwin) refuse POSIX shm;
+            // skip rather than fail the suite — production Ghostty+TB still
+            // create objects the server can read.
+            eprintln!(
+                "skip posix_shm_roundtrip: shm_open create failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        assert_eq!(unsafe { libc::ftruncate(fd, 64) }, 0);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                64,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"HELLOSHM".as_ptr(), ptr as *mut u8, 8);
+            libc::munmap(ptr, 64);
+            libc::close(fd);
+        }
+        let data = read_shm_payload(name.as_bytes(), None, 0).expect("read_shm");
+        assert_eq!(&data[..8], b"HELLOSHM");
+        let fd3 = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd3 < 0, "expected unlink after read");
+    }
+
+    #[test]
+    fn query_t_s_missing_shm_returns_error_not_ok() {
+        // terminal-browser probes t=s; a false OK made it commit to shm and
+        // then render blank when frames were dropped.
+        // Payload "L25vcGU=" is base64 for "/nope".
+        let mut p = KittyParser::new();
+        let ev = p.feed_apc_body(b"a=q,i=42,s=1,v=1,t=s,f=24;L25vcGU=");
+        assert_eq!(ev.len(), 1);
+        match &ev[0] {
+            GraphicsEvent::QueryReply { bytes } => {
+                let s = String::from_utf8_lossy(bytes);
+                assert!(s.contains("i=42"), "{s}");
+                assert!(!s.contains(";OK"), "{s}");
+                assert!(s.contains("EBADF") || s.contains("Failed"), "{s}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_query_advertises_unicode_placeholders() {
+        let ev = parse_apc_g(b"a=q,i=31,e=T,U=1");
+        let GraphicsEvent::QueryReply { bytes } = &ev[0] else {
+            panic!("expected reply");
+        };
+        let s = String::from_utf8_lossy(bytes);
+        assert!(s.contains("e=T"), "{s}");
+        assert!(s.contains("U=1"), "{s}");
     }
 }
