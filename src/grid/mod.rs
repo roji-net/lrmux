@@ -49,6 +49,9 @@ pub struct Grid {
     /// Mouse encoding the child asked for: 0 = legacy X10,
     /// 5 = UTF-8 extended (DECSET 1005), 6 = SGR (DECSET 1006).
     pub mouse_fmt: u8,
+    /// SGR-Pixels (DECSET 1016): SGR reports carry pixel coordinates
+    /// instead of cells. Independent of `mouse_fmt` (still SGR on the wire).
+    pub mouse_pixels: bool,
     /// Alternate scroll (DECSET 1007): in the alternate screen a wheel
     /// event is turned into arrow keys by the terminal.
     pub mouse_altscroll: bool,
@@ -98,6 +101,7 @@ impl Grid {
             app_cursor_keys: false,
             mouse_tracking: 0,
             mouse_fmt: 0,
+            mouse_pixels: false,
             mouse_altscroll: false,
             dirty: vec![true; rows],
         };
@@ -113,7 +117,8 @@ impl Grid {
     /// Pack mouse state for the wire: bits 0-2 tracking (1000/1002/1003),
     /// bits 3-4 encoding (0/5/6 → 0/1/2), bit 5 altscroll,
     /// bit 6 application cursor keys (needed to pick the right arrow
-    /// sequence when translating wheel events locally).
+    /// sequence when translating wheel events locally),
+    /// bit 7 SGR-Pixels (1016).
     pub fn mouse_flags(&self) -> u8 {
         let fmt = match self.mouse_fmt {
             5 => 1,
@@ -124,6 +129,7 @@ impl Grid {
             | (fmt << 3)
             | ((self.mouse_altscroll as u8) << 5)
             | ((self.app_cursor_keys as u8) << 6)
+            | ((self.mouse_pixels as u8) << 7)
     }
 
     /// Unpack wire flags written by `mouse_flags`.
@@ -136,6 +142,7 @@ impl Grid {
         };
         self.mouse_altscroll = f & 0x20 != 0;
         self.app_cursor_keys = f & 0x40 != 0;
+        self.mouse_pixels = f & 0x80 != 0;
     }
 
     pub fn rows(&self) -> usize {
@@ -233,8 +240,37 @@ impl Grid {
         self.rows.get(row).and_then(|r| r.get(col))
     }
 
+    /// Mutable cell access (marks the row dirty).
+    pub fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
+        if row >= self.rows.len() || col >= self.cols {
+            return None;
+        }
+        self.mark_dirty(row);
+        self.rows.get_mut(row)?.get_mut(col)
+    }
+
     /// Print a character at the cursor position, advancing the cursor.
+    /// Combining marks attach to the previous cell without advancing.
     pub fn print(&mut self, c: char) {
+        if cell::is_combining_mark(c) {
+            let (crow, ccol) = if self.wrap_pending && self.cursor_col > 0 {
+                (self.cursor_row, self.cursor_col)
+            } else if self.cursor_col > 0 {
+                (self.cursor_row, self.cursor_col - 1)
+            } else if self.cursor_row > 0 {
+                (self.cursor_row - 1, self.cols.saturating_sub(1))
+            } else {
+                return;
+            };
+            if let Some(row) = self.rows.get_mut(crow)
+                && let Some(cell) = row.get_mut(ccol)
+            {
+                let _ = cell.push_mark(c);
+                self.mark_dirty(crow);
+            }
+            return;
+        }
+
         // Handle wrap: if we were at the last column and need to wrap.
         if self.wrap_pending {
             self.cursor_col = 0;
@@ -262,6 +298,8 @@ impl Grid {
                 fg,
                 bg,
                 attrs,
+                marks: ['\0', '\0'],
+                mark_len: 0,
             };
         }
         self.mark_dirty(crow);

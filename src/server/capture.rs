@@ -354,6 +354,8 @@ mod tests {
                 fg,
                 bg: Color::Default,
                 attrs: Attr::default(),
+                marks: ['\0', '\0'],
+                mark_len: 0,
             })
             .collect()
     }

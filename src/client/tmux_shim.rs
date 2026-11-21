@@ -68,12 +68,23 @@ pub fn run(args: &[String]) -> i32 {
              usage: tmux [-S socket] command [flags]\n\
              \n\
              Supported: new-window kill-window display-message \\\n\
-             set-window-option\n\
+             set-window-option set / set-option (allow-passthrough no-op)\n\
              show-environment list-sessions list-windows\n\
              \n\
              Other commands return success with empty output.",
             crate::version::VERSION
         );
+        return 0;
+    }
+
+    // terminal-browser (and similar) call `tmux set -p allow-passthrough on`
+    // during prepare. Honor as a silent success so Kitty graphics can use
+    // the DCS tmux; wrapper path under tmux_compat.
+    if matches!(
+        cmd_args[0].as_str(),
+        "set" | "set-option" | "set-window-option"
+    ) && cmd_args.iter().any(|a| a.contains("allow-passthrough"))
+    {
         return 0;
     }
 

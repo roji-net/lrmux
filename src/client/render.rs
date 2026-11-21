@@ -123,11 +123,15 @@ impl Renderer {
                         current_sgr = Some(sgr);
                     }
 
-                    // Write the character.
+                    // Write the character (+ combining marks for Kitty placeholders).
                     if cell.ch == '\0' {
                         buf.push(' ');
                     } else {
-                        buf.push(cell.ch);
+                        for ch in cell.chars() {
+                            if ch != '\0' {
+                                buf.push(ch);
+                            }
+                        }
                     }
                     col += 1;
                 }

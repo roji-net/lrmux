@@ -298,7 +298,9 @@ pub fn encode_report(fmt: u8, ev: &Event) -> Vec<u8> {
 /// mask returns an empty string: reporting stays off and the outer
 /// terminal keeps its native wheel scrollback and drag selection.
 /// SGR encoding (1006) is always requested so reports are unambiguous.
-pub fn terminal_setup(tracking: u8) -> String {
+/// When `sgr_pixels` is set, also enable DECSET 1016 so coordinates are
+/// pixels (what terminal-browser expects).
+pub fn terminal_setup(tracking: u8, sgr_pixels: bool) -> String {
     let mut s = String::new();
     if tracking & 1 != 0 {
         s.push_str("\x1b[?1000h");
@@ -311,6 +313,9 @@ pub fn terminal_setup(tracking: u8) -> String {
     }
     if tracking != 0 {
         s.push_str("\x1b[?1006h");
+        if sgr_pixels {
+            s.push_str("\x1b[?1016h");
+        }
     }
     s
 }
@@ -318,7 +323,7 @@ pub fn terminal_setup(tracking: u8) -> String {
 /// DECRST string that disables every mode `terminal_setup` may enable.
 /// Safe to emit unconditionally on cleanup.
 pub fn terminal_teardown() -> &'static str {
-    "\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?1005l\x1b[?1007l"
+    "\x1b[?1016l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?1005l\x1b[?1007l"
 }
 
 #[cfg(test)]
@@ -508,8 +513,15 @@ mod tests {
     fn setup_empty_without_tracking() {
         // No tracking mask → no DECSET at all: the outer terminal keeps
         // native wheel scrollback and drag selection.
-        assert_eq!(terminal_setup(0), "");
-        assert_eq!(terminal_setup(0b010), "\x1b[?1002h\x1b[?1006h");
-        assert_eq!(terminal_setup(0b101), "\x1b[?1000h\x1b[?1003h\x1b[?1006h");
+        assert_eq!(terminal_setup(0, false), "");
+        assert_eq!(terminal_setup(0b010, false), "\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            terminal_setup(0b101, false),
+            "\x1b[?1000h\x1b[?1003h\x1b[?1006h"
+        );
+        assert_eq!(
+            terminal_setup(0b100, true),
+            "\x1b[?1003h\x1b[?1006h\x1b[?1016h"
+        );
     }
 }

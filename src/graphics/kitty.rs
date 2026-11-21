@@ -1,0 +1,702 @@
+//! Parse Kitty graphics APC `_G key=val,…;payload` chunks.
+
+use std::collections::HashMap;
+
+/// Result of applying one or more completed Kitty commands.
+#[derive(Debug, Clone)]
+pub enum GraphicsEvent {
+    /// Image bytes ready to store / ship to clients.
+    Transmit {
+        image_id: u32,
+        width: u32,
+        height: u32,
+        format: u8,
+        zlib: bool,
+        data: Vec<u8>,
+        /// Virtual placement size when `U=1` (or normalized).
+        place_cols: Option<u32>,
+        place_rows: Option<u32>,
+        /// True when the original command also displayed at the cursor
+        /// without U=1 — caller should synthesize placeholders.
+        need_placeholders: bool,
+    },
+    Delete {
+        image_id: u32,
+    },
+    /// Quiet query reply to write back to the PTY.
+    QueryReply {
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsAction {
+    Transmit,
+    TransmitAndDisplay,
+    Put,
+    Delete,
+    Query,
+    Other,
+}
+
+#[derive(Default)]
+struct ChunkState {
+    keys: HashMap<String, String>,
+    payload: Vec<u8>,
+}
+
+/// Accumulates chunked Kitty APC frames until `m=0`.
+#[derive(Default)]
+pub struct KittyParser {
+    pending: Option<ChunkState>,
+}
+
+impl KittyParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one complete APC body after `_G` (keys;payload), without the
+    /// surrounding ESC/_/ST. Returns zero or more completed events.
+    pub fn feed_apc_body(&mut self, body: &[u8]) -> Vec<GraphicsEvent> {
+        let Some((keys_raw, payload_b64)) = split_keys_payload(body) else {
+            return Vec::new();
+        };
+        let keys = parse_keys(keys_raw);
+        let more = keys.get("m").map(|s| s == "1").unwrap_or(false);
+        let chunk = base64_decode(payload_b64);
+
+        if let Some(ref mut st) = self.pending {
+            st.payload.extend_from_slice(&chunk);
+            if more {
+                return Vec::new();
+            }
+            let done = self.pending.take().unwrap();
+            return finalize(done.keys, done.payload);
+        }
+
+        if more {
+            self.pending = Some(ChunkState {
+                keys,
+                payload: chunk,
+            });
+            return Vec::new();
+        }
+
+        finalize(keys, chunk)
+    }
+}
+
+/// Parse a single (possibly complete) `_G…` APC body into events.
+pub fn parse_apc_g(body: &[u8]) -> Vec<GraphicsEvent> {
+    let mut p = KittyParser::new();
+    p.feed_apc_body(body)
+}
+
+fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEvent> {
+    let action = match keys.get("a").map(|s| s.as_str()).unwrap_or("t") {
+        "t" => GraphicsAction::Transmit,
+        "T" => GraphicsAction::TransmitAndDisplay,
+        "p" => GraphicsAction::Put,
+        "d" => GraphicsAction::Delete,
+        "q" => GraphicsAction::Query,
+        _ => GraphicsAction::Other,
+    };
+    // `i` omitted → 0; pane layer replaces 0 with a fresh id so unicode
+    // placeholders (fg RGB) and `a=p,i=…` stay unique.
+    let image_id = keys.get("i").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Feature query (`e=…`): report supported keys; no image load.
+    // Without this, clients like terminal-browser cannot discover U=1.
+    if action == GraphicsAction::Query
+        && let Some(e) = keys.get("e")
+    {
+        return vec![GraphicsEvent::QueryReply {
+            bytes: feature_query_reply(image_id, e, &keys),
+        }];
+    }
+
+    match action {
+        GraphicsAction::Query => {
+            // Kitty: try to load, reply OK/error, do NOT store.
+            // Lying with OK for t=s made terminal-browser commit to shm and
+            // then go blank when we dropped the frames.
+            let reply = match load_image_bytes(&keys, &payload) {
+                Ok(_) => format!("\x1b_Gi={image_id};OK\x1b\\"),
+                Err(msg) => format!("\x1b_Gi={image_id};{msg}\x1b\\"),
+            };
+            vec![GraphicsEvent::QueryReply {
+                bytes: reply.into_bytes(),
+            }]
+        }
+        GraphicsAction::Delete => {
+            vec![GraphicsEvent::Delete { image_id }]
+        }
+        GraphicsAction::Put => {
+            let cols = keys.get("c").and_then(|s| s.parse().ok());
+            let rows = keys.get("r").and_then(|s| s.parse().ok());
+            let virtual_u = keys.get("U").map(|s| s == "1").unwrap_or(false);
+            if virtual_u {
+                // Placement only — image data already transmitted.
+                vec![GraphicsEvent::Transmit {
+                    image_id,
+                    width: 0,
+                    height: 0,
+                    format: 32,
+                    zlib: false,
+                    data: Vec::new(),
+                    place_cols: cols,
+                    place_rows: rows,
+                    need_placeholders: cols.is_some() && rows.is_some(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+        GraphicsAction::Transmit | GraphicsAction::TransmitAndDisplay => {
+            let width = keys.get("s").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let height = keys.get("v").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let format = keys.get("f").and_then(|s| s.parse().ok()).unwrap_or(32);
+            let zlib = keys.get("o").map(|s| s == "z").unwrap_or(false);
+            let data = match load_image_bytes(&keys, &payload) {
+                Ok(bytes) => bytes,
+                Err(msg) => {
+                    crate::log::warn(&format!("kitty graphics: {msg}"));
+                    // With an id, clients expect a failure reply.
+                    if image_id != 0 {
+                        return vec![GraphicsEvent::QueryReply {
+                            bytes: format!("\x1b_Gi={image_id};{msg}\x1b\\").into_bytes(),
+                        }];
+                    }
+                    return Vec::new();
+                }
+            };
+            let virtual_u = keys.get("U").map(|s| s == "1").unwrap_or(false);
+            let cols = keys.get("c").and_then(|s| s.parse().ok());
+            let rows = keys.get("r").and_then(|s| s.parse().ok());
+            let need_placeholders = match action {
+                GraphicsAction::TransmitAndDisplay if virtual_u => cols.is_some() && rows.is_some(),
+                GraphicsAction::TransmitAndDisplay => {
+                    // Cursor placement — normalize to unicode placeholders.
+                    true
+                }
+                _ => virtual_u && cols.is_some() && rows.is_some(),
+            };
+            vec![GraphicsEvent::Transmit {
+                image_id,
+                width,
+                height,
+                format,
+                zlib,
+                data,
+                place_cols: cols,
+                place_rows: rows,
+                need_placeholders,
+            }]
+        }
+        GraphicsAction::Other => Vec::new(),
+    }
+}
+
+/// Load pixel bytes for the transmission medium in `keys` (`t=d|f|t|s`).
+fn load_image_bytes(keys: &HashMap<String, String>, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let medium = keys.get("t").map(|s| s.as_str()).unwrap_or("d");
+    match medium {
+        "d" => Ok(payload.to_vec()),
+        "f" | "t" => {
+            read_path_payload(payload).ok_or_else(|| "EBADF:Failed to open image file".to_string())
+        }
+        "s" => {
+            let size = keys.get("S").and_then(|s| s.parse().ok());
+            let offset = keys.get("O").and_then(|s| s.parse().ok()).unwrap_or(0);
+            read_shm_payload(payload, size, offset)
+                .ok_or_else(|| "EBADF:Failed to open shared memory".to_string())
+        }
+        other => Err(format!("EINVAL:unsupported transmission medium t={other}")),
+    }
+}
+
+/// Feature-query reply (`a=q,e=…`). Advertise unicode placeholders for `e=T`.
+fn feature_query_reply(image_id: u32, e: &str, keys: &HashMap<String, String>) -> Vec<u8> {
+    let mut parts = vec![format!("i={image_id}"), format!("e={e}")];
+    // Echo non-default keys we support for the queried action.
+    if e == "T" || e == "t" {
+        if keys.get("U").map(|s| s.as_str()) == Some("1") {
+            parts.push("U=1".into());
+        }
+        if keys.get("C").map(|s| s.as_str()) == Some("1") {
+            // We don't suppress cursor movement specially; omit C if unsure.
+        }
+        // Direct + file + shm + temp we can attempt.
+        if let Some(t) = keys.get("t")
+            && matches!(t.as_str(), "d" | "f" | "t" | "s")
+        {
+            parts.push(format!("t={t}"));
+        }
+    }
+    let body = parts.join(",");
+    format!("\x1b_G{body}\x1b\\").into_bytes()
+}
+
+/// Decode a `t=f`/`t=t` path payload (raw UTF-8 or base64 of the path).
+fn read_path_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.is_empty() {
+        return None;
+    }
+    let path = std::str::from_utf8(payload)
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(path) = path
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        return Some(bytes);
+    }
+    // Retry as base64-encoded path (Kitty encodes the path in the payload
+    // before our chunk decoder runs — by here it's usually already decoded).
+    let decoded = base64_decode(payload);
+    let path = std::str::from_utf8(&decoded).ok()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// Read a POSIX shared-memory object (`t=s`). Payload is the shm name
+/// (Kitty base64-decodes it before we see it). Unlinks after a successful
+/// read, per the graphics protocol.
+fn read_shm_payload(name_bytes: &[u8], size: Option<u64>, offset: u64) -> Option<Vec<u8>> {
+    let name = std::str::from_utf8(name_bytes).ok()?.trim();
+    if name.is_empty() || name.contains('\0') {
+        return None;
+    }
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return None;
+    }
+    let file_size = st.st_size as u64;
+    if offset > file_size {
+        unsafe {
+            libc::close(fd);
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        return None;
+    }
+    let want = size
+        .unwrap_or(file_size.saturating_sub(offset))
+        .min(file_size.saturating_sub(offset));
+    if want == 0 || want > 64 * 1024 * 1024 {
+        unsafe {
+            libc::close(fd);
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        return None;
+    }
+    let map_len = (offset + want) as usize;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        unsafe {
+            libc::close(fd);
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        return None;
+    }
+    let mut out = vec![0u8; want as usize];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (ptr as *const u8).add(offset as usize),
+            out.as_mut_ptr(),
+            want as usize,
+        );
+        libc::munmap(ptr, map_len);
+        libc::close(fd);
+        // Protocol: terminal unlinks after reading.
+        let _ = libc::shm_unlink(c_name.as_ptr());
+    }
+    Some(out)
+}
+
+fn split_keys_payload(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    match body.iter().position(|&b| b == b';') {
+        Some(semi) => Some((&body[..semi], &body[semi + 1..])),
+        // Delete / place commands often omit the payload separator.
+        None => Some((body, b"")),
+    }
+}
+
+fn parse_keys(raw: &[u8]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for part in raw.split(|&b| b == b',') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(eq) = part.iter().position(|&b| b == b'=') {
+            let k = String::from_utf8_lossy(&part[..eq]).into_owned();
+            let v = String::from_utf8_lossy(&part[eq + 1..]).into_owned();
+            map.insert(k, v);
+        }
+    }
+    map
+}
+
+fn base64_decode(input: &[u8]) -> Vec<u8> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let filtered: Vec<u8> = input
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(filtered.len() * 3 / 4);
+    let mut i = 0;
+    while i + 4 <= filtered.len() {
+        let (a, b, c, d) = (
+            val(filtered[i]).unwrap_or(0) as u32,
+            val(filtered[i + 1]).unwrap_or(0) as u32,
+            val(filtered[i + 2]).unwrap_or(0) as u32,
+            val(filtered[i + 3]).unwrap_or(0) as u32,
+        );
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+        i += 4;
+    }
+    let rem = filtered.len() - i;
+    if rem >= 2 {
+        let a = val(filtered[i]).unwrap_or(0) as u32;
+        let b = val(filtered[i + 1]).unwrap_or(0) as u32;
+        let c = if rem >= 3 {
+            val(filtered[i + 2]).unwrap_or(0) as u32
+        } else {
+            0
+        };
+        let n = (a << 18) | (b << 12) | (c << 6);
+        out.push((n >> 16) as u8);
+        if rem >= 3 {
+            out.push((n >> 8) as u8);
+        }
+    }
+    out
+}
+
+/// Scan `input` for complete APC `_G…ST` and DCS `tmux;…ST` sequences.
+/// Returns (events from completed APCs, bytes with those sequences removed
+/// for the VT parser, leftover incomplete prefix to keep).
+///
+/// `parser` must be the same instance across PTY reads — Kitty chunked
+/// transmits (`m=1`…`m=0`) are separate complete APC frames, and dropping
+/// the assembler between reads finalizes only the last chunk (blank image).
+pub fn extract_graphics(
+    parser: &mut KittyParser,
+    input: &[u8],
+) -> (Vec<GraphicsEvent>, Vec<u8>, Vec<u8>) {
+    let mut events = Vec::new();
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] != 0x1b {
+            out.push(input[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= input.len() {
+            // Lone ESC — keep for next read.
+            return (events, out, input[i..].to_vec());
+        }
+        let kind = input[i + 1];
+        if kind == b'_' {
+            // APC: ESC _ … ST (ESC \) or BEL
+            if let Some((end, body)) = take_string_body(&input[i + 2..]) {
+                let abs_end = i + 2 + end;
+                if body.first() == Some(&b'G') {
+                    events.extend(parser.feed_apc_body(&body[1..]));
+                }
+                i = abs_end;
+                continue;
+            }
+            return (events, out, input[i..].to_vec());
+        }
+        if kind == b'P' {
+            // DCS: ESC P … ST. tmux passthrough doubles ESC inside the
+            // body, so a naive ST search would stop at the inner `ESC ESC \`
+            // (doubled form of the wrapped sequence's own ST).
+            if let Some((end, body)) = take_dcs_body(&input[i + 2..]) {
+                let abs_end = i + 2 + end;
+                if let Some(inner) = unwrap_tmux_dcs(body) {
+                    // Nested extract shares the same assembler so a chunked
+                    // image split across tmux-wrapped APC frames still joins.
+                    let (ev, cleaned, left) = extract_graphics(parser, &inner);
+                    events.extend(ev);
+                    out.extend_from_slice(&cleaned);
+                    if !left.is_empty() {
+                        // Incomplete inner sequence — keep whole DCS for later.
+                        return (events, out, input[i..].to_vec());
+                    }
+                }
+                // Drop the DCS wrapper either way (passthrough consumed).
+                i = abs_end;
+                continue;
+            }
+            return (events, out, input[i..].to_vec());
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    (events, out, Vec::new())
+}
+
+fn take_string_body(rest: &[u8]) -> Option<(usize, &[u8])> {
+    // Find ST = ESC \ or BEL.
+    let mut j = 0;
+    while j < rest.len() {
+        if rest[j] == 0x07 {
+            return Some((j + 1, &rest[..j]));
+        }
+        if rest[j] == 0x1b && j + 1 < rest.len() && rest[j + 1] == b'\\' {
+            return Some((j + 2, &rest[..j]));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// DCS body terminator that respects tmux's doubled-ESC escaping.
+fn take_dcs_body(rest: &[u8]) -> Option<(usize, &[u8])> {
+    let tmux = rest.starts_with(b"tmux;");
+    let mut j = 0;
+    while j < rest.len() {
+        if rest[j] == 0x07 {
+            return Some((j + 1, &rest[..j]));
+        }
+        if rest[j] == 0x1b && j + 1 < rest.len() {
+            if tmux && rest[j + 1] == 0x1b {
+                // Escaped ESC inside tmux passthrough — skip both.
+                j += 2;
+                continue;
+            }
+            if rest[j + 1] == b'\\' {
+                return Some((j + 2, &rest[..j]));
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Unwrap `tmux;<bytes with doubled ESC>` into the inner byte string.
+fn unwrap_tmux_dcs(body: &[u8]) -> Option<Vec<u8>> {
+    const PREFIX: &[u8] = b"tmux;";
+    if !body.starts_with(PREFIX) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = PREFIX.len();
+    while i < body.len() {
+        if body[i] == 0x1b && i + 1 < body.len() && body[i + 1] == 0x1b {
+            out.push(0x1b);
+            i += 2;
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_chunk_transmit() {
+        let body = b"a=T,f=32,o=z,s=1,v=1,t=d,i=7,U=1,c=2,r=2,q=2,m=0;AAAA";
+        let ev = parse_apc_g(body);
+        assert_eq!(ev.len(), 1);
+        match &ev[0] {
+            GraphicsEvent::Transmit {
+                image_id,
+                place_cols,
+                place_rows,
+                need_placeholders,
+                ..
+            } => {
+                assert_eq!(*image_id, 7);
+                assert_eq!(*place_cols, Some(2));
+                assert_eq!(*place_rows, Some(2));
+                assert!(*need_placeholders);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_apc_from_stream() {
+        let seq = b"hello\x1b_Ga=q,i=1,t=d,f=24,s=1,v=1;AAAA\x1b\\world";
+        let mut parser = KittyParser::new();
+        let (ev, cleaned, left) = extract_graphics(&mut parser, seq);
+        assert!(left.is_empty());
+        assert_eq!(cleaned, b"helloworld");
+        assert!(matches!(ev[0], GraphicsEvent::QueryReply { .. }));
+    }
+
+    #[test]
+    fn extract_tmux_wrapped_apc() {
+        // ESC P tmux; ESC ESC _ G … ESC ESC \ ESC \
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"\x1bPtmux;");
+        for &b in b"\x1b_Ga=d,d=I,i=5,q=2\x1b\\" {
+            if b == 0x1b {
+                seq.push(0x1b);
+            }
+            seq.push(b);
+        }
+        seq.extend_from_slice(b"\x1b\\");
+        let mut parser = KittyParser::new();
+        let (ev, _cleaned, left) = extract_graphics(&mut parser, &seq);
+        assert!(left.is_empty());
+        assert!(matches!(ev[0], GraphicsEvent::Delete { image_id: 5 }));
+    }
+
+    #[test]
+    fn chunked_transmit_survives_across_extract_calls() {
+        // kitten icat --transfer-mode=stream sends each m=1/m=0 frame as its
+        // own APC; PTY reads often split them. Parser state must persist.
+        let mut parser = KittyParser::new();
+        let c1 = b"\x1b_Ga=T,f=100,m=1,s=2,v=2,i=9;AA\x1b\\";
+        let (ev1, _, left1) = extract_graphics(&mut parser, c1);
+        assert!(ev1.is_empty());
+        assert!(left1.is_empty());
+        let c2 = b"\x1b_Ga=T,m=0;BB\x1b\\";
+        let (ev2, _, left2) = extract_graphics(&mut parser, c2);
+        assert!(left2.is_empty());
+        assert_eq!(ev2.len(), 1);
+        match &ev2[0] {
+            GraphicsEvent::Transmit {
+                image_id,
+                format,
+                width,
+                height,
+                data,
+                need_placeholders,
+                ..
+            } => {
+                assert_eq!(*image_id, 9);
+                assert_eq!(*format, 100);
+                assert_eq!(*width, 2);
+                assert_eq!(*height, 2);
+                assert!(*need_placeholders);
+                // base64 "AA" + "BB" → 2 bytes
+                assert_eq!(data.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod shm_smoke {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn posix_shm_roundtrip() {
+        let name = CString::new(format!("/lrmux_shm_{}", std::process::id())).unwrap();
+        unsafe {
+            libc::shm_unlink(name.as_ptr());
+        }
+        let fd = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            // Some environments (sandbox / older Darwin) refuse POSIX shm;
+            // skip rather than fail the suite — production Ghostty+TB still
+            // create objects the server can read.
+            eprintln!(
+                "skip posix_shm_roundtrip: shm_open create failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        assert_eq!(unsafe { libc::ftruncate(fd, 64) }, 0);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                64,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"HELLOSHM".as_ptr(), ptr as *mut u8, 8);
+            libc::munmap(ptr, 64);
+            libc::close(fd);
+        }
+        let data = read_shm_payload(name.as_bytes(), None, 0).expect("read_shm");
+        assert_eq!(&data[..8], b"HELLOSHM");
+        let fd3 = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd3 < 0, "expected unlink after read");
+    }
+
+    #[test]
+    fn query_t_s_missing_shm_returns_error_not_ok() {
+        // terminal-browser probes t=s; a false OK made it commit to shm and
+        // then render blank when frames were dropped.
+        // Payload "L25vcGU=" is base64 for "/nope".
+        let mut p = KittyParser::new();
+        let ev = p.feed_apc_body(b"a=q,i=42,s=1,v=1,t=s,f=24;L25vcGU=");
+        assert_eq!(ev.len(), 1);
+        match &ev[0] {
+            GraphicsEvent::QueryReply { bytes } => {
+                let s = String::from_utf8_lossy(bytes);
+                assert!(s.contains("i=42"), "{s}");
+                assert!(!s.contains(";OK"), "{s}");
+                assert!(s.contains("EBADF") || s.contains("Failed"), "{s}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feature_query_advertises_unicode_placeholders() {
+        let ev = parse_apc_g(b"a=q,i=31,e=T,U=1");
+        let GraphicsEvent::QueryReply { bytes } = &ev[0] else {
+            panic!("expected reply");
+        };
+        let s = String::from_utf8_lossy(bytes);
+        assert!(s.contains("e=T"), "{s}");
+        assert!(s.contains("U=1"), "{s}");
+    }
+}

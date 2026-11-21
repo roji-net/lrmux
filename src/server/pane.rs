@@ -13,6 +13,54 @@ use std::path::PathBuf;
 /// Global pane ID counter (tmux uses %N format).
 static PANE_ID: AtomicU32 = AtomicU32::new(0);
 
+/// Outer-TTY pixel geometry (from a client's CSI 14t/16t probe,
+/// `TIOCGWINSZ`, or `LRMUX_INIT_PIXELS` at server fork).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PixelGeometry {
+    pub cell_w: u16,
+    pub cell_h: u16,
+    pub win_w: u16,
+    pub win_h: u16,
+}
+
+impl PixelGeometry {
+    pub fn is_usable(&self) -> bool {
+        self.cell_w > 0 && self.cell_h > 0
+    }
+}
+
+/// Server-wide cell pixel size used for every new/resized pane PTY.
+/// `kitten icat` (and friends) read `TIOCGWINSZ` and abort when
+/// `ws_xpixel`/`ws_ypixel` are 0 — so this must be set before spawn when
+/// possible (`LRMUX_INIT_PIXELS`), and refreshed from attached clients.
+static SERVER_PIXEL_GEO: std::sync::Mutex<Option<PixelGeometry>> = std::sync::Mutex::new(None);
+
+pub fn set_server_pixel_geo(geo: PixelGeometry) {
+    if geo.is_usable() {
+        *SERVER_PIXEL_GEO.lock().unwrap() = Some(geo);
+    }
+}
+
+pub fn server_pixel_geo() -> Option<PixelGeometry> {
+    *SERVER_PIXEL_GEO.lock().unwrap()
+}
+
+fn pty_size_for(rows: u16, cols: u16) -> PtySize {
+    match server_pixel_geo() {
+        Some(g) if g.is_usable() => PtySize::with_cell_pixels(rows, cols, g.cell_w, g.cell_h),
+        _ => PtySize::cells(rows, cols),
+    }
+}
+
+/// Push current server pixel geometry into an existing pane's PTY
+/// (SIGWINCH) without changing the cell grid.
+pub fn apply_pixel_geo_to_pty(pane: &Pane) {
+    let size = pty_size_for(pane.rows, pane.cols);
+    if size.xpixel > 0 && size.ypixel > 0 {
+        pane.pty.resize(size);
+    }
+}
+
 /// Max time a query reply waits for the pane tty to leave cooked mode
 /// before being dropped. Apps accept query replies only during a short
 /// window after probing (devin ~150-200ms); a reply injected later lands in
@@ -20,6 +68,10 @@ static PANE_ID: AtomicU32 = AtomicU32::new(0);
 /// deadline it's better to stay silent — a terminal that never answers is
 /// something apps already handle via their own timeout.
 const REPLY_DEFER_MAX: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// XTWINOPS 14t/16t often race the client's attach-time pixel probe
+/// (`new-server -- kitten icat …`). Hold longer so geometry can land.
+const XTWINOPS_DEFER_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Minimum latency before a locally-generated reply is delivered. Real
 /// terminals answer a query several ms after receiving it; a reply written
@@ -48,12 +100,20 @@ enum ReplySlot {
         code: u8,
         bell: bool,
     },
+    /// XTWINOPS 14/16 waiting for an attached client's pixel geometry.
+    WaitingXtwinops {
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        kind: vt::XtwinopsQuery,
+    },
 }
 
 impl ReplySlot {
     fn deadline(&self) -> std::time::Instant {
         match self {
-            ReplySlot::Ready { deadline, .. } | ReplySlot::Waiting { deadline, .. } => *deadline,
+            ReplySlot::Ready { deadline, .. }
+            | ReplySlot::Waiting { deadline, .. }
+            | ReplySlot::WaitingXtwinops { deadline, .. } => *deadline,
         }
     }
 }
@@ -94,6 +154,16 @@ pub struct Pane {
     /// a DA-first reply means "color query unsupported" and leaves the
     /// real color replies to render as typed text in the app).
     deferred_replies: Vec<ReplySlot>,
+    /// Kitty graphics images for this pane.
+    pub images: crate::graphics::ImageStore,
+    /// Incomplete APC/DCS prefix held across PTY reads.
+    gfx_pending: Vec<u8>,
+    /// Assembles chunked Kitty transmits (`m=1`…`m=0`) across PTY reads.
+    gfx_parser: crate::graphics::kitty::KittyParser,
+    /// Next image id when the child omits `i=` (kitten stream mode).
+    next_image_id: u32,
+    /// Graphics events produced since the last drain.
+    pending_graphics: Vec<crate::graphics::GraphicsEvent>,
 }
 
 impl Pane {
@@ -158,7 +228,7 @@ impl Pane {
         // stable across renames, unlike the session name.
         extra_env.push(("LRMUX_SESSION".into(), format!("${session_id}")));
         extra_env.extend(env.iter().cloned());
-        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd, &extra_env);
+        let pty = Pty::spawn(argv, pty_size_for(rows, cols), cwd, &extra_env);
 
         let mut trace = open_pane_trace(id);
         if let Some(ref mut f) = trace {
@@ -187,7 +257,41 @@ impl Pane {
             trace,
             trace_start: std::time::Instant::now(),
             deferred_replies: Vec::new(),
+            images: crate::graphics::ImageStore::default(),
+            gfx_pending: Vec::new(),
+            gfx_parser: crate::graphics::kitty::KittyParser::new(),
+            next_image_id: 1,
+            pending_graphics: Vec::new(),
         }
+    }
+
+    /// Drain graphics events produced by recent PTY output.
+    /// Coalesces blob transmits so only the latest frame per `image_id`
+    /// is shipped (terminal-browser paints many full-window frames/sec).
+    pub fn take_graphics_events(&mut self) -> Vec<crate::graphics::GraphicsEvent> {
+        coalesce_graphics_events(std::mem::take(&mut self.pending_graphics))
+    }
+
+    /// Image ids referenced by Kitty placeholders currently on the grid
+    /// (fg RGB encodes the id). Used to bound attach/retransmit.
+    pub fn referenced_image_ids(&self) -> Vec<u32> {
+        use crate::grid::Color;
+        use std::collections::BTreeSet;
+        let mut ids = BTreeSet::new();
+        for row in 0..self.grid.rows() {
+            let Some(cells) = self.grid.row(row) else {
+                continue;
+            };
+            for cell in cells {
+                if !cell.is_kitty_placeholder() {
+                    continue;
+                }
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    ids.insert(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+                }
+            }
+        }
+        ids.into_iter().collect()
     }
 
     /// Palette learned from proxied OSC 10/11 replies (for HTML capture).
@@ -278,6 +382,7 @@ impl Pane {
     pub fn process_pty_output(
         &mut self,
         palette_fallback: super::capture::TerminalPalette,
+        pixel_geo: Option<PixelGeometry>,
     ) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
         if self.exited {
             return Ok((false, Vec::new(), Vec::new()));
@@ -309,7 +414,16 @@ impl Pane {
                         let _ = f.write_all(&buf[..n]);
                     }
                 }
-                let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
+                // Extract Kitty APC / DCS tmux wrappers before VT parse —
+                // vte silently drops APC string bodies.
+                self.gfx_pending.extend_from_slice(&buf[..n]);
+                let (gfx_events, cleaned, leftover) = crate::graphics::kitty::extract_graphics(
+                    &mut self.gfx_parser,
+                    &self.gfx_pending,
+                );
+                self.gfx_pending = leftover;
+                self.apply_graphics_events(gfx_events);
+                let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &cleaned);
                 // Replies must leave in the order the child asked: probe
                 // libraries (terminal-colorsaurus, used by devin) read
                 // responses sequentially and treat a DA-first reply as
@@ -328,6 +442,18 @@ impl Pane {
                                     osc_queries.push(q);
                                 }
                             }
+                        }
+                        vt::PendingReply::Xtwinops(q) => {
+                            if let Some(r) = self.xtwinops_reply(q, pixel_geo) {
+                                self.queue_ready_reply(r);
+                            } else if matches!(
+                                q,
+                                vt::XtwinopsQuery::WindowPixels | vt::XtwinopsQuery::CellPixels
+                            ) {
+                                // Race with attach probe — hold for geometry.
+                                self.queue_waiting_xtwinops(q);
+                            }
+                            // 18t always answers from the grid (handled above).
                         }
                     }
                 }
@@ -352,6 +478,77 @@ impl Pane {
         }
         let _ = self.flush_deferred_replies();
         Ok((alive, raw, osc_queries))
+    }
+
+    fn queue_waiting_xtwinops(&mut self, kind: vt::XtwinopsQuery) {
+        let now = std::time::Instant::now();
+        self.trace("DFR", b"waiting for pixel geometry (XTWINOPS)");
+        self.deferred_replies.push(ReplySlot::WaitingXtwinops {
+            earliest: now + REPLY_MIN_DELAY,
+            deadline: now + XTWINOPS_DEFER_MAX,
+            kind,
+        });
+    }
+
+    /// Fill any WaitingXtwinops slots from freshly arrived outer geometry
+    /// (client's TermPixelGeometry). Returns true if something was filled.
+    pub fn resolve_waiting_xtwinops(&mut self, geo: PixelGeometry) -> io::Result<bool> {
+        if !geo.is_usable() {
+            return Ok(false);
+        }
+        let mut filled = false;
+        let mut i = 0;
+        while i < self.deferred_replies.len() {
+            let filled_here = match self.deferred_replies[i] {
+                ReplySlot::WaitingXtwinops {
+                    earliest,
+                    deadline,
+                    kind,
+                } => self.xtwinops_reply(kind, Some(geo)).map(|bytes| {
+                    self.deferred_replies[i] = ReplySlot::Ready {
+                        earliest,
+                        deadline,
+                        bytes,
+                    };
+                }),
+                _ => None,
+            };
+            if filled_here.is_some() {
+                filled = true;
+            }
+            i += 1;
+        }
+        if filled {
+            self.trace("DFR", b"filled waiting XTWINOPS from pixel geo");
+            self.flush_deferred_replies()?;
+        }
+        Ok(filled)
+    }
+
+    /// Answer XTWINOPS 14/16/18. Cell/window pixels need outer geometry;
+    /// character-area size comes from the pane grid.
+    fn xtwinops_reply(&self, q: vt::XtwinopsQuery, geo: Option<PixelGeometry>) -> Option<Vec<u8>> {
+        match q {
+            vt::XtwinopsQuery::TextAreaChars => {
+                let rows = self.grid.rows();
+                let cols = self.grid.cols();
+                Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
+            }
+            vt::XtwinopsQuery::CellPixels => {
+                let g = geo.filter(|g| g.is_usable())?;
+                Some(format!("\x1b[6;{};{}t", g.cell_h, g.cell_w).into_bytes())
+            }
+            vt::XtwinopsQuery::WindowPixels => {
+                let g = geo.filter(|g| g.is_usable())?;
+                // Pane text area in pixels (not the full outer window) —
+                // matches what apps under a mux expect for layout.
+                let w = (self.grid.cols() as u32).saturating_mul(g.cell_w as u32);
+                let h = (self.grid.rows() as u32).saturating_mul(g.cell_h as u32);
+                let w = w.min(u32::from(u16::MAX)) as u16;
+                let h = h.min(u32::from(u16::MAX)) as u16;
+                Some(format!("\x1b[4;{h};{w}t").into_bytes())
+            }
+        }
     }
 
     /// Synthesize an OSC 10/11 reply from the pane's cached palette or the
@@ -759,13 +956,139 @@ impl Pane {
 
     /// Resize the pane (PTY + grid).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.pty.resize(PtySize { rows, cols });
+        self.pty.resize(pty_size_for(rows, cols));
         self.grid.resize(rows as usize, cols as usize);
         self.rows = rows;
         self.cols = cols;
     }
 
     /// Collect dirty rows as (row_index, cells) pairs for protocol transmission.
+    fn apply_graphics_events(&mut self, events: Vec<crate::graphics::GraphicsEvent>) {
+        use crate::graphics::GraphicsEvent;
+        use crate::graphics::placeholder;
+        use crate::graphics::store::StoredImage;
+        for ev in events {
+            match ev {
+                GraphicsEvent::Transmit {
+                    mut image_id,
+                    width,
+                    height,
+                    format,
+                    zlib,
+                    data,
+                    place_cols,
+                    place_rows,
+                    need_placeholders,
+                } => {
+                    // kitten stream mode often omits `i=`; unicode placeholders
+                    // encode the id in fg RGB, so 0 would collide / look blank.
+                    if image_id == 0 && !data.is_empty() {
+                        image_id = self.next_image_id;
+                        self.next_image_id = self.next_image_id.saturating_add(1).max(1);
+                    }
+                    let cols = place_cols.or_else(|| {
+                        // Prefer pixel→cell math when we know the outer cell size.
+                        if width > 0
+                            && let Some(g) = server_pixel_geo()
+                        {
+                            let cw = (g.cell_w as u32).max(1);
+                            return Some(width.div_ceil(cw).max(1));
+                        }
+                        Some(
+                            (self.cols as u32)
+                                .saturating_sub(self.grid.cursor_col as u32)
+                                .max(1),
+                        )
+                    });
+                    let rows = place_rows.or_else(|| {
+                        if height > 0
+                            && let Some(g) = server_pixel_geo()
+                        {
+                            let ch = (g.cell_h as u32).max(1);
+                            return Some(height.div_ceil(ch).max(1));
+                        }
+                        Some(
+                            (self.rows as u32)
+                                .saturating_sub(self.grid.cursor_row as u32)
+                                .max(1),
+                        )
+                    });
+                    if !data.is_empty() || width > 0 {
+                        self.images.insert(
+                            image_id,
+                            StoredImage {
+                                width,
+                                height,
+                                format,
+                                zlib,
+                                data: data.clone(),
+                                place_cols: cols,
+                                place_rows: rows,
+                            },
+                        );
+                    } else if let (Some(c), Some(r)) = (cols, rows) {
+                        // Placement-only: update geometry on existing blob.
+                        self.images.insert(
+                            image_id,
+                            StoredImage {
+                                width: 0,
+                                height: 0,
+                                format: 32,
+                                zlib: false,
+                                data: Vec::new(),
+                                place_cols: Some(c),
+                                place_rows: Some(r),
+                            },
+                        );
+                    }
+                    if need_placeholders && let (Some(c), Some(r)) = (cols, rows) {
+                        placeholder::write_placeholders(&mut self.grid, image_id, c, r);
+                    }
+                    let has_blob = !data.is_empty();
+                    let ev = GraphicsEvent::Transmit {
+                        image_id,
+                        width,
+                        height,
+                        format,
+                        zlib,
+                        data,
+                        place_cols: cols,
+                        place_rows: rows,
+                        need_placeholders,
+                    };
+                    // Replace any earlier pending blob for this id — no point
+                    // shipping a frame that will be overwritten this tick.
+                    if has_blob {
+                        if let Some(pos) = self.pending_graphics.iter().position(|e| {
+                            matches!(
+                                e,
+                                GraphicsEvent::Transmit {
+                                    image_id: id,
+                                    data: d,
+                                    ..
+                                } if *id == image_id && !d.is_empty()
+                            )
+                        }) {
+                            self.pending_graphics[pos] = ev;
+                        } else {
+                            self.pending_graphics.push(ev);
+                        }
+                    } else {
+                        self.pending_graphics.push(ev);
+                    }
+                }
+                GraphicsEvent::Delete { image_id } => {
+                    self.images.remove(image_id);
+                    self.pending_graphics
+                        .push(GraphicsEvent::Delete { image_id });
+                }
+                GraphicsEvent::QueryReply { bytes } => {
+                    self.queue_ready_reply(bytes);
+                }
+            }
+        }
+    }
+
     pub fn take_dirty_rows(&mut self) -> Vec<(u16, Vec<Cell>)> {
         let dirty = self.grid.take_dirty();
         let cols = self.cols as usize;
@@ -788,6 +1111,8 @@ impl Pane {
                                         fg: c.fg,
                                         bg: c.bg,
                                         attrs: c.attrs,
+                                        marks: ['\0', '\0'],
+                                        mark_len: 0,
                                     }
                                 } else {
                                     c.clone()
@@ -817,6 +1142,8 @@ impl Pane {
                                 fg: c.fg,
                                 bg: c.bg,
                                 attrs: c.attrs,
+                                marks: ['\0', '\0'],
+                                mark_len: 0,
                             }
                         } else {
                             c.clone()
@@ -839,6 +1166,8 @@ impl Pane {
                             fg: c.fg,
                             bg: c.bg,
                             attrs: c.attrs,
+                            marks: ['\0', '\0'],
+                            mark_len: 0,
                         });
                     } else {
                         cells.push(c.clone());
@@ -879,6 +1208,8 @@ impl Pane {
                                 fg: c.fg,
                                 bg: c.bg,
                                 attrs: c.attrs,
+                                marks: ['\0', '\0'],
+                                mark_len: 0,
                             }
                         } else {
                             c.clone()
@@ -1072,6 +1403,64 @@ mod tests {
         pane
     }
 
+    #[test]
+    fn xtwinops_replies_use_cell_geo_and_grid_size() {
+        let pane = cat_pane(); // 24×80
+        let geo = PixelGeometry {
+            cell_w: 10,
+            cell_h: 20,
+            win_w: 800,
+            win_h: 600,
+        };
+        assert_eq!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::CellPixels, Some(geo))
+                .unwrap(),
+            b"\x1b[6;20;10t"
+        );
+        assert_eq!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::WindowPixels, Some(geo))
+                .unwrap(),
+            b"\x1b[4;480;800t" // 24*20 × 80*10
+        );
+        assert_eq!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::TextAreaChars, None)
+                .unwrap(),
+            b"\x1b[8;24;80t"
+        );
+        assert!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::CellPixels, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn waiting_xtwinops_resolves_when_geo_arrives() {
+        // kitten icat queries 14t/16t before the attach client finishes
+        // probing — slots wait, then flush once TermPixelGeometry lands.
+        let mut pane = cat_pane();
+        pane.queue_waiting_xtwinops(vt::XtwinopsQuery::CellPixels);
+        pane.queue_waiting_xtwinops(vt::XtwinopsQuery::WindowPixels);
+        age_all(&mut pane);
+        let geo = PixelGeometry {
+            cell_w: 10,
+            cell_h: 20,
+            win_w: 800,
+            win_h: 600,
+        };
+        assert!(pane.resolve_waiting_xtwinops(geo).unwrap());
+        let out = read_master(&pane);
+        assert!(
+            out.windows(b"\x1b[6;20;10t".len())
+                .any(|w| w == b"\x1b[6;20;10t"),
+            "missing cell reply: {out:?}"
+        );
+        assert!(
+            out.windows(b"\x1b[4;480;800t".len())
+                .any(|w| w == b"\x1b[4;480;800t"),
+            "missing window reply: {out:?}"
+        );
+    }
+
     /// Bytes echoed back by cat after replies were written to the master.
     fn read_master(pane: &Pane) -> Vec<u8> {
         let fd = pane.pty.master_fd();
@@ -1103,7 +1492,9 @@ mod tests {
     fn age_all(pane: &mut Pane) {
         for s in &mut pane.deferred_replies {
             match s {
-                ReplySlot::Ready { earliest, .. } | ReplySlot::Waiting { earliest, .. } => {
+                ReplySlot::Ready { earliest, .. }
+                | ReplySlot::Waiting { earliest, .. }
+                | ReplySlot::WaitingXtwinops { earliest, .. } => {
                     *earliest = std::time::Instant::now() - std::time::Duration::from_secs(1);
                 }
             }
@@ -1220,6 +1611,61 @@ mod tests {
         assert_eq!(env[2], ("TERM_PROGRAM".into(), "tmux".into()));
         assert_eq!(env[3].0, "TERM_PROGRAM_VERSION");
     }
+
+    #[test]
+    fn coalesce_keeps_latest_blob_per_image_id() {
+        use crate::graphics::GraphicsEvent;
+        let events = vec![
+            GraphicsEvent::Transmit {
+                image_id: 1,
+                width: 1,
+                height: 1,
+                format: 32,
+                zlib: false,
+                data: vec![1],
+                place_cols: Some(1),
+                place_rows: Some(1),
+                need_placeholders: true,
+            },
+            GraphicsEvent::Transmit {
+                image_id: 1,
+                width: 1,
+                height: 1,
+                format: 32,
+                zlib: false,
+                data: vec![2, 2],
+                place_cols: Some(1),
+                place_rows: Some(1),
+                need_placeholders: true,
+            },
+            GraphicsEvent::Delete { image_id: 9 },
+            GraphicsEvent::Transmit {
+                image_id: 2,
+                width: 1,
+                height: 1,
+                format: 32,
+                zlib: false,
+                data: vec![3],
+                place_cols: None,
+                place_rows: None,
+                need_placeholders: false,
+            },
+        ];
+        let out = super::coalesce_graphics_events(events);
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            GraphicsEvent::Transmit { image_id, data, .. } => {
+                assert_eq!(*image_id, 1);
+                assert_eq!(data.as_slice(), &[2, 2]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(out[1], GraphicsEvent::Delete { image_id: 9 }));
+        assert!(matches!(
+            &out[2],
+            GraphicsEvent::Transmit { image_id: 2, .. }
+        ));
+    }
 }
 
 /// Extra env exported to pane children in tmux-compat mode
@@ -1301,6 +1747,29 @@ fn tmux_env_pairs(
             crate::client::tmux_shim::TMUX_VERSION.into(),
         ),
     ]
+}
+
+/// Keep the latest blob `Transmit` per image id; preserve deletes and
+/// placement-only events in relative order.
+fn coalesce_graphics_events(
+    events: Vec<crate::graphics::GraphicsEvent>,
+) -> Vec<crate::graphics::GraphicsEvent> {
+    use crate::graphics::GraphicsEvent;
+    use std::collections::HashSet;
+    let mut seen_blobs = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for ev in events.into_iter().rev() {
+        match &ev {
+            GraphicsEvent::Transmit { image_id, data, .. } if !data.is_empty() => {
+                if seen_blobs.insert(*image_id) {
+                    out.push(ev);
+                }
+            }
+            _ => out.push(ev),
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// Open this pane's byte-trace file (`LRMUX_TRACE`), or None when

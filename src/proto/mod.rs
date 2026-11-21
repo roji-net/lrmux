@@ -27,12 +27,37 @@ use crate::grid::{Attr, Cell, Color};
 pub const PROTO_MIN: u16 = 1;
 /// Newest wire protocol version this build speaks. Bump when the wire
 /// format changes in a way trailing optional fields can't cover.
-pub const PROTO_MAX: u16 = 2;
+pub const PROTO_MAX: u16 = 4;
 /// Version assumed for peers that send no proto fields
 /// (pre-versioning builds).
 pub const PROTO_LEGACY: u16 = 1;
 /// First version that speaks application-level Ping/Pong keepalive.
 pub const PROTO_KEEPALIVE: u16 = 2;
+/// First version with combining-mark cells + Kitty GraphicsTransmit.
+pub const PROTO_GRAPHICS: u16 = 3;
+/// First version with outer-TTY pixel geometry (`TermPixelGeometry`) for
+/// XTWINOPS 14t/16t answers (terminal-browser cell sizing).
+pub const PROTO_PIXEL_GEO: u16 = 4;
+
+thread_local! {
+    /// When encoding/decoding grid cells, include combining-mark trailer
+    /// (proto ≥ [`PROTO_GRAPHICS`]).
+    static CELL_MARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Run `f` with cell mark encoding matching `proto`.
+pub fn with_cell_marks<R>(proto: u16, f: impl FnOnce() -> R) -> R {
+    CELL_MARKS.with(|c| {
+        let prev = c.replace(proto >= PROTO_GRAPHICS);
+        let out = f();
+        c.set(prev);
+        out
+    })
+}
+
+fn cell_marks_enabled() -> bool {
+    CELL_MARKS.with(|c| c.get())
+}
 
 /// A peer's advertised protocol-version range (inclusive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +307,14 @@ pub enum ClientMsg {
         fg: Option<(u8, u8, u8)>,
         bg: Option<(u8, u8, u8)>,
     },
+    /// Outer TTY pixel geometry from CSI 14t/16t (proto ≥ [`PROTO_PIXEL_GEO`]).
+    /// Server answers pane XTWINOPS queries from this cache.
+    TermPixelGeometry {
+        cell_w: u16,
+        cell_h: u16,
+        win_w: u16,
+        win_h: u16,
+    },
     /// Set / replace the server PSK (hot-apply + persist). Scaffolding for
     /// in-session network setup; fullscreen config editor comes later.
     SetPsk { psk: String },
@@ -455,6 +488,20 @@ pub enum ServerMsg {
     /// Acknowledge SendEvent — same contract as SendKeysAck.
     /// Missing from older servers; clients should bound the wait.
     SendEventAck { ok: bool, reason: String },
+    /// Kitty image blob for a pane (proto ≥ [`PROTO_GRAPHICS`]).
+    GraphicsTransmit {
+        pane_id: u32,
+        image_id: u32,
+        width: u32,
+        height: u32,
+        format: u8,
+        zlib: bool,
+        place_cols: u32,
+        place_rows: u32,
+        data: Vec<u8>,
+    },
+    /// Delete a Kitty image (proto ≥ [`PROTO_GRAPHICS`]).
+    GraphicsDelete { pane_id: u32, image_id: u32 },
     /// Keepalive probe (proto ≥ [`PROTO_KEEPALIVE`]). Peer replies with Pong.
     Ping,
     /// Keepalive reply to a client Ping.
@@ -524,6 +571,7 @@ const C_NEXT_LAYOUT: u8 = 0x25;
 const C_FOCUS_PANE: u8 = 0x26;
 const C_PING: u8 = 0x27;
 const C_PONG: u8 = 0x28;
+const C_TERM_PIXEL_GEO: u8 = 0x29;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -546,6 +594,8 @@ const S_SEND_EVENT_ACK: u8 = 0x21;
 const S_WINDOW_LAYOUT: u8 = 0x22;
 const S_PING: u8 = 0x23;
 const S_PONG: u8 = 0x24;
+const S_GRAPHICS_TRANSMIT: u8 = 0x25;
+const S_GRAPHICS_DELETE: u8 = 0x26;
 
 // ── Encode ──────────────────────────────────────────────────────────
 
@@ -888,6 +938,18 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         ClientMsg::Pong => {
             payload.push(C_PONG);
         }
+        ClientMsg::TermPixelGeometry {
+            cell_w,
+            cell_h,
+            win_w,
+            win_h,
+        } => {
+            payload.push(C_TERM_PIXEL_GEO);
+            payload.extend_from_slice(&cell_w.to_le_bytes());
+            payload.extend_from_slice(&cell_h.to_le_bytes());
+            payload.extend_from_slice(&win_w.to_le_bytes());
+            payload.extend_from_slice(&win_h.to_le_bytes());
+        }
     }
     frame(payload)
 }
@@ -1144,6 +1206,34 @@ pub fn encode_server(msg: &ServerMsg) -> Vec<u8> {
             payload.extend_from_slice(&(reason.len() as u32).to_le_bytes());
             payload.extend_from_slice(reason.as_bytes());
         }
+        ServerMsg::GraphicsTransmit {
+            pane_id,
+            image_id,
+            width,
+            height,
+            format,
+            zlib,
+            place_cols,
+            place_rows,
+            data,
+        } => {
+            payload.push(S_GRAPHICS_TRANSMIT);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+            payload.extend_from_slice(&image_id.to_le_bytes());
+            payload.extend_from_slice(&width.to_le_bytes());
+            payload.extend_from_slice(&height.to_le_bytes());
+            payload.push(*format);
+            payload.push(if *zlib { 1 } else { 0 });
+            payload.extend_from_slice(&place_cols.to_le_bytes());
+            payload.extend_from_slice(&place_rows.to_le_bytes());
+            payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            payload.extend_from_slice(data);
+        }
+        ServerMsg::GraphicsDelete { pane_id, image_id } => {
+            payload.push(S_GRAPHICS_DELETE);
+            payload.extend_from_slice(&pane_id.to_le_bytes());
+            payload.extend_from_slice(&image_id.to_le_bytes());
+        }
         ServerMsg::Ping => {
             payload.push(S_PING);
         }
@@ -1164,10 +1254,20 @@ fn frame(payload: Vec<u8>) -> Vec<u8> {
 
 /// Encode a single cell into a buffer.
 fn encode_cell(buf: &mut Vec<u8>, cell: &Cell) {
+    encode_cell_for(buf, cell, cell_marks_enabled());
+}
+
+fn encode_cell_for(buf: &mut Vec<u8>, cell: &Cell, with_marks: bool) {
     buf.extend_from_slice(&(cell.ch as u32).to_le_bytes());
     encode_color(buf, cell.fg);
     encode_color(buf, cell.bg);
     encode_attr(buf, cell.attrs);
+    if with_marks {
+        buf.push(cell.mark_len.min(2));
+        for i in 0..cell.mark_len.min(2) {
+            buf.extend_from_slice(&(cell.marks[i as usize] as u32).to_le_bytes());
+        }
+    }
 }
 
 fn encode_color(buf: &mut Vec<u8>, color: Color) {
@@ -1637,6 +1737,18 @@ fn decode_client_body(tag: u8, data: &[u8]) -> io::Result<ClientMsg> {
         }
         C_PING => Ok(ClientMsg::Ping),
         C_PONG => Ok(ClientMsg::Pong),
+        C_TERM_PIXEL_GEO => {
+            let cell_w = read_u16(&mut r)?;
+            let cell_h = read_u16(&mut r)?;
+            let win_w = read_u16(&mut r)?;
+            let win_h = read_u16(&mut r)?;
+            Ok(ClientMsg::TermPixelGeometry {
+                cell_w,
+                cell_h,
+                win_w,
+                win_h,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -2027,6 +2139,40 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
             let reason = read_len_string(&mut r)?;
             Ok(ServerMsg::SendEventAck { ok, reason })
         }
+        S_GRAPHICS_TRANSMIT => {
+            let pane_id = read_u32(&mut r)?;
+            let image_id = read_u32(&mut r)?;
+            let width = read_u32(&mut r)?;
+            let height = read_u32(&mut r)?;
+            let format = read_u8(&mut r)?;
+            let zlib = read_u8(&mut r)? != 0;
+            let place_cols = read_u32(&mut r)?;
+            let place_rows = read_u32(&mut r)?;
+            let len = read_u32(&mut r)? as usize;
+            if r.len() < len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "GraphicsTransmit data truncated",
+                ));
+            }
+            let data = r[..len].to_vec();
+            Ok(ServerMsg::GraphicsTransmit {
+                pane_id,
+                image_id,
+                width,
+                height,
+                format,
+                zlib,
+                place_cols,
+                place_rows,
+                data,
+            })
+        }
+        S_GRAPHICS_DELETE => {
+            let pane_id = read_u32(&mut r)?;
+            let image_id = read_u32(&mut r)?;
+            Ok(ServerMsg::GraphicsDelete { pane_id, image_id })
+        }
         S_PING => Ok(ServerMsg::Ping),
         S_PONG => Ok(ServerMsg::Pong),
         _ => Err(io::Error::new(
@@ -2037,12 +2183,33 @@ pub fn decode_server<R: Read + ?Sized>(reader: &mut R) -> io::Result<ServerMsg> 
 }
 
 fn decode_cell(r: &mut &[u8]) -> io::Result<Cell> {
+    decode_cell_for(r, cell_marks_enabled())
+}
+
+fn decode_cell_for(r: &mut &[u8], with_marks: bool) -> io::Result<Cell> {
     let ch_u = read_u32(r)?;
     let ch = char::from_u32(ch_u).unwrap_or('\0');
     let fg = decode_color(r)?;
     let bg = decode_color(r)?;
     let attrs = decode_attr(r)?;
-    Ok(Cell { ch, fg, bg, attrs })
+    let mut marks = ['\0', '\0'];
+    let mut mark_len = 0u8;
+    if with_marks {
+        let n = read_u8(r)?.min(2);
+        for i in 0..n {
+            let mu = read_u32(r)?;
+            marks[i as usize] = char::from_u32(mu).unwrap_or('\0');
+        }
+        mark_len = n;
+    }
+    Ok(Cell {
+        ch,
+        fg,
+        bg,
+        attrs,
+        marks,
+        mark_len,
+    })
 }
 
 fn decode_color(r: &mut &[u8]) -> io::Result<Color> {
@@ -2775,6 +2942,28 @@ mod tests {
         }
         assert_eq!(PROTO_KEEPALIVE, 2);
         assert!(PROTO_MAX >= PROTO_KEEPALIVE);
+        assert!(PROTO_MAX >= PROTO_PIXEL_GEO);
+    }
+
+    #[test]
+    fn term_pixel_geometry_roundtrip() {
+        let msg = ClientMsg::TermPixelGeometry {
+            cell_w: 9,
+            cell_h: 18,
+            win_w: 1440,
+            win_h: 900,
+        };
+        match decode_client(&mut &encode_client(&msg)[..]).unwrap() {
+            ClientMsg::TermPixelGeometry {
+                cell_w,
+                cell_h,
+                win_w,
+                win_h,
+            } => {
+                assert_eq!((cell_w, cell_h, win_w, win_h), (9, 18, 1440, 900));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

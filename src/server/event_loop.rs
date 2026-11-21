@@ -57,6 +57,8 @@ struct ClientConn {
     suppressed: bool,
     /// Outer TTY default colors (OSC 10/11), probed by the client on attach.
     palette: super::capture::TerminalPalette,
+    /// Outer TTY cell/window pixels (CSI 14t/16t), probed on attach.
+    pixel_geo: Option<super::pane::PixelGeometry>,
     /// True when connected over TCP (plain or TLS). Unix clients skip
     /// auth_token checks (filesystem permissions are the gate).
     is_tcp: bool,
@@ -73,7 +75,10 @@ struct ClientConn {
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
-const CLIENT_OUTBUF_CAP: usize = 8 * 1024 * 1024;
+/// Per-client outbound buffer cap. Terminal-browser frames are often a full
+/// window of RGBA (~10–20 MiB); 8 MiB made a single GraphicsTransmit kill the
+/// client and trip a reconnect death spiral.
+const CLIENT_OUTBUF_CAP: usize = 64 * 1024 * 1024;
 /// Outbuf level at which incremental updates to a normal client are
 /// suspended (well below the hard cap — the client freezes instead of
 /// being disconnected).
@@ -99,6 +104,7 @@ impl ClientConn {
             close_when_idle: false,
             suppressed: false,
             palette: super::capture::TerminalPalette::default(),
+            pixel_geo: None,
             is_tcp,
             relay_peer: None,
             relay_in: Vec::new(),
@@ -238,6 +244,32 @@ fn client_send(client: &mut ClientConn, bytes: &[u8]) -> bool {
     flush_client_outbuf(client)
 }
 
+/// Like [`client_send`], but if the message does not fit, **drop it** and keep
+/// the client. Used for Kitty graphics — losing a frame is better than
+/// disconnecting into a reconnect storm (terminal-browser).
+fn client_send_droppable(client: &mut ClientConn, bytes: &[u8]) -> bool {
+    // Realtime path: if a previous multi‑MiB frame is still draining, skip
+    // this one. Queuing TB frames only adds multi-second latency.
+    const BUSY: usize = 512 * 1024;
+    if client.outbuf.len() > BUSY {
+        let _ = flush_client_outbuf(client);
+        if client.outbuf.len() > BUSY {
+            return true;
+        }
+    }
+    if client.outbuf.len().saturating_add(bytes.len()) > CLIENT_OUTBUF_CAP {
+        crate::log::warn(&format!(
+            "client fd {} outbuf full — dropping {} byte graphics/frame message",
+            client.fd,
+            bytes.len()
+        ));
+        // Still try to drain whatever is queued so we catch up.
+        return flush_client_outbuf(client);
+    }
+    client.outbuf.extend_from_slice(bytes);
+    flush_client_outbuf(client)
+}
+
 /// Write as much buffered data to the client socket as possible without
 /// blocking. Returns false on write error (client should be disconnected).
 /// Leftover data stays in outbuf and is retried when POLLOUT fires.
@@ -348,6 +380,14 @@ pub fn run(
     // Capture once at startup. Probes (ListSessions) and failed first
     // handshakes must not consume / lose `new-server -- cmd` options.
     let boot = take_bootstrap();
+    // Seed PTY pixel dims before any pane spawn (kitten icat / TIOCGWINSZ).
+    if let Some(geo) = boot.pixels {
+        super::pane::set_server_pixel_geo(geo);
+        crate::log::info(&format!(
+            "bootstrap pixel geo cell={}x{}",
+            geo.cell_w, geo.cell_h
+        ));
+    }
 
     let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if manager {
         // Manager role: pure directory/broker, no sessions, no waiting
@@ -716,10 +756,30 @@ pub fn run(
                     fg: clients.iter().find_map(|c| c.palette.fg),
                     bg: clients.iter().find_map(|c| c.palette.bg),
                 };
+                // Prefer a viewer of this window; else any attached client's
+                // probed cell size. TB's CSI 14t/16t answers come from here.
+                let pixel_geo = clients
+                    .iter()
+                    .find(|c| {
+                        c.attach
+                            && !c.is_control
+                            && c.session_idx == si
+                            && c.active_window == wi
+                            && c.pixel_geo.is_some_and(|g| g.is_usable())
+                    })
+                    .or_else(|| {
+                        clients
+                            .iter()
+                            .find(|c| c.attach && c.pixel_geo.is_some_and(|g| g.is_usable()))
+                    })
+                    .and_then(|c| c.pixel_geo);
                 let mouse_before = pane.grid.mouse_flags();
-                match pane.process_pty_output(palette_fallback) {
+                match pane.process_pty_output(palette_fallback, pixel_geo) {
                     Ok((true, raw, osc_queries)) => {
                         let pane_id = pane.id;
+                        let gfx = pane.take_graphics_events();
+                        let _ =
+                            send_graphics_to_window_viewers(&mut clients, si, wi, pane_id, &gfx);
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         // Forward raw output to control clients viewing this window.
                         let cc_bytes = pane.take_cc_forward_bytes(&raw);
@@ -1108,6 +1168,36 @@ pub fn run(
                                                 clients[client_idx].active_window,
                                                 pal,
                                             );
+                                        }
+                                        ClientMsg::TermPixelGeometry {
+                                            cell_w,
+                                            cell_h,
+                                            win_w,
+                                            win_h,
+                                        } => {
+                                            let geo = super::pane::PixelGeometry {
+                                                cell_w,
+                                                cell_h,
+                                                win_w,
+                                                win_h,
+                                            };
+                                            clients[client_idx].pixel_geo = Some(geo);
+                                            super::pane::set_server_pixel_geo(geo);
+                                            crate::log::info(&format!(
+                                                "client fd {} pixel geo cell={cell_w}x{cell_h} win={win_w}x{win_h}",
+                                                clients[client_idx].fd
+                                            ));
+                                            // Resolve XTWINOPS held while geometry was racing
+                                            // attach (`new-server -- kitten icat …`), and push
+                                            // pixel dims into every pane PTY (TIOCSWINSZ).
+                                            for session in &mut sessions {
+                                                for window in &mut session.windows {
+                                                    for pane in &mut window.panes {
+                                                        let _ = pane.resolve_waiting_xtwinops(geo);
+                                                        super::pane::apply_pixel_geo_to_pty(pane);
+                                                    }
+                                                }
+                                            }
                                         }
                                         ClientMsg::Detach => {
                                             to_remove.push(client_idx);
@@ -2688,6 +2778,8 @@ struct Bootstrap {
     command: Option<String>,
     session_name: Option<String>,
     cwd: Option<String>,
+    /// `cell_w,cell_h` from the forking client's `TIOCGWINSZ`.
+    pixels: Option<super::pane::PixelGeometry>,
 }
 
 /// Read and clear `LRMUX_INIT_*` so a later pane spawn does not see them.
@@ -2701,16 +2793,29 @@ fn take_bootstrap() -> Bootstrap {
     let cwd = std::env::var("LRMUX_INIT_CWD")
         .ok()
         .filter(|s| !s.is_empty());
+    let pixels = std::env::var("LRMUX_INIT_PIXELS").ok().and_then(|s| {
+        let mut it = s.split(',');
+        let cell_w: u16 = it.next()?.parse().ok()?;
+        let cell_h: u16 = it.next()?.parse().ok()?;
+        (cell_w > 0 && cell_h > 0).then_some(super::pane::PixelGeometry {
+            cell_w,
+            cell_h,
+            win_w: 0,
+            win_h: 0,
+        })
+    });
     // Safety: server is single-threaded at startup.
     unsafe {
         std::env::remove_var("LRMUX_INIT_COMMAND");
         std::env::remove_var("LRMUX_INIT_SESSION");
         std::env::remove_var("LRMUX_INIT_CWD");
+        std::env::remove_var("LRMUX_INIT_PIXELS");
     }
     Bootstrap {
         command,
         session_name,
         cwd,
+        pixels,
     }
 }
 
@@ -3000,16 +3105,48 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     }
     for &pi in &order {
         let pane = &window.panes[pi];
+        // Retransmit only images referenced by current placeholders — a full
+        // store dump of TB frames can be tens of MiB and used to abort attach.
+        if client.proto >= proto::PROTO_GRAPHICS {
+            let ids = pane.referenced_image_ids();
+            for id in ids {
+                let Some(img) = pane.images.get(id) else {
+                    continue;
+                };
+                if img.data.is_empty() {
+                    continue;
+                }
+                let gmsg = proto::encode_server(&ServerMsg::GraphicsTransmit {
+                    pane_id: pane.id,
+                    image_id: id,
+                    width: img.width,
+                    height: img.height,
+                    format: img.format,
+                    zlib: img.zlib,
+                    place_cols: img.place_cols.unwrap_or(0),
+                    place_rows: img.place_rows.unwrap_or(0),
+                    data: img.data.clone(),
+                });
+                if !client_send_droppable(client, &gmsg) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "client gone",
+                    ));
+                }
+            }
+        }
         let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-        let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-            rows: pane.rows,
-            cols: pane.cols,
-            cells: pane.snapshot(),
-            cursor_row,
-            cursor_col,
-            cursor_visible,
-            mouse_flags: pane.grid.mouse_flags(),
-            pane_id: Some(pane.id),
+        let snapshot = proto::with_cell_marks(client.proto, || {
+            proto::encode_server(&ServerMsg::GridSnapshot {
+                rows: pane.rows,
+                cols: pane.cols,
+                cells: pane.snapshot(),
+                cursor_row,
+                cursor_col,
+                cursor_visible,
+                mouse_flags: pane.grid.mouse_flags(),
+                pane_id: Some(pane.id),
+            })
         });
         if !client_send(client, &snapshot) {
             return Err(io::Error::new(
@@ -4069,6 +4206,126 @@ fn proxy_osc_color_query(
 }
 
 /// Send dirty rows + cursor to clients viewing a specific window in a specific session.
+/// Ship Kitty graphics events to interactive viewers (proto ≥ GRAPHICS).
+fn send_graphics_to_window_viewers(
+    clients: &mut Vec<ClientConn>,
+    session_idx: usize,
+    window_idx: usize,
+    pane_id: u32,
+    events: &[crate::graphics::GraphicsEvent],
+) -> io::Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    // Belt-and-suspenders with pane::take_graphics_events coalescing.
+    let events = coalesce_transmit_events(events);
+    for ev in &events {
+        let msg = match ev {
+            crate::graphics::GraphicsEvent::Transmit {
+                image_id,
+                width,
+                height,
+                format,
+                zlib,
+                data,
+                place_cols,
+                place_rows,
+                ..
+            } => {
+                if data.is_empty() && *width == 0 {
+                    // Placement-only — clients already have the blob.
+                    continue;
+                }
+                proto::encode_server(&ServerMsg::GraphicsTransmit {
+                    pane_id,
+                    image_id: *image_id,
+                    width: *width,
+                    height: *height,
+                    format: *format,
+                    zlib: *zlib,
+                    place_cols: place_cols.unwrap_or(0),
+                    place_rows: place_rows.unwrap_or(0),
+                    data: data.clone(),
+                })
+            }
+            crate::graphics::GraphicsEvent::Delete { image_id } => {
+                proto::encode_server(&ServerMsg::GraphicsDelete {
+                    pane_id,
+                    image_id: *image_id,
+                })
+            }
+            crate::graphics::GraphicsEvent::QueryReply { .. } => continue,
+        };
+        let mut i = 0;
+        while i < clients.len() {
+            if clients[i].session_idx == session_idx
+                && clients[i].active_window == window_idx
+                && !clients[i].is_control
+                && clients[i].proto >= proto::PROTO_GRAPHICS
+                && !client_send_droppable(&mut clients[i], &msg)
+            {
+                clients.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Drop superseded blob transmits (same image id) so we only ship the latest.
+fn coalesce_transmit_events(
+    events: &[crate::graphics::GraphicsEvent],
+) -> Vec<crate::graphics::GraphicsEvent> {
+    use crate::graphics::GraphicsEvent;
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for ev in events.iter().rev() {
+        match ev {
+            GraphicsEvent::Transmit { image_id, data, .. } if !data.is_empty() => {
+                if seen.insert(*image_id) {
+                    out.push(ev.clone());
+                }
+            }
+            _ => out.push(ev.clone()),
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// Retransmit images referenced by the pane grid (attach / Refresh / reconnect).
+fn retransmit_pane_graphics(
+    clients: &mut [ClientConn],
+    client_idx: usize,
+    pane: &crate::server::pane::Pane,
+) {
+    if client_idx >= clients.len() || clients[client_idx].proto < proto::PROTO_GRAPHICS {
+        return;
+    }
+    for id in pane.referenced_image_ids() {
+        let Some(img) = pane.images.get(id) else {
+            continue;
+        };
+        if img.data.is_empty() {
+            continue;
+        }
+        let msg = proto::encode_server(&ServerMsg::GraphicsTransmit {
+            pane_id: pane.id,
+            image_id: id,
+            width: img.width,
+            height: img.height,
+            format: img.format,
+            zlib: img.zlib,
+            place_cols: img.place_cols.unwrap_or(0),
+            place_rows: img.place_rows.unwrap_or(0),
+            data: img.data.clone(),
+        });
+        let _ = client_send_droppable(&mut clients[client_idx], &msg);
+    }
+}
+
 fn send_grid_update_to_window_viewers(
     clients: &mut Vec<ClientConn>,
     session_idx: usize,
@@ -4108,19 +4365,13 @@ fn send_grid_update_to_window_viewers(
 
     let dirty = pane.take_dirty_rows();
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+    let mouse_flags = pane.grid.mouse_flags();
     // Always send a GridUpdate when the PTY produced output, even if no
     // rows are dirty. The cursor may have moved (e.g., shell echoing a space
     // to an already-blank cell, or cursor-positioning escape sequences).
     // Without this, the client's cursor would not update until the next
     // dirty row — making it look like keypresses are ignored.
-    let msg = proto::encode_server(&ServerMsg::GridUpdate {
-        dirty,
-        cursor_row,
-        cursor_col,
-        cursor_visible,
-        mouse_flags: pane.grid.mouse_flags(),
-        pane_id: Some(pane_id),
-    });
+    // Encode per-client so proto < GRAPHICS gets cells without mark trailers.
     let mut i = 0;
     while i < clients.len() {
         if clients[i].session_idx == session_idx
@@ -4130,10 +4381,23 @@ fn send_grid_update_to_window_viewers(
             if clients[i].suppressed || clients[i].outbuf.len() > CLIENT_SUPPRESS_HIGH {
                 clients[i].suppressed = true;
                 i += 1;
-            } else if !client_send(&mut clients[i], &msg) {
-                clients.remove(i);
             } else {
-                i += 1;
+                let proto_v = clients[i].proto;
+                let msg = proto::with_cell_marks(proto_v, || {
+                    proto::encode_server(&ServerMsg::GridUpdate {
+                        dirty: dirty.clone(),
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        mouse_flags,
+                        pane_id: Some(pane_id),
+                    })
+                });
+                if !client_send(&mut clients[i], &msg) {
+                    clients.remove(i);
+                } else {
+                    i += 1;
+                }
             }
         } else {
             i += 1;

@@ -310,8 +310,12 @@ pub fn run(
     // (when it tracks the mouse) or local copy-mode selection. Inactive
     // it is a pass-through, so keystrokes see zero added latency.
     let mut mouse_decoder = mouse::Decoder::new();
-    // Tracking mask currently applied to the outer terminal (None = not yet).
-    let mut applied_mouse: Option<u8> = None;
+    // Tracking mask + SGR-Pixels currently applied to the outer terminal
+    // (None = not yet synced).
+    let mut applied_mouse: Option<(u8, bool)> = None;
+    // Outer cell/window pixel size (CSI 14t/16t), used for 1016 hit-tests
+    // and reported to the server for pane XTWINOPS answers.
+    let mut pixel_geo: Option<PixelGeo> = None;
     // Mouse reporting policy: config mode + Ctrl-A m / [M]-click override
     // + the auto_enable sticky latch.
     let mut mouse_ctl = MouseCtl {
@@ -333,6 +337,21 @@ pub fn run(
     let mut probe_leftover = Vec::new();
     let mut osc_probe = OscProbe::default();
     report_outer_term_palette(&mut stream, &mut probe_leftover, &mut osc_probe)?;
+    input_filter.inject(&probe_leftover);
+    // CSI 14t/16t → server answers pane XTWINOPS (terminal-browser sizing).
+    probe_leftover.clear();
+    if let Some(geo) = probe_outer_pixel_geometry(&mut probe_leftover) {
+        pixel_geo = Some(geo);
+        if negotiated_proto >= proto::PROTO_PIXEL_GEO {
+            let msg = proto::encode_client(&ClientMsg::TermPixelGeometry {
+                cell_w: geo.cell_w,
+                cell_h: geo.cell_h,
+                win_w: geo.win_w,
+                win_h: geo.win_h,
+            });
+            proto::send(&mut stream, &msg)?;
+        }
+    }
     input_filter.inject(&probe_leftover);
 
     // Create the local window view (composite grid + per-pane state) + renderer.
@@ -427,6 +446,10 @@ pub fn run(
     let mut ended = false;
     // In-process reconnect after transport loss / keepalive miss.
     let mut reconnect: Option<ReconnectState> = None;
+    // Consecutive disconnects while the session lived < 3s — stops the
+    // outbuf-kick → reconnect → kick death spiral (terminal-browser).
+    let mut disconnect_streak: u32 = 0;
+    let mut connected_since = Some(std::time::Instant::now());
     let mut keepalive = {
         let net = &crate::config::global().network;
         crate::keepalive::Keepalive::maybe(
@@ -437,6 +460,9 @@ pub fn run(
     };
     // stream_fd refreshed after reconnect.
     let mut stream_fd = stream.as_raw_fd();
+    // Kitty image blobs keyed by image id (from GraphicsTransmit).
+    let mut graphics_images: std::collections::HashMap<u32, ClientImage> =
+        std::collections::HashMap::new();
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -489,16 +515,17 @@ pub fn run(
             }
         }
 
+        // Stable session — clear the kick streak so a later blip starts fresh.
+        if let Some(t) = connected_since
+            && t.elapsed() > std::time::Duration::from_secs(5)
+            && disconnect_streak > 0
+        {
+            disconnect_streak = 0;
+        }
+
         // ── Reconnecting: dim overlay + backoff retries ─────────────
         if let Some(ref mut rc) = reconnect {
-            render_reconnect_overlay(
-                &grid,
-                &status_text,
-                term_rows,
-                term_cols,
-                rc,
-                socket_path,
-            )?;
+            render_reconnect_overlay(&grid, &status_text, term_rows, term_cols, rc, socket_path)?;
             let now = std::time::Instant::now();
             let wait = rc
                 .next_at
@@ -553,17 +580,29 @@ pub fn run(
                             )
                         };
                         reconnect = None;
+                        connected_since = Some(std::time::Instant::now());
                         copy_mode = None;
                         confirm_state = ConfirmState::None;
                         prefix_state = PrefixState::Normal;
                         renderer.invalidate();
                         grid.mark_all_dirty();
+                        graphics_images.clear();
                         let _ = send_cmd(&mut stream, &ClientMsg::Refresh);
+                        if let Some(geo) = pixel_geo
+                            && negotiated_proto >= proto::PROTO_PIXEL_GEO
+                        {
+                            let msg = proto::encode_client(&ClientMsg::TermPixelGeometry {
+                                cell_w: geo.cell_w,
+                                cell_h: geo.cell_h,
+                                win_w: geo.win_w,
+                                win_h: geo.win_h,
+                            });
+                            let _ = proto::send(&mut stream, &msg);
+                        }
                         // Brief flash that we are back.
                         flash_msg = Some("reconnected".to_string());
-                        flash_deadline = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(2),
-                        );
+                        flash_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                         continue;
                     }
                     Err(e) => {
@@ -687,10 +726,19 @@ pub fn run(
                 // repaint per motion event is what made selection flicker.
                 let mut redraw_cm = false;
                 for ev in &mouse_events {
+                    // Map SGR-Pixels coords back to cells for UI hit-tests.
+                    let (cell_x, cell_y) = match (grid.mouse_pixels, pixel_geo) {
+                        (true, Some(g)) if g.cell_w > 0 && g.cell_h > 0 => {
+                            let cx = ((ev.x.saturating_sub(1) as usize) / g.cell_w as usize) + 1;
+                            let cy = ((ev.y.saturating_sub(1) as usize) / g.cell_h as usize) + 1;
+                            (cx as u16, cy as u16)
+                        }
+                        _ => (ev.x, ev.y),
+                    };
                     // The status bar row is lrmux's own UI — clicks there
                     // never reach the pane (the bounds check below already
                     // drops them), so handling them here is passthrough-safe.
-                    if ev.y as usize == term_rows {
+                    if cell_y as usize == term_rows {
                         if ev.is_wheel() {
                             // Wheel on the bar cycles windows, tmux-style.
                             let msg = if ev.is_wheel_up() {
@@ -703,7 +751,7 @@ pub fn run(
                             // The [M] control occupies the last 3 columns —
                             // a click there forces reporting off (clicks
                             // then can't reach us; Ctrl-A m re-enables).
-                            if ev.x as usize + 2 >= term_cols && term_cols >= 8 {
+                            if cell_x as usize + 2 >= term_cols && term_cols >= 8 {
                                 mouse_ctl.ovr = MouseOverride::ForceOff;
                                 flash_msg = Some("mouse off — Ctrl-A m to re-enable".to_string());
                                 flash_deadline = Some(
@@ -721,7 +769,7 @@ pub fn run(
                             // Left press on a window entry switches to it.
                             if let Some(&(_, _, idx)) = status_spans
                                 .iter()
-                                .find(|&&(s, e, _)| ev.x >= s && ev.x < e)
+                                .find(|&&(s, e, _)| cell_x >= s && cell_x < e)
                             {
                                 send_cmd(&mut stream, &ClientMsg::SelectWindow { index: idx })?;
                             }
@@ -736,14 +784,34 @@ pub fn run(
                         if ev.is_motion() && grid.mouse_tracking & 0b110 == 0 {
                             continue;
                         }
-                        if ev.x == 0
-                            || ev.x as usize > grid.cols()
-                            || ev.y == 0
-                            || ev.y as usize > grid.rows().min(view_rows)
-                        {
+                        let in_pane = if grid.mouse_pixels {
+                            match pixel_geo {
+                                Some(g) if g.cell_w > 0 && g.cell_h > 0 => {
+                                    let max_x = grid.cols() as u32 * g.cell_w as u32;
+                                    let max_y = grid.rows().min(view_rows) as u32 * g.cell_h as u32;
+                                    ev.x > 0
+                                        && (ev.x as u32) <= max_x
+                                        && ev.y > 0
+                                        && (ev.y as u32) <= max_y
+                                }
+                                // No cell size yet — forward and let the
+                                // child decide (better than dropping).
+                                _ => ev.x > 0 && ev.y > 0,
+                            }
+                        } else {
+                            ev.x > 0
+                                && ev.x as usize <= grid.cols()
+                                && ev.y > 0
+                                && ev.y as usize <= grid.rows().min(view_rows)
+                        };
+                        if !in_pane {
                             continue; // status bar / filler region
                         }
-                        let data = mouse::encode_report(grid.mouse_fmt, ev);
+                        // Outer 1016 is only enabled when the child asked
+                        // for pixels, so coords already match; SGR wire
+                        // shape either way (fmt 6).
+                        let fmt = if grid.mouse_pixels { 6 } else { grid.mouse_fmt };
+                        let data = mouse::encode_report(fmt, ev);
                         let msg = proto::encode_client(&ClientMsg::PaneInput { data });
                         proto::send(&mut stream, &msg)?;
                         continue;
@@ -827,9 +895,9 @@ pub fn run(
                         {
                             let before = (cm.vrow, cm.vcol, cm.viewport_top);
                             let total = grid.scrollback.len() + grid.rows();
-                            cm.vrow =
-                                (cm.viewport_top + ev.y.saturating_sub(1) as usize).min(total - 1);
-                            cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.vrow = (cm.viewport_top + cell_y.saturating_sub(1) as usize)
+                                .min(total - 1);
+                            cm.vcol = (cell_x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
                             // Skip the redraw when the motion stayed inside
                             // the same cell — nothing changed on screen.
@@ -857,9 +925,9 @@ pub fn run(
                         // pending anchor (and any selection if in copy mode).
                         if let Some(cm) = copy_mode.as_mut() {
                             cm.selection_start = None;
-                            cm.vrow = (cm.viewport_top + ev.y.saturating_sub(1) as usize)
+                            cm.vrow = (cm.viewport_top + cell_y.saturating_sub(1) as usize)
                                 .min(grid.scrollback.len() + grid.rows() - 1);
-                            cm.vcol = (ev.x.saturating_sub(1) as usize).min(grid.cols() - 1);
+                            cm.vcol = (cell_x.saturating_sub(1) as usize).min(grid.cols() - 1);
                             cm.ensure_cursor_visible(view_rows);
                             redraw_cm = true;
                         }
@@ -870,7 +938,7 @@ pub fn run(
                     // copy mode; release without drag = plain click).
                     // Left button only.
                     if ev.cb & 3 == 0 {
-                        mouse_anchor = Some((ev.x, ev.y));
+                        mouse_anchor = Some((cell_x, cell_y));
                     }
                 }
                 // Apply copy-mode exit/copy triggered by the mouse.
@@ -1329,7 +1397,11 @@ pub fn run(
                     ka.note_rx();
                 }
                 let mut needs_render = false;
-                while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
+                loop {
+                    let next = proto::with_cell_marks(negotiated_proto, || {
+                        try_parse_server_frame(&mut server_buf)
+                    })?;
+                    let Some(msg) = next else { break };
                     match msg {
                         ServerMsg::WindowLayout {
                             rows,
@@ -1555,6 +1627,9 @@ pub fn run(
                             }
                         }
                         ServerMsg::PaneExit { .. } => {
+                            // Graceful server/session teardown — exit cleanly;
+                            // do not enter the reconnect overlay on the
+                            // EOF that follows.
                             exit_reason = Some("session ended (last pane exited)".to_string());
                             ended = true;
                             break;
@@ -1642,6 +1717,53 @@ pub fn run(
                         | ServerMsg::RelayAck { .. }
                         | ServerMsg::SendKeysAck { .. }
                         | ServerMsg::SendEventAck { .. } => {}
+                        ServerMsg::GraphicsTransmit {
+                            pane_id: _,
+                            image_id,
+                            width,
+                            height,
+                            format,
+                            zlib,
+                            place_cols,
+                            place_rows,
+                            data,
+                        } => {
+                            graphics_images.insert(
+                                image_id,
+                                ClientImage {
+                                    width,
+                                    height,
+                                    format,
+                                    zlib,
+                                    place_cols,
+                                    place_rows,
+                                    data: data.clone(),
+                                },
+                            );
+                            let seq = crate::graphics::placeholder::emit_transmit_and_place(
+                                image_id,
+                                width,
+                                height,
+                                format,
+                                zlib,
+                                &data,
+                                place_cols.max(1),
+                                place_rows.max(1),
+                            );
+                            let mut stdout = client_stdout();
+                            let _ = stdout.write_all(&seq);
+                            let _ = stdout.flush();
+                        }
+                        ServerMsg::GraphicsDelete {
+                            pane_id: _,
+                            image_id,
+                        } => {
+                            graphics_images.remove(&image_id);
+                            let seq = crate::graphics::placeholder::emit_delete(image_id);
+                            let mut stdout = client_stdout();
+                            let _ = stdout.write_all(&seq);
+                            let _ = stdout.flush();
+                        }
                         ServerMsg::Ping => {
                             let _ = send_cmd(&mut stream, &ClientMsg::Pong);
                         }
@@ -1661,7 +1783,7 @@ pub fn run(
                 );
                 // Render once per socket batch instead of once per frame —
                 // during a burst many GridUpdates arrive in a single read.
-                if needs_render && exit_reason.is_none() {
+                if needs_render && exit_reason.is_none() && !ended {
                     client_trace_msg(
                         "EVT",
                         &format!("render cur={};{}", grid.cursor_row, grid.cursor_col),
@@ -1684,28 +1806,52 @@ pub fn run(
                     }
                 }
             } else if last == 0 {
-                // Server closed the connection (EOF) — enter reconnect overlay.
-                begin_reconnect(
+                // Server closed the connection (EOF).
+                if ended {
+                    break;
+                }
+                if !begin_reconnect_tracked(
                     &mut reconnect,
                     &mut copy_mode,
                     &mut confirm_state,
                     &mut prefix_state,
                     disconnect_reason(socket_path, "connection closed (EOF)"),
-                );
+                    &mut disconnect_streak,
+                    &mut connected_since,
+                ) {
+                    exit_reason = Some(reconnect_give_up_reason(socket_path));
+                    ended = true;
+                    break;
+                }
                 continue;
             } else {
                 let err = io::Error::last_os_error();
                 if err.kind() != io::ErrorKind::WouldBlock {
-                    begin_reconnect(
+                    if ended {
+                        break;
+                    }
+                    if !begin_reconnect_tracked(
                         &mut reconnect,
                         &mut copy_mode,
                         &mut confirm_state,
                         &mut prefix_state,
                         format!("read error from server: {err}"),
-                    );
+                        &mut disconnect_streak,
+                        &mut connected_since,
+                    ) {
+                        exit_reason = Some(reconnect_give_up_reason(socket_path));
+                        ended = true;
+                        break;
+                    }
                     continue;
                 }
             }
+        }
+
+        // PaneExit already decided we're done — leave before a trailing
+        // POLLHUP/EOF can open the reconnect overlay.
+        if ended {
+            break;
         }
 
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
@@ -1713,13 +1859,19 @@ pub fn run(
             break;
         }
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            begin_reconnect(
+            if !begin_reconnect_tracked(
                 &mut reconnect,
                 &mut copy_mode,
                 &mut confirm_state,
                 &mut prefix_state,
                 disconnect_reason(socket_path, "connection hung up"),
-            );
+                &mut disconnect_streak,
+                &mut connected_since,
+            ) {
+                exit_reason = Some(reconnect_give_up_reason(socket_path));
+                ended = true;
+                break;
+            }
             continue;
         }
 
@@ -1730,25 +1882,36 @@ pub fn run(
                 Some(crate::keepalive::Action::SendPing) => {
                     if send_cmd(&mut stream, &ClientMsg::Ping).is_ok() {
                         ka.note_ping_sent();
+                    } else if !begin_reconnect_tracked(
+                        &mut reconnect,
+                        &mut copy_mode,
+                        &mut confirm_state,
+                        &mut prefix_state,
+                        "keepalive ping failed to send".to_string(),
+                        &mut disconnect_streak,
+                        &mut connected_since,
+                    ) {
+                        exit_reason = Some(reconnect_give_up_reason(socket_path));
+                        ended = true;
+                        break;
                     } else {
-                        begin_reconnect(
-                            &mut reconnect,
-                            &mut copy_mode,
-                            &mut confirm_state,
-                            &mut prefix_state,
-                            "keepalive ping failed to send".to_string(),
-                        );
                         continue;
                     }
                 }
                 Some(crate::keepalive::Action::TimedOut) => {
-                    begin_reconnect(
+                    if !begin_reconnect_tracked(
                         &mut reconnect,
                         &mut copy_mode,
                         &mut confirm_state,
                         &mut prefix_state,
                         "keepalive timeout".to_string(),
-                    );
+                        &mut disconnect_streak,
+                        &mut connected_since,
+                    ) {
+                        exit_reason = Some(reconnect_give_up_reason(socket_path));
+                        ended = true;
+                        break;
+                    }
                     continue;
                 }
                 None => {}
@@ -1792,11 +1955,27 @@ pub fn run(
     })
 }
 
+/// Cached Kitty image for emission to the outer TTY.
+struct ClientImage {
+    width: u32,
+    height: u32,
+    format: u8,
+    zlib: bool,
+    place_cols: u32,
+    place_rows: u32,
+    data: Vec<u8>,
+}
+
+/// How many recent reconnect errors the overlay keeps (and always
+/// reserves vertical space for, so the box doesn't jump).
+const RECONNECT_ERROR_SLOTS: usize = 5;
+
 /// In-process reconnect overlay state after transport loss.
 struct ReconnectState {
     since: std::time::Instant,
     attempt: u32,
     next_at: std::time::Instant,
+    /// Newest at the back; each entry already includes an HH:MM:SS prefix.
     last_errors: std::collections::VecDeque<String>,
     reason: String,
 }
@@ -1814,24 +1993,97 @@ impl ReconnectState {
     }
 
     fn push_error(&mut self, err: String) {
-        if self.last_errors.len() >= 3 {
+        let stamp = {
+            // Local wall clock — enough to order retries visually.
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Approximate local HH:MM:SS via UTC offset is fine for a
+            // reconnect UI; prefer libc localtime when available.
+            reconnect_hhmmss(t)
+        };
+        if self.last_errors.len() >= RECONNECT_ERROR_SLOTS {
             self.last_errors.pop_front();
         }
-        self.last_errors.push_back(err);
+        self.last_errors.push_back(format!("[{stamp}] {err}"));
     }
 }
 
-fn begin_reconnect(
+fn reconnect_hhmmss(unix_secs: u64) -> String {
+    // Use local time via libc so the stamp matches the user's clock.
+    let tt = unix_secs as libc::time_t;
+    let tm = unsafe {
+        let mut out: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&tt, &mut out).is_null() {
+            return format!("{unix_secs}");
+        }
+        out
+    };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+fn reconnect_give_up_reason(socket_path: &std::path::Path) -> String {
+    let log = server_log_path(socket_path);
+    format!(
+        "gave up reconnecting after repeated instant disconnects \
+         (server likely dropping this client — often a graphics outbuf flood). \
+         Check {log}"
+    )
+}
+
+/// Start / continue the reconnect overlay. Tracks brief-session disconnect
+/// streaks so a server that immediately kicks us (outbuf flood) cannot spin
+/// at attempt=0 forever. Returns false when the streak is exhausted — caller
+/// should exit instead of looping.
+fn begin_reconnect_tracked(
     reconnect: &mut Option<ReconnectState>,
     copy_mode: &mut Option<copy_mode::CopyMode>,
     confirm_state: &mut ConfirmState,
     prefix_state: &mut PrefixState,
     reason: String,
-) {
+    disconnect_streak: &mut u32,
+    connected_since: &mut Option<std::time::Instant>,
+) -> bool {
     *copy_mode = None;
     *confirm_state = ConfirmState::None;
     *prefix_state = PrefixState::Normal;
-    *reconnect = Some(ReconnectState::new(reason));
+
+    let brief = connected_since
+        .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
+        .unwrap_or(true);
+    *connected_since = None;
+    if brief {
+        *disconnect_streak = disconnect_streak.saturating_add(1);
+    } else {
+        *disconnect_streak = 1;
+    }
+
+    // Give up after repeated instant kicks — user can re-attach manually.
+    if *disconnect_streak >= 12 {
+        return false;
+    }
+
+    let attempt = disconnect_streak.saturating_sub(1);
+    let delay = crate::keepalive::reconnect_backoff(attempt);
+    let mut rc = match reconnect.take() {
+        Some(mut existing) => {
+            existing.push_error(reason.clone());
+            existing.reason = reason;
+            existing.attempt = attempt.max(existing.attempt);
+            existing
+        }
+        None => {
+            let mut rc = ReconnectState::new(reason.clone());
+            rc.push_error(reason);
+            rc.attempt = attempt;
+            rc
+        }
+    };
+    // Never retry instantly on a streak — that was the busy-loop.
+    rc.next_at = std::time::Instant::now() + delay;
+    *reconnect = Some(rc);
+    true
 }
 
 fn disconnect_reason(socket_path: &std::path::Path, detail: &str) -> String {
@@ -1849,7 +2101,9 @@ fn disconnect_reason(socket_path: &std::path::Path, detail: &str) -> String {
 }
 
 fn reconnect_wants_quit(input: &[u8]) -> bool {
-    input.iter().any(|&b| b == b'q' || b == b'Q' || b == 0x1b || b == 0x03)
+    input
+        .iter()
+        .any(|&b| b == b'q' || b == b'Q' || b == 0x1b || b == 0x03)
 }
 
 fn try_reconnect(
@@ -1943,15 +2197,26 @@ fn render_reconnect_overlay(
         .next_at
         .saturating_duration_since(std::time::Instant::now())
         .as_secs();
+    // Fixed layout: title, target, stats, reason, N error slots, hint.
+    // Empty error slots keep the box height stable across retries.
     let mut lines: Vec<String> = vec![
         "Connection lost".to_string(),
         target,
-        format!("elapsed {elapsed}s  ·  attempt {}  ·  retry in {next}s", rc.attempt + 1),
+        format!(
+            "elapsed {elapsed}s  ·  attempt {}  ·  retry in {next}s",
+            rc.attempt + 1
+        ),
         rc.reason.clone(),
     ];
-    for e in &rc.last_errors {
-        lines.push(format!("• {e}"));
+    let err_start = lines.len();
+    for i in 0..RECONNECT_ERROR_SLOTS {
+        if let Some(e) = rc.last_errors.get(i) {
+            lines.push(format!("• {e}"));
+        } else {
+            lines.push(String::new());
+        }
     }
+    let hint_idx = lines.len();
     lines.push("q / Esc / Ctrl-C to quit".to_string());
 
     let box_w = lines
@@ -1961,10 +2226,12 @@ fn render_reconnect_overlay(
         .unwrap_or(20)
         .min(term_cols.saturating_sub(4))
         .max(24);
+    // Content rows + top/bottom borders.
     let box_h = lines.len() + 2;
-    let top = view_rows.saturating_sub(box_h) / 2;
+    let top = view_rows.saturating_sub(box_h) / 2; // 0-based first row
     let left = term_cols.saturating_sub(box_w + 2) / 2;
     let horiz = "─".repeat(box_w);
+    // 1-based: top border, then content, then bottom border with no gap.
     write!(
         stdout,
         "\x1b[{};{}H\x1b[0;1;37;44m┌{}┐\x1b[0m",
@@ -1979,8 +2246,10 @@ fn render_reconnect_overlay(
         }
         let style = if i == 0 {
             "\x1b[1;37;44m"
-        } else if i == lines.len() - 1 {
+        } else if i == hint_idx {
             "\x1b[0;36;44m"
+        } else if i >= err_start && i < hint_idx && !line.is_empty() {
+            "\x1b[0;33;44m"
         } else {
             "\x1b[0;37;44m"
         };
@@ -1994,7 +2263,7 @@ fn render_reconnect_overlay(
     write!(
         stdout,
         "\x1b[{};{}H\x1b[0;1;37;44m└{}┘\x1b[0m",
-        top + 1 + box_h,
+        top + box_h, // was top+1+box_h → blank gap above the bottom border
         left + 1,
         horiz
     )?;
@@ -3059,30 +3328,40 @@ fn desired_mouse_mask(ctl: &mut MouseCtl, grid: &Grid, local: bool) -> u8 {
 /// scrollback and selection — lrmux never interprets the wheel.
 /// Returns true when the applied mask changed (status bar repaint).
 fn sync_mouse_modes(
-    applied: &mut Option<u8>,
+    applied: &mut Option<(u8, bool)>,
     grid: &Grid,
     decoder: &mut mouse::Decoder,
     local: bool,
     ctl: &mut MouseCtl,
 ) -> bool {
     let desired = desired_mouse_mask(ctl, grid, local);
-    if *applied == Some(desired) {
+    let pixels = desired != 0 && grid.mouse_pixels;
+    if *applied == Some((desired, pixels)) {
         return false;
     }
     let mut stdout = client_stdout();
     let _ = stdout.write_all(mouse::terminal_teardown().as_bytes());
     if desired != 0 {
-        let _ = stdout.write_all(mouse::terminal_setup(desired).as_bytes());
+        let _ = stdout.write_all(mouse::terminal_setup(desired, pixels).as_bytes());
     }
     let _ = stdout.flush();
-    *applied = Some(desired);
+    *applied = Some((desired, pixels));
     decoder.set_active(desired != 0);
     true
 }
 
 /// Whether outer-terminal mouse reports can currently reach us.
-fn mouse_reporting_on(applied: Option<u8>) -> bool {
-    applied.unwrap_or(0) != 0
+fn mouse_reporting_on(applied: Option<(u8, bool)>) -> bool {
+    applied.map(|(m, _)| m).unwrap_or(0) != 0
+}
+
+/// Outer-TTY pixel geometry from CSI 14t/16t.
+#[derive(Debug, Clone, Copy)]
+struct PixelGeo {
+    cell_w: u16,
+    cell_h: u16,
+    win_w: u16,
+    win_h: u16,
 }
 
 /// Paint the `[M]`/`[m]` mouse-reporting indicator at the status bar's
@@ -3140,7 +3419,7 @@ fn restore_after_overlay(
     status_text: &str,
     term_rows: usize,
     term_cols: usize,
-    applied_mouse: Option<u8>,
+    applied_mouse: Option<(u8, bool)>,
     stream: &mut ipc::ConnStream,
 ) -> io::Result<()> {
     renderer.invalidate();
@@ -3481,6 +3760,156 @@ pub(crate) fn report_outer_term_palette(
     }
     let msg = proto::encode_client(&ClientMsg::TermPalette { fg, bg });
     proto::send(stream, &msg)
+}
+
+/// Probe outer cell/window pixels. Prefer `TIOCGWINSZ` (what `kitten icat`
+/// uses); fall back to CSI 14t/16t when the ioctl reports 0×0 pixels.
+fn probe_outer_pixel_geometry(extra_input: &mut Vec<u8>) -> Option<PixelGeo> {
+    if let Some(ws) = crate::term::winsize::outer()
+        && let Some((cell_w, cell_h)) = ws.cell_size()
+    {
+        return Some(PixelGeo {
+            cell_w,
+            cell_h,
+            win_w: ws.xpixel,
+            win_h: ws.ypixel,
+        });
+    }
+    // CSI fallback for terminals that omit pixels from the ioctl.
+    let query = b"\x1b[14t\x1b[16t";
+    let mut buf = Vec::new();
+    if write_and_read_xtwinops(libc::STDIN_FILENO, libc::STDOUT_FILENO, query, &mut buf)
+        && let Some(geo) = parse_xtwinops_replies(&buf, extra_input)
+    {
+        return Some(geo);
+    }
+    let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    if fd >= 0 {
+        struct TtyFd(i32);
+        impl Drop for TtyFd {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+        let tty = TtyFd(fd);
+        buf.clear();
+        if write_and_read_xtwinops(tty.0, tty.0, query, &mut buf)
+            && let Some(geo) = parse_xtwinops_replies(&buf, extra_input)
+        {
+            return Some(geo);
+        }
+    }
+    None
+}
+
+fn write_and_read_xtwinops(in_fd: i32, out_fd: i32, query: &[u8], buf: &mut Vec<u8>) -> bool {
+    let n = unsafe { libc::write(out_fd, query.as_ptr() as *const _, query.len()) };
+    if n < 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + OSC_REPLY_TIMEOUT;
+    let mut tmp = [0u8; 256];
+    while std::time::Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd: in_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        let ms = remain.as_millis().min(i32::MAX as u128) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr <= 0 {
+            break;
+        }
+        let rn = unsafe { libc::read(in_fd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
+        if rn > 0 {
+            buf.extend_from_slice(&tmp[..rn as usize]);
+            // Got both reply kinds or enough data to parse.
+            if buf.windows(3).any(|w| w == b"[4;") && buf.windows(3).any(|w| w == b"[6;") {
+                break;
+            }
+            if buf.len() > 128 {
+                break;
+            }
+        } else if rn == 0 {
+            break;
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock
+                && err.kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+    }
+    !buf.is_empty()
+}
+
+/// Pull CSI 4;h;w t and CSI 6;ch;cw t out of a probe buffer; leftover
+/// bytes (keystrokes) go to `extra_input`.
+fn parse_xtwinops_replies(buf: &[u8], extra_input: &mut Vec<u8>) -> Option<PixelGeo> {
+    let mut cell_w = 0u16;
+    let mut cell_h = 0u16;
+    let mut win_w = 0u16;
+    let mut win_h = 0u16;
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
+            // Scan for final `t`.
+            let mut j = i + 2;
+            while j < buf.len() && buf[j] != b't' {
+                let b = buf[j];
+                if !b.is_ascii_digit() && b != b';' {
+                    break;
+                }
+                j += 1;
+            }
+            if j < buf.len() && buf[j] == b't' {
+                let params = std::str::from_utf8(&buf[i + 2..j]).unwrap_or("");
+                let parts: Vec<u16> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+                if parts.len() >= 3 {
+                    match parts[0] {
+                        4 => {
+                            win_h = parts[1];
+                            win_w = parts[2];
+                        }
+                        6 => {
+                            cell_h = parts[1];
+                            cell_w = parts[2];
+                        }
+                        _ => extra_input.extend_from_slice(&buf[i..=j]),
+                    }
+                } else {
+                    extra_input.extend_from_slice(&buf[i..=j]);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        extra_input.push(buf[i]);
+        i += 1;
+    }
+    if cell_w == 0 || cell_h == 0 {
+        return None;
+    }
+    // If 14t was missing, derive a window size from cells × terminal size.
+    if win_w == 0 || win_h == 0 {
+        let (rows, cols) = terminal::get_size();
+        win_w = (cols as u32)
+            .saturating_mul(cell_w as u32)
+            .min(u32::from(u16::MAX)) as u16;
+        win_h = (rows as u32)
+            .saturating_mul(cell_h as u32)
+            .min(u32::from(u16::MAX)) as u16;
+    }
+    Some(PixelGeo {
+        cell_w,
+        cell_h,
+        win_w,
+        win_h,
+    })
 }
 
 /// Query the outer terminal's OSC 10 (fg) or 11 (bg) color.

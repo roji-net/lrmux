@@ -88,6 +88,7 @@ pub fn tls_fingerprint() -> &'static str {
 /// - `LRMUX_INIT_COMMAND` — first window runs `$SHELL -ci <command>`
 /// - `LRMUX_INIT_SESSION` — session name override
 /// - `LRMUX_INIT_CWD` — cwd for the first window (client's cwd, or `-c`)
+/// - `LRMUX_INIT_PIXELS` — `cell_w,cell_h` from the parent's `TIOCGWINSZ`
 ///
 /// `TERM` / `COLORTERM` are inherited from the forking client as-is.
 /// `manager` runs the session-manager role: no sessions, a peer

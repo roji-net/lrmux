@@ -32,6 +32,7 @@ Module layout (per §5.7 of the design doc):
 - `src/keys/` — key input parsing, prefix detection, command dispatch
 - `src/statusbar/` — status line rendering
 - `src/layout/` — pane split/resize layout algorithms
+- `src/graphics/` — Kitty graphics parse/store/placeholders
 
 ## Conventions
 
@@ -55,7 +56,7 @@ Module layout (per §5.7 of the design doc):
 - **Architecture**: Server owns PTY + grid + VT parser. After each PTY read, sends dirty rows + cursor to client. Client maintains its own grid copy, applies updates, and renders locally using the diff-based renderer.
 - **Single session/window/pane**: Phase 3 proves the architecture with one session, one window, one pane. Multi-pane/multi-window is deferred.
 - **Server lifecycle**: Server exits when the client disconnects or the child process exits. Socket file is cleaned up on exit.
-- **No reconnect yet**: If the client disconnects, the server exits. Reconnect to a persistent server is deferred.
+- **Reconnect overlay (proto ≥ 2)**: On unexpected transport loss / keepalive timeout the attached client dims the last frame and retries with exponential backoff (q/Esc/Ctrl-C quit). Brief connect→kick streaks (e.g. graphics outbuf flood) escalate backoff and give up after ~12 instant disconnects instead of spinning. A graceful `PaneExit` (last session closed / KillServer) exits cleanly without entering reconnect. Overlay shows up to 5 timestamped recent errors at a fixed height. Graphics frames that do not fit the client outbuf are dropped rather than disconnecting the viewer; pending transmits are coalesced to the latest blob per image id, and new frames are skipped while a previous multi‑MiB frame is still draining (keeps terminal-browser usable instead of multi-second queue latency).
 - **No SIGWINCH yet**: Resize messages are handled in the protocol but not triggered by signal handling.
 
 ## Phase 4 status
@@ -81,6 +82,8 @@ Module layout (per §5.7 of the design doc):
 - **Server discovery**: Scans `/tmp/lrmux-<UID>/` for socket files and probes each to find running servers.
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
 - **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.
+- **Kitty graphics (proto ≥ 3)**: Server parses Kitty APC `_G` (and DCS `tmux;` unwrap), stores image blobs per pane, writes Unicode placeholders (`U+10EEEE` + diacritics, id in fg RGB), and forwards `GraphicsTransmit`/`GraphicsDelete` to viewers. Clients re-emit `a=t` with the source `f=` (PNG=100 / RGBA=32 / …) plus virtual `a=p,U=1`, and paint placeholder graphemes. Chunked `m=1`…`m=0` frames keep a per-pane assembler across PTY reads. Cursor placements (`a=T` without `U=1`) are normalized to virtual (cell size from pixel geo when `c`/`r` omitted; missing `i=` gets an allocated id). `t=d`/`t=f`/`t=t`/`t=s` (POSIX shm, unlinked after read) are loaded into direct blobs; `a=q` actually tries the medium (a false OK for `t=s` made terminal-browser commit to shm and then go blank). Feature queries (`e=T,U=1`) advertise unicode placeholders. Reattach/Refresh retransmits referenced images. For `terminal-browser`, enable `tmux_compat` (or `--tmux-compat`) so TB prefers the mux placeholder/passthrough path; the shim accepts `set -p allow-passthrough` as a successful no-op. Outer terminal must speak Kitty graphics (Ghostty/Kitty/iTerm2). Sixel/OSC 1337 are out of scope.
+- **XTWINOPS + SGR-Pixels (proto ≥ 4)**: On attach the client probes outer pixel size (`TIOCGWINSZ`, else CSI 14t/16t) and sends `TermPixelGeometry`. The server answers pane `14t`/`16t`/`18t` from that cache and fills every pane PTY's `ws_xpixel`/`ws_ypixel` (kitten icat aborts when those are 0). `new-server` forks with `LRMUX_INIT_PIXELS` from the parent's ioctl (or keeps a pre-set `cell_w,cell_h` env when the ioctl is unavailable) so the first pane already has pixels; attach refreshes all PTYs. DECSET 1016 is enabled on the outer TTY when the child requests it.
 - **Not yet implemented**: Pane splits, layout engine, window auto-renumber (already works via Vec), search in copy mode, TOML config loading, F-key shortcuts.
 
 ## Crash recovery and state persistence
