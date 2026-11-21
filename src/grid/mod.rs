@@ -233,8 +233,37 @@ impl Grid {
         self.rows.get(row).and_then(|r| r.get(col))
     }
 
+    /// Mutable cell access (marks the row dirty).
+    pub fn cell_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
+        if row >= self.rows.len() || col >= self.cols {
+            return None;
+        }
+        self.mark_dirty(row);
+        self.rows.get_mut(row)?.get_mut(col)
+    }
+
     /// Print a character at the cursor position, advancing the cursor.
+    /// Combining marks attach to the previous cell without advancing.
     pub fn print(&mut self, c: char) {
+        if cell::is_combining_mark(c) {
+            let (crow, ccol) = if self.wrap_pending && self.cursor_col > 0 {
+                (self.cursor_row, self.cursor_col)
+            } else if self.cursor_col > 0 {
+                (self.cursor_row, self.cursor_col - 1)
+            } else if self.cursor_row > 0 {
+                (self.cursor_row - 1, self.cols.saturating_sub(1))
+            } else {
+                return;
+            };
+            if let Some(row) = self.rows.get_mut(crow)
+                && let Some(cell) = row.get_mut(ccol)
+            {
+                let _ = cell.push_mark(c);
+                self.mark_dirty(crow);
+            }
+            return;
+        }
+
         // Handle wrap: if we were at the last column and need to wrap.
         if self.wrap_pending {
             self.cursor_col = 0;
@@ -262,6 +291,8 @@ impl Grid {
                 fg,
                 bg,
                 attrs,
+                marks: ['\0', '\0'],
+                mark_len: 0,
             };
         }
         self.mark_dirty(crow);

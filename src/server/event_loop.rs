@@ -720,6 +720,9 @@ pub fn run(
                 match pane.process_pty_output(palette_fallback) {
                     Ok((true, raw, osc_queries)) => {
                         let pane_id = pane.id;
+                        let gfx = pane.take_graphics_events();
+                        let _ =
+                            send_graphics_to_window_viewers(&mut clients, si, wi, pane_id, &gfx);
                         let _ = send_grid_update_to_window_viewers(&mut clients, si, wi, pane);
                         // Forward raw output to control clients viewing this window.
                         let cc_bytes = pane.take_cc_forward_bytes(&raw);
@@ -3000,16 +3003,47 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     }
     for &pi in &order {
         let pane = &window.panes[pi];
+        // Retransmit Kitty images before the cell snapshot so placeholders
+        // resolve on attach / Refresh / reconnect.
+        if client.proto >= proto::PROTO_GRAPHICS {
+            for &id in pane.images.ids_in_order() {
+                let Some(img) = pane.images.get(id) else {
+                    continue;
+                };
+                if img.data.is_empty() {
+                    continue;
+                }
+                let gmsg = proto::encode_server(&ServerMsg::GraphicsTransmit {
+                    pane_id: pane.id,
+                    image_id: id,
+                    width: img.width,
+                    height: img.height,
+                    format: img.format,
+                    zlib: img.zlib,
+                    place_cols: img.place_cols.unwrap_or(0),
+                    place_rows: img.place_rows.unwrap_or(0),
+                    data: img.data.clone(),
+                });
+                if !client_send(client, &gmsg) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "client gone",
+                    ));
+                }
+            }
+        }
         let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
-        let snapshot = proto::encode_server(&ServerMsg::GridSnapshot {
-            rows: pane.rows,
-            cols: pane.cols,
-            cells: pane.snapshot(),
-            cursor_row,
-            cursor_col,
-            cursor_visible,
-            mouse_flags: pane.grid.mouse_flags(),
-            pane_id: Some(pane.id),
+        let snapshot = proto::with_cell_marks(client.proto, || {
+            proto::encode_server(&ServerMsg::GridSnapshot {
+                rows: pane.rows,
+                cols: pane.cols,
+                cells: pane.snapshot(),
+                cursor_row,
+                cursor_col,
+                cursor_visible,
+                mouse_flags: pane.grid.mouse_flags(),
+                pane_id: Some(pane.id),
+            })
         });
         if !client_send(client, &snapshot) {
             return Err(io::Error::new(
@@ -4069,6 +4103,102 @@ fn proxy_osc_color_query(
 }
 
 /// Send dirty rows + cursor to clients viewing a specific window in a specific session.
+/// Ship Kitty graphics events to interactive viewers (proto ≥ GRAPHICS).
+fn send_graphics_to_window_viewers(
+    clients: &mut Vec<ClientConn>,
+    session_idx: usize,
+    window_idx: usize,
+    pane_id: u32,
+    events: &[crate::graphics::GraphicsEvent],
+) -> io::Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    for ev in events {
+        let msg = match ev {
+            crate::graphics::GraphicsEvent::Transmit {
+                image_id,
+                width,
+                height,
+                format,
+                zlib,
+                data,
+                place_cols,
+                place_rows,
+                ..
+            } => {
+                if data.is_empty() && *width == 0 {
+                    // Placement-only — clients already have the blob.
+                    continue;
+                }
+                proto::encode_server(&ServerMsg::GraphicsTransmit {
+                    pane_id,
+                    image_id: *image_id,
+                    width: *width,
+                    height: *height,
+                    format: *format,
+                    zlib: *zlib,
+                    place_cols: place_cols.unwrap_or(0),
+                    place_rows: place_rows.unwrap_or(0),
+                    data: data.clone(),
+                })
+            }
+            crate::graphics::GraphicsEvent::Delete { image_id } => {
+                proto::encode_server(&ServerMsg::GraphicsDelete {
+                    pane_id,
+                    image_id: *image_id,
+                })
+            }
+            crate::graphics::GraphicsEvent::QueryReply { .. } => continue,
+        };
+        let mut i = 0;
+        while i < clients.len() {
+            if clients[i].session_idx == session_idx
+                && clients[i].active_window == window_idx
+                && !clients[i].is_control
+                && clients[i].proto >= proto::PROTO_GRAPHICS
+                && !client_send(&mut clients[i], &msg)
+            {
+                clients.remove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Retransmit all stored images in a pane (attach / Refresh / reconnect).
+fn retransmit_pane_graphics(
+    clients: &mut [ClientConn],
+    client_idx: usize,
+    pane: &crate::server::pane::Pane,
+) {
+    if client_idx >= clients.len() || clients[client_idx].proto < proto::PROTO_GRAPHICS {
+        return;
+    }
+    for &id in pane.images.ids_in_order() {
+        let Some(img) = pane.images.get(id) else {
+            continue;
+        };
+        if img.data.is_empty() {
+            continue;
+        }
+        let msg = proto::encode_server(&ServerMsg::GraphicsTransmit {
+            pane_id: pane.id,
+            image_id: id,
+            width: img.width,
+            height: img.height,
+            format: img.format,
+            zlib: img.zlib,
+            place_cols: img.place_cols.unwrap_or(0),
+            place_rows: img.place_rows.unwrap_or(0),
+            data: img.data.clone(),
+        });
+        let _ = client_send(&mut clients[client_idx], &msg);
+    }
+}
+
 fn send_grid_update_to_window_viewers(
     clients: &mut Vec<ClientConn>,
     session_idx: usize,
@@ -4108,19 +4238,13 @@ fn send_grid_update_to_window_viewers(
 
     let dirty = pane.take_dirty_rows();
     let (cursor_row, cursor_col, cursor_visible) = pane.cursor();
+    let mouse_flags = pane.grid.mouse_flags();
     // Always send a GridUpdate when the PTY produced output, even if no
     // rows are dirty. The cursor may have moved (e.g., shell echoing a space
     // to an already-blank cell, or cursor-positioning escape sequences).
     // Without this, the client's cursor would not update until the next
     // dirty row — making it look like keypresses are ignored.
-    let msg = proto::encode_server(&ServerMsg::GridUpdate {
-        dirty,
-        cursor_row,
-        cursor_col,
-        cursor_visible,
-        mouse_flags: pane.grid.mouse_flags(),
-        pane_id: Some(pane_id),
-    });
+    // Encode per-client so proto < GRAPHICS gets cells without mark trailers.
     let mut i = 0;
     while i < clients.len() {
         if clients[i].session_idx == session_idx
@@ -4130,10 +4254,23 @@ fn send_grid_update_to_window_viewers(
             if clients[i].suppressed || clients[i].outbuf.len() > CLIENT_SUPPRESS_HIGH {
                 clients[i].suppressed = true;
                 i += 1;
-            } else if !client_send(&mut clients[i], &msg) {
-                clients.remove(i);
             } else {
-                i += 1;
+                let proto_v = clients[i].proto;
+                let msg = proto::with_cell_marks(proto_v, || {
+                    proto::encode_server(&ServerMsg::GridUpdate {
+                        dirty: dirty.clone(),
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        mouse_flags,
+                        pane_id: Some(pane_id),
+                    })
+                });
+                if !client_send(&mut clients[i], &msg) {
+                    clients.remove(i);
+                } else {
+                    i += 1;
+                }
             }
         } else {
             i += 1;

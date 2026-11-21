@@ -677,10 +677,17 @@ while revealing the real implementation.
 | `show-environment` | the server's environment as `K=V` lines |
 | `set-environment [-u] <name> [value]`, `unset-environment <name>` | edits the server env that future panes inherit |
 | `list-sessions`, `list-windows` | existing control-mode behavior |
+| `set` / `set-option` with `allow-passthrough` | successful no-op (terminal-browser prepare) |
 
 A bad `-t` target answers `%error` (non-zero exit), like tmux's
 "can't find window". Unimplemented commands return success with empty
 output rather than failing.
+
+Apps that need Kitty graphics under a multiplexer (notably
+`terminal-browser`) should run with `tmux_compat` so they take the
+Unicode-placeholder path. lrmux parses Kitty APC / DCS-tmux-wrapped
+graphics, stores blobs, writes placeholders into the grid, and
+re-emits `a=t` / `a=p,U=1` on attached clients (protocol ≥ 3).
 
 #### Server environment refresh (tmux `update-environment`)
 

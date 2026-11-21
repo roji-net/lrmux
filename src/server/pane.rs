@@ -94,6 +94,12 @@ pub struct Pane {
     /// a DA-first reply means "color query unsupported" and leaves the
     /// real color replies to render as typed text in the app).
     deferred_replies: Vec<ReplySlot>,
+    /// Kitty graphics images for this pane.
+    pub images: crate::graphics::ImageStore,
+    /// Incomplete APC/DCS prefix held across PTY reads.
+    gfx_pending: Vec<u8>,
+    /// Graphics events produced since the last drain.
+    pending_graphics: Vec<crate::graphics::GraphicsEvent>,
 }
 
 impl Pane {
@@ -187,7 +193,15 @@ impl Pane {
             trace,
             trace_start: std::time::Instant::now(),
             deferred_replies: Vec::new(),
+            images: crate::graphics::ImageStore::default(),
+            gfx_pending: Vec::new(),
+            pending_graphics: Vec::new(),
         }
+    }
+
+    /// Drain graphics events produced by recent PTY output.
+    pub fn take_graphics_events(&mut self) -> Vec<crate::graphics::GraphicsEvent> {
+        std::mem::take(&mut self.pending_graphics)
     }
 
     /// Palette learned from proxied OSC 10/11 replies (for HTML capture).
@@ -309,7 +323,14 @@ impl Pane {
                         let _ = f.write_all(&buf[..n]);
                     }
                 }
-                let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &buf[..n]);
+                // Extract Kitty APC / DCS tmux wrappers before VT parse —
+                // vte silently drops APC string bodies.
+                self.gfx_pending.extend_from_slice(&buf[..n]);
+                let (gfx_events, cleaned, leftover) =
+                    crate::graphics::kitty::extract_graphics(&self.gfx_pending);
+                self.gfx_pending = leftover;
+                self.apply_graphics_events(gfx_events);
+                let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &cleaned);
                 // Replies must leave in the order the child asked: probe
                 // libraries (terminal-colorsaurus, used by devin) read
                 // responses sequentially and treat a DA-first reply as
@@ -766,6 +787,69 @@ impl Pane {
     }
 
     /// Collect dirty rows as (row_index, cells) pairs for protocol transmission.
+    fn apply_graphics_events(&mut self, events: Vec<crate::graphics::GraphicsEvent>) {
+        use crate::graphics::GraphicsEvent;
+        use crate::graphics::placeholder;
+        use crate::graphics::store::StoredImage;
+        for ev in events {
+            match ev {
+                GraphicsEvent::Transmit {
+                    image_id,
+                    width,
+                    height,
+                    format,
+                    zlib,
+                    data,
+                    place_cols,
+                    place_rows,
+                    need_placeholders,
+                } => {
+                    let cols = place_cols.or_else(|| {
+                        // Cursor placement without c/r: fill remaining pane.
+                        Some(self.cols.saturating_sub(self.grid.cursor_col as u16) as u32)
+                    });
+                    let rows = place_rows.or_else(|| {
+                        Some(self.rows.saturating_sub(self.grid.cursor_row as u16) as u32)
+                    });
+                    self.images.insert(
+                        image_id,
+                        StoredImage {
+                            width,
+                            height,
+                            format,
+                            zlib,
+                            data: data.clone(),
+                            place_cols: cols,
+                            place_rows: rows,
+                        },
+                    );
+                    if need_placeholders && let (Some(c), Some(r)) = (cols, rows) {
+                        placeholder::write_placeholders(&mut self.grid, image_id, c, r);
+                    }
+                    self.pending_graphics.push(GraphicsEvent::Transmit {
+                        image_id,
+                        width,
+                        height,
+                        format,
+                        zlib,
+                        data,
+                        place_cols: cols,
+                        place_rows: rows,
+                        need_placeholders,
+                    });
+                }
+                GraphicsEvent::Delete { image_id } => {
+                    self.images.remove(image_id);
+                    self.pending_graphics
+                        .push(GraphicsEvent::Delete { image_id });
+                }
+                GraphicsEvent::QueryReply { bytes } => {
+                    self.queue_ready_reply(bytes);
+                }
+            }
+        }
+    }
+
     pub fn take_dirty_rows(&mut self) -> Vec<(u16, Vec<Cell>)> {
         let dirty = self.grid.take_dirty();
         let cols = self.cols as usize;
@@ -788,6 +872,8 @@ impl Pane {
                                         fg: c.fg,
                                         bg: c.bg,
                                         attrs: c.attrs,
+                                        marks: ['\0', '\0'],
+                                        mark_len: 0,
                                     }
                                 } else {
                                     c.clone()
@@ -817,6 +903,8 @@ impl Pane {
                                 fg: c.fg,
                                 bg: c.bg,
                                 attrs: c.attrs,
+                                marks: ['\0', '\0'],
+                                mark_len: 0,
                             }
                         } else {
                             c.clone()
@@ -839,6 +927,8 @@ impl Pane {
                             fg: c.fg,
                             bg: c.bg,
                             attrs: c.attrs,
+                            marks: ['\0', '\0'],
+                            mark_len: 0,
                         });
                     } else {
                         cells.push(c.clone());
@@ -879,6 +969,8 @@ impl Pane {
                                 fg: c.fg,
                                 bg: c.bg,
                                 attrs: c.attrs,
+                                marks: ['\0', '\0'],
+                                mark_len: 0,
                             }
                         } else {
                             c.clone()

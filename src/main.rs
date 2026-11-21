@@ -9,6 +9,7 @@ mod client;
 mod cmd;
 mod compat;
 mod config;
+mod graphics;
 mod grid;
 mod ipc;
 mod keepalive;

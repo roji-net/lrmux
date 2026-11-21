@@ -32,6 +32,7 @@ Module layout (per §5.7 of the design doc):
 - `src/keys/` — key input parsing, prefix detection, command dispatch
 - `src/statusbar/` — status line rendering
 - `src/layout/` — pane split/resize layout algorithms
+- `src/graphics/` — Kitty graphics parse/store/placeholders
 
 ## Conventions
 
@@ -81,6 +82,7 @@ Module layout (per §5.7 of the design doc):
 - **Server discovery**: Scans `/tmp/lrmux-<UID>/` for socket files and probes each to find running servers.
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
 - **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.
+- **Kitty graphics (proto ≥ 3)**: Server parses Kitty APC `_G` (and DCS `tmux;` unwrap), stores image blobs per pane, writes Unicode placeholders (`U+10EEEE` + diacritics, id in fg RGB), and forwards `GraphicsTransmit`/`GraphicsDelete` to viewers. Clients emit `a=t` + virtual `a=p,U=1` to the outer TTY and paint placeholder graphemes. Cursor placements (`a=T` without `U=1`) are normalized to virtual. Reattach/Refresh retransmits referenced images. For `terminal-browser`, enable `tmux_compat` (or `--tmux-compat`) so TB uses the mux placeholder path; the shim accepts `set -p allow-passthrough` as a successful no-op. Outer terminal must speak Kitty graphics (Ghostty/Kitty/iTerm2). File/shm media and Sixel/OSC 1337 are out of scope.
 - **Not yet implemented**: Pane splits, layout engine, window auto-renumber (already works via Vec), search in copy mode, TOML config loading, F-key shortcuts.
 
 ## Crash recovery and state persistence

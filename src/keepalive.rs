@@ -110,10 +110,7 @@ mod tests {
         let mut ka = Keepalive::maybe(2, 1, crate::proto::PROTO_KEEPALIVE).unwrap();
         let t0 = ka.last_rx;
         assert_eq!(ka.poll(t0 + Duration::from_millis(500)), None);
-        assert_eq!(
-            ka.poll(t0 + Duration::from_secs(2)),
-            Some(Action::SendPing)
-        );
+        assert_eq!(ka.poll(t0 + Duration::from_secs(2)), Some(Action::SendPing));
         ka.note_ping_sent();
         // Freeze ping_sent_at by reading it after note.
         let sent = ka.ping_sent_at.unwrap();

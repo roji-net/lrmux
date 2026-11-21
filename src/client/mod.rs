@@ -437,6 +437,9 @@ pub fn run(
     };
     // stream_fd refreshed after reconnect.
     let mut stream_fd = stream.as_raw_fd();
+    // Kitty image blobs keyed by image id (from GraphicsTransmit).
+    let mut graphics_images: std::collections::HashMap<u32, ClientImage> =
+        std::collections::HashMap::new();
 
     // Install SIGWINCH handler so terminal resizes are detected.
     install_winch_handler();
@@ -491,14 +494,7 @@ pub fn run(
 
         // ── Reconnecting: dim overlay + backoff retries ─────────────
         if let Some(ref mut rc) = reconnect {
-            render_reconnect_overlay(
-                &grid,
-                &status_text,
-                term_rows,
-                term_cols,
-                rc,
-                socket_path,
-            )?;
+            render_reconnect_overlay(&grid, &status_text, term_rows, term_cols, rc, socket_path)?;
             let now = std::time::Instant::now();
             let wait = rc
                 .next_at
@@ -558,12 +554,12 @@ pub fn run(
                         prefix_state = PrefixState::Normal;
                         renderer.invalidate();
                         grid.mark_all_dirty();
+                        graphics_images.clear();
                         let _ = send_cmd(&mut stream, &ClientMsg::Refresh);
                         // Brief flash that we are back.
                         flash_msg = Some("reconnected".to_string());
-                        flash_deadline = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(2),
-                        );
+                        flash_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
                         continue;
                     }
                     Err(e) => {
@@ -1329,7 +1325,11 @@ pub fn run(
                     ka.note_rx();
                 }
                 let mut needs_render = false;
-                while let Some(msg) = try_parse_server_frame(&mut server_buf)? {
+                loop {
+                    let next = proto::with_cell_marks(negotiated_proto, || {
+                        try_parse_server_frame(&mut server_buf)
+                    })?;
+                    let Some(msg) = next else { break };
                     match msg {
                         ServerMsg::WindowLayout {
                             rows,
@@ -1642,6 +1642,52 @@ pub fn run(
                         | ServerMsg::RelayAck { .. }
                         | ServerMsg::SendKeysAck { .. }
                         | ServerMsg::SendEventAck { .. } => {}
+                        ServerMsg::GraphicsTransmit {
+                            pane_id: _,
+                            image_id,
+                            width,
+                            height,
+                            format,
+                            zlib,
+                            place_cols,
+                            place_rows,
+                            data,
+                        } => {
+                            graphics_images.insert(
+                                image_id,
+                                ClientImage {
+                                    width,
+                                    height,
+                                    format,
+                                    zlib,
+                                    place_cols,
+                                    place_rows,
+                                    data: data.clone(),
+                                },
+                            );
+                            let seq = crate::graphics::placeholder::emit_transmit_and_place(
+                                image_id,
+                                width,
+                                height,
+                                zlib,
+                                &data,
+                                place_cols.max(1),
+                                place_rows.max(1),
+                            );
+                            let mut stdout = client_stdout();
+                            let _ = stdout.write_all(&seq);
+                            let _ = stdout.flush();
+                        }
+                        ServerMsg::GraphicsDelete {
+                            pane_id: _,
+                            image_id,
+                        } => {
+                            graphics_images.remove(&image_id);
+                            let seq = crate::graphics::placeholder::emit_delete(image_id);
+                            let mut stdout = client_stdout();
+                            let _ = stdout.write_all(&seq);
+                            let _ = stdout.flush();
+                        }
                         ServerMsg::Ping => {
                             let _ = send_cmd(&mut stream, &ClientMsg::Pong);
                         }
@@ -1792,6 +1838,17 @@ pub fn run(
     })
 }
 
+/// Cached Kitty image for emission to the outer TTY.
+struct ClientImage {
+    width: u32,
+    height: u32,
+    format: u8,
+    zlib: bool,
+    place_cols: u32,
+    place_rows: u32,
+    data: Vec<u8>,
+}
+
 /// In-process reconnect overlay state after transport loss.
 struct ReconnectState {
     since: std::time::Instant,
@@ -1849,7 +1906,9 @@ fn disconnect_reason(socket_path: &std::path::Path, detail: &str) -> String {
 }
 
 fn reconnect_wants_quit(input: &[u8]) -> bool {
-    input.iter().any(|&b| b == b'q' || b == b'Q' || b == 0x1b || b == 0x03)
+    input
+        .iter()
+        .any(|&b| b == b'q' || b == b'Q' || b == 0x1b || b == 0x03)
 }
 
 fn try_reconnect(
@@ -1946,7 +2005,10 @@ fn render_reconnect_overlay(
     let mut lines: Vec<String> = vec![
         "Connection lost".to_string(),
         target,
-        format!("elapsed {elapsed}s  ·  attempt {}  ·  retry in {next}s", rc.attempt + 1),
+        format!(
+            "elapsed {elapsed}s  ·  attempt {}  ·  retry in {next}s",
+            rc.attempt + 1
+        ),
         rc.reason.clone(),
     ];
     for e in &rc.last_errors {
