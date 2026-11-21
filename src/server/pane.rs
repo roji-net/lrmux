@@ -13,6 +13,21 @@ use std::path::PathBuf;
 /// Global pane ID counter (tmux uses %N format).
 static PANE_ID: AtomicU32 = AtomicU32::new(0);
 
+/// Outer-TTY pixel geometry (from a client's CSI 14t/16t probe).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PixelGeometry {
+    pub cell_w: u16,
+    pub cell_h: u16,
+    pub win_w: u16,
+    pub win_h: u16,
+}
+
+impl PixelGeometry {
+    pub fn is_usable(&self) -> bool {
+        self.cell_w > 0 && self.cell_h > 0
+    }
+}
+
 /// Max time a query reply waits for the pane tty to leave cooked mode
 /// before being dropped. Apps accept query replies only during a short
 /// window after probing (devin ~150-200ms); a reply injected later lands in
@@ -20,6 +35,10 @@ static PANE_ID: AtomicU32 = AtomicU32::new(0);
 /// deadline it's better to stay silent — a terminal that never answers is
 /// something apps already handle via their own timeout.
 const REPLY_DEFER_MAX: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// XTWINOPS 14t/16t often race the client's attach-time pixel probe
+/// (`new-server -- kitten icat …`). Hold longer so geometry can land.
+const XTWINOPS_DEFER_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Minimum latency before a locally-generated reply is delivered. Real
 /// terminals answer a query several ms after receiving it; a reply written
@@ -48,12 +67,20 @@ enum ReplySlot {
         code: u8,
         bell: bool,
     },
+    /// XTWINOPS 14/16 waiting for an attached client's pixel geometry.
+    WaitingXtwinops {
+        earliest: std::time::Instant,
+        deadline: std::time::Instant,
+        kind: vt::XtwinopsQuery,
+    },
 }
 
 impl ReplySlot {
     fn deadline(&self) -> std::time::Instant {
         match self {
-            ReplySlot::Ready { deadline, .. } | ReplySlot::Waiting { deadline, .. } => *deadline,
+            ReplySlot::Ready { deadline, .. }
+            | ReplySlot::Waiting { deadline, .. }
+            | ReplySlot::WaitingXtwinops { deadline, .. } => *deadline,
         }
     }
 }
@@ -292,6 +319,7 @@ impl Pane {
     pub fn process_pty_output(
         &mut self,
         palette_fallback: super::capture::TerminalPalette,
+        pixel_geo: Option<PixelGeometry>,
     ) -> io::Result<(bool, Vec<u8>, Vec<vt::OscColorQuery>)> {
         if self.exited {
             return Ok((false, Vec::new(), Vec::new()));
@@ -350,6 +378,18 @@ impl Pane {
                                 }
                             }
                         }
+                        vt::PendingReply::Xtwinops(q) => {
+                            if let Some(r) = self.xtwinops_reply(q, pixel_geo) {
+                                self.queue_ready_reply(r);
+                            } else if matches!(
+                                q,
+                                vt::XtwinopsQuery::WindowPixels | vt::XtwinopsQuery::CellPixels
+                            ) {
+                                // Race with attach probe — hold for geometry.
+                                self.queue_waiting_xtwinops(q);
+                            }
+                            // 18t always answers from the grid (handled above).
+                        }
                     }
                 }
                 if raw.len() >= MAX_DRAIN {
@@ -373,6 +413,77 @@ impl Pane {
         }
         let _ = self.flush_deferred_replies();
         Ok((alive, raw, osc_queries))
+    }
+
+    fn queue_waiting_xtwinops(&mut self, kind: vt::XtwinopsQuery) {
+        let now = std::time::Instant::now();
+        self.trace("DFR", b"waiting for pixel geometry (XTWINOPS)");
+        self.deferred_replies.push(ReplySlot::WaitingXtwinops {
+            earliest: now + REPLY_MIN_DELAY,
+            deadline: now + XTWINOPS_DEFER_MAX,
+            kind,
+        });
+    }
+
+    /// Fill any WaitingXtwinops slots from freshly arrived outer geometry
+    /// (client's TermPixelGeometry). Returns true if something was filled.
+    pub fn resolve_waiting_xtwinops(&mut self, geo: PixelGeometry) -> io::Result<bool> {
+        if !geo.is_usable() {
+            return Ok(false);
+        }
+        let mut filled = false;
+        let mut i = 0;
+        while i < self.deferred_replies.len() {
+            let filled_here = match self.deferred_replies[i] {
+                ReplySlot::WaitingXtwinops {
+                    earliest,
+                    deadline,
+                    kind,
+                } => self.xtwinops_reply(kind, Some(geo)).map(|bytes| {
+                    self.deferred_replies[i] = ReplySlot::Ready {
+                        earliest,
+                        deadline,
+                        bytes,
+                    };
+                }),
+                _ => None,
+            };
+            if filled_here.is_some() {
+                filled = true;
+            }
+            i += 1;
+        }
+        if filled {
+            self.trace("DFR", b"filled waiting XTWINOPS from pixel geo");
+            self.flush_deferred_replies()?;
+        }
+        Ok(filled)
+    }
+
+    /// Answer XTWINOPS 14/16/18. Cell/window pixels need outer geometry;
+    /// character-area size comes from the pane grid.
+    fn xtwinops_reply(&self, q: vt::XtwinopsQuery, geo: Option<PixelGeometry>) -> Option<Vec<u8>> {
+        match q {
+            vt::XtwinopsQuery::TextAreaChars => {
+                let rows = self.grid.rows();
+                let cols = self.grid.cols();
+                Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
+            }
+            vt::XtwinopsQuery::CellPixels => {
+                let g = geo.filter(|g| g.is_usable())?;
+                Some(format!("\x1b[6;{};{}t", g.cell_h, g.cell_w).into_bytes())
+            }
+            vt::XtwinopsQuery::WindowPixels => {
+                let g = geo.filter(|g| g.is_usable())?;
+                // Pane text area in pixels (not the full outer window) —
+                // matches what apps under a mux expect for layout.
+                let w = (self.grid.cols() as u32).saturating_mul(g.cell_w as u32);
+                let h = (self.grid.rows() as u32).saturating_mul(g.cell_h as u32);
+                let w = w.min(u32::from(u16::MAX)) as u16;
+                let h = h.min(u32::from(u16::MAX)) as u16;
+                Some(format!("\x1b[4;{h};{w}t").into_bytes())
+            }
+        }
     }
 
     /// Synthesize an OSC 10/11 reply from the pane's cached palette or the
@@ -1164,6 +1275,64 @@ mod tests {
         pane
     }
 
+    #[test]
+    fn xtwinops_replies_use_cell_geo_and_grid_size() {
+        let pane = cat_pane(); // 24×80
+        let geo = PixelGeometry {
+            cell_w: 10,
+            cell_h: 20,
+            win_w: 800,
+            win_h: 600,
+        };
+        assert_eq!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::CellPixels, Some(geo))
+                .unwrap(),
+            b"\x1b[6;20;10t"
+        );
+        assert_eq!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::WindowPixels, Some(geo))
+                .unwrap(),
+            b"\x1b[4;480;800t" // 24*20 × 80*10
+        );
+        assert_eq!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::TextAreaChars, None)
+                .unwrap(),
+            b"\x1b[8;24;80t"
+        );
+        assert!(
+            pane.xtwinops_reply(vt::XtwinopsQuery::CellPixels, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn waiting_xtwinops_resolves_when_geo_arrives() {
+        // kitten icat queries 14t/16t before the attach client finishes
+        // probing — slots wait, then flush once TermPixelGeometry lands.
+        let mut pane = cat_pane();
+        pane.queue_waiting_xtwinops(vt::XtwinopsQuery::CellPixels);
+        pane.queue_waiting_xtwinops(vt::XtwinopsQuery::WindowPixels);
+        age_all(&mut pane);
+        let geo = PixelGeometry {
+            cell_w: 10,
+            cell_h: 20,
+            win_w: 800,
+            win_h: 600,
+        };
+        assert!(pane.resolve_waiting_xtwinops(geo).unwrap());
+        let out = read_master(&pane);
+        assert!(
+            out.windows(b"\x1b[6;20;10t".len())
+                .any(|w| w == b"\x1b[6;20;10t"),
+            "missing cell reply: {out:?}"
+        );
+        assert!(
+            out.windows(b"\x1b[4;480;800t".len())
+                .any(|w| w == b"\x1b[4;480;800t"),
+            "missing window reply: {out:?}"
+        );
+    }
+
     /// Bytes echoed back by cat after replies were written to the master.
     fn read_master(pane: &Pane) -> Vec<u8> {
         let fd = pane.pty.master_fd();
@@ -1195,7 +1364,9 @@ mod tests {
     fn age_all(pane: &mut Pane) {
         for s in &mut pane.deferred_replies {
             match s {
-                ReplySlot::Ready { earliest, .. } | ReplySlot::Waiting { earliest, .. } => {
+                ReplySlot::Ready { earliest, .. }
+                | ReplySlot::Waiting { earliest, .. }
+                | ReplySlot::WaitingXtwinops { earliest, .. } => {
                     *earliest = std::time::Instant::now() - std::time::Duration::from_secs(1);
                 }
             }

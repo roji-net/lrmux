@@ -15,6 +15,17 @@ pub struct OscColorQuery {
     pub bell_terminated: bool,
 }
 
+/// XTWINOPS report request from the child (`CSI Ps t`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XtwinopsQuery {
+    /// CSI 14 t — window size in pixels → reply CSI 4 ; h ; w t.
+    WindowPixels,
+    /// CSI 16 t — cell size in pixels → reply CSI 6 ; h ; w t.
+    CellPixels,
+    /// CSI 18 t — text area in characters → reply CSI 8 ; rows ; cols t.
+    TextAreaChars,
+}
+
 /// One reply-able item from a `parse_bytes` pass.
 #[derive(Debug)]
 pub enum PendingReply {
@@ -22,6 +33,8 @@ pub enum PendingReply {
     Bytes(Vec<u8>),
     /// OSC 10/11 — needs the outer palette (cached or proxied to a client).
     Osc(OscColorQuery),
+    /// XTWINOPS 14/16/18 — needs outer pixel geometry (or grid size for 18).
+    Xtwinops(XtwinopsQuery),
 }
 
 /// Output of one `parse_bytes` pass: replies to the child's terminal
@@ -236,6 +249,7 @@ impl Perform for VtHandler<'_> {
                             1005 => self.grid.mouse_fmt = 5,
                             1006 => self.grid.mouse_fmt = 6,
                             1007 => self.grid.mouse_altscroll = true,
+                            1016 => self.grid.mouse_pixels = true,
                             _ => {}
                         }
                     }
@@ -254,11 +268,29 @@ impl Perform for VtHandler<'_> {
                             1003 => self.grid.mouse_tracking &= !4,
                             1005 | 1006 => self.grid.mouse_fmt = 0,
                             1007 => self.grid.mouse_altscroll = false,
+                            1016 => self.grid.mouse_pixels = false,
                             _ => {}
                         }
                     }
                 }
             }
+
+            // XTWINOPS — window/cell geometry reports (xterm).
+            't' if intermediates.is_empty() => match param(0, 0) {
+                14 => self
+                    .result
+                    .replies
+                    .push(PendingReply::Xtwinops(XtwinopsQuery::WindowPixels)),
+                16 => self
+                    .result
+                    .replies
+                    .push(PendingReply::Xtwinops(XtwinopsQuery::CellPixels)),
+                18 => self
+                    .result
+                    .replies
+                    .push(PendingReply::Xtwinops(XtwinopsQuery::TextAreaChars)),
+                _ => {}
+            },
 
             // SCP / RCP — plain forms only. `\x1b[?u` is a kitty keyboard
             // flags query and `\x1b[>Nu` / `\x1b[<u` push/pop its state —
@@ -518,16 +550,42 @@ mod tests {
     fn decset_mouse_modes() {
         let mut grid = Grid::new(1, 20, 10);
         let mut parser = vte::Parser::new();
-        parse_bytes(&mut parser, &mut grid, b"\x1b[?1002h\x1b[?1006h\x1b[?1007h");
+        parse_bytes(
+            &mut parser,
+            &mut grid,
+            b"\x1b[?1002h\x1b[?1006h\x1b[?1007h\x1b[?1016h",
+        );
         assert_eq!(grid.mouse_tracking, 2);
         assert_eq!(grid.mouse_fmt, 6);
         assert!(grid.mouse_altscroll);
+        assert!(grid.mouse_pixels);
         assert!(grid.wants_mouse());
-        parse_bytes(&mut parser, &mut grid, b"\x1b[?1002l\x1b[?1006l");
+        parse_bytes(&mut parser, &mut grid, b"\x1b[?1002l\x1b[?1006l\x1b[?1016l");
         assert_eq!(grid.mouse_tracking, 0);
         assert_eq!(grid.mouse_fmt, 0);
+        assert!(!grid.mouse_pixels);
         assert!(!grid.wants_mouse());
         assert!(grid.mouse_altscroll); // 1007 untouched
+    }
+
+    #[test]
+    fn xtwinops_queries_emit_pending_replies() {
+        let mut grid = Grid::new(24, 80, 10);
+        let mut parser = vte::Parser::new();
+        let r = parse_bytes(&mut parser, &mut grid, b"\x1b[14t\x1b[16t\x1b[18t");
+        assert_eq!(r.replies.len(), 3);
+        assert!(matches!(
+            r.replies[0],
+            PendingReply::Xtwinops(XtwinopsQuery::WindowPixels)
+        ));
+        assert!(matches!(
+            r.replies[1],
+            PendingReply::Xtwinops(XtwinopsQuery::CellPixels)
+        ));
+        assert!(matches!(
+            r.replies[2],
+            PendingReply::Xtwinops(XtwinopsQuery::TextAreaChars)
+        ));
     }
 
     #[test]

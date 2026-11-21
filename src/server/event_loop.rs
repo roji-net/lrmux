@@ -57,6 +57,8 @@ struct ClientConn {
     suppressed: bool,
     /// Outer TTY default colors (OSC 10/11), probed by the client on attach.
     palette: super::capture::TerminalPalette,
+    /// Outer TTY cell/window pixels (CSI 14t/16t), probed on attach.
+    pixel_geo: Option<super::pane::PixelGeometry>,
     /// True when connected over TCP (plain or TLS). Unix clients skip
     /// auth_token checks (filesystem permissions are the gate).
     is_tcp: bool,
@@ -99,6 +101,7 @@ impl ClientConn {
             close_when_idle: false,
             suppressed: false,
             palette: super::capture::TerminalPalette::default(),
+            pixel_geo: None,
             is_tcp,
             relay_peer: None,
             relay_in: Vec::new(),
@@ -716,8 +719,25 @@ pub fn run(
                     fg: clients.iter().find_map(|c| c.palette.fg),
                     bg: clients.iter().find_map(|c| c.palette.bg),
                 };
+                // Prefer a viewer of this window; else any attached client's
+                // probed cell size. TB's CSI 14t/16t answers come from here.
+                let pixel_geo = clients
+                    .iter()
+                    .find(|c| {
+                        c.attach
+                            && !c.is_control
+                            && c.session_idx == si
+                            && c.active_window == wi
+                            && c.pixel_geo.is_some_and(|g| g.is_usable())
+                    })
+                    .or_else(|| {
+                        clients
+                            .iter()
+                            .find(|c| c.attach && c.pixel_geo.is_some_and(|g| g.is_usable()))
+                    })
+                    .and_then(|c| c.pixel_geo);
                 let mouse_before = pane.grid.mouse_flags();
-                match pane.process_pty_output(palette_fallback) {
+                match pane.process_pty_output(palette_fallback, pixel_geo) {
                     Ok((true, raw, osc_queries)) => {
                         let pane_id = pane.id;
                         let gfx = pane.take_graphics_events();
@@ -1111,6 +1131,33 @@ pub fn run(
                                                 clients[client_idx].active_window,
                                                 pal,
                                             );
+                                        }
+                                        ClientMsg::TermPixelGeometry {
+                                            cell_w,
+                                            cell_h,
+                                            win_w,
+                                            win_h,
+                                        } => {
+                                            let geo = super::pane::PixelGeometry {
+                                                cell_w,
+                                                cell_h,
+                                                win_w,
+                                                win_h,
+                                            };
+                                            clients[client_idx].pixel_geo = Some(geo);
+                                            crate::log::info(&format!(
+                                                "client fd {} pixel geo cell={cell_w}x{cell_h} win={win_w}x{win_h}",
+                                                clients[client_idx].fd
+                                            ));
+                                            // Resolve XTWINOPS held while geometry was racing
+                                            // attach (`new-server -- kitten icat …`).
+                                            for session in &mut sessions {
+                                                for window in &mut session.windows {
+                                                    for pane in &mut window.panes {
+                                                        let _ = pane.resolve_waiting_xtwinops(geo);
+                                                    }
+                                                }
+                                            }
                                         }
                                         ClientMsg::Detach => {
                                             to_remove.push(client_idx);

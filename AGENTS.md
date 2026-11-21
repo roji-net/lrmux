@@ -56,7 +56,7 @@ Module layout (per §5.7 of the design doc):
 - **Architecture**: Server owns PTY + grid + VT parser. After each PTY read, sends dirty rows + cursor to client. Client maintains its own grid copy, applies updates, and renders locally using the diff-based renderer.
 - **Single session/window/pane**: Phase 3 proves the architecture with one session, one window, one pane. Multi-pane/multi-window is deferred.
 - **Server lifecycle**: Server exits when the client disconnects or the child process exits. Socket file is cleaned up on exit.
-- **No reconnect yet**: If the client disconnects, the server exits. Reconnect to a persistent server is deferred.
+- **Reconnect overlay (proto ≥ 2)**: On unexpected transport loss / keepalive timeout the attached client dims the last frame and retries with infinite backoff (q/Esc/Ctrl-C quit). A graceful `PaneExit` (last session closed / KillServer) exits cleanly without entering reconnect. Overlay shows up to 5 timestamped recent errors at a fixed height.
 - **No SIGWINCH yet**: Resize messages are handled in the protocol but not triggered by signal handling.
 
 ## Phase 4 status
@@ -83,6 +83,7 @@ Module layout (per §5.7 of the design doc):
 - **Session queries**: `ListSessions` protocol message (lightweight: connect, query, disconnect). Server responds with `SessionList`.
 - **Selector**: Interactive TUI with fuzzy filter, j/k navigation, Enter to join, n for new session, N for new server. `SelectSession` protocol message switches to the chosen session after handshake.
 - **Kitty graphics (proto ≥ 3)**: Server parses Kitty APC `_G` (and DCS `tmux;` unwrap), stores image blobs per pane, writes Unicode placeholders (`U+10EEEE` + diacritics, id in fg RGB), and forwards `GraphicsTransmit`/`GraphicsDelete` to viewers. Clients emit `a=t` + virtual `a=p,U=1` to the outer TTY and paint placeholder graphemes. Cursor placements (`a=T` without `U=1`) are normalized to virtual. Reattach/Refresh retransmits referenced images. For `terminal-browser`, enable `tmux_compat` (or `--tmux-compat`) so TB uses the mux placeholder path; the shim accepts `set -p allow-passthrough` as a successful no-op. Outer terminal must speak Kitty graphics (Ghostty/Kitty/iTerm2). File/shm media and Sixel/OSC 1337 are out of scope.
+- **XTWINOPS + SGR-Pixels (proto ≥ 4)**: On attach the client probes CSI 14t/16t and sends `TermPixelGeometry`. The server answers pane `14t`/`16t`/`18t` from that cache (pane pixels = cells × cell size). Queries that race the probe are held ~2s and filled when geometry arrives — needed for `kitten icat` / terminal-browser sizing. DECSET 1016 (SGR-Pixels) is tracked and enabled on the outer TTY when the child requests it; mouse reports forward in pixel space.
 - **Not yet implemented**: Pane splits, layout engine, window auto-renumber (already works via Vec), search in copy mode, TOML config loading, F-key shortcuts.
 
 ## Crash recovery and state persistence

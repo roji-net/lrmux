@@ -27,7 +27,7 @@ use crate::grid::{Attr, Cell, Color};
 pub const PROTO_MIN: u16 = 1;
 /// Newest wire protocol version this build speaks. Bump when the wire
 /// format changes in a way trailing optional fields can't cover.
-pub const PROTO_MAX: u16 = 3;
+pub const PROTO_MAX: u16 = 4;
 /// Version assumed for peers that send no proto fields
 /// (pre-versioning builds).
 pub const PROTO_LEGACY: u16 = 1;
@@ -35,6 +35,9 @@ pub const PROTO_LEGACY: u16 = 1;
 pub const PROTO_KEEPALIVE: u16 = 2;
 /// First version with combining-mark cells + Kitty GraphicsTransmit.
 pub const PROTO_GRAPHICS: u16 = 3;
+/// First version with outer-TTY pixel geometry (`TermPixelGeometry`) for
+/// XTWINOPS 14t/16t answers (terminal-browser cell sizing).
+pub const PROTO_PIXEL_GEO: u16 = 4;
 
 thread_local! {
     /// When encoding/decoding grid cells, include combining-mark trailer
@@ -304,6 +307,14 @@ pub enum ClientMsg {
         fg: Option<(u8, u8, u8)>,
         bg: Option<(u8, u8, u8)>,
     },
+    /// Outer TTY pixel geometry from CSI 14t/16t (proto ≥ [`PROTO_PIXEL_GEO`]).
+    /// Server answers pane XTWINOPS queries from this cache.
+    TermPixelGeometry {
+        cell_w: u16,
+        cell_h: u16,
+        win_w: u16,
+        win_h: u16,
+    },
     /// Set / replace the server PSK (hot-apply + persist). Scaffolding for
     /// in-session network setup; fullscreen config editor comes later.
     SetPsk { psk: String },
@@ -560,6 +571,7 @@ const C_NEXT_LAYOUT: u8 = 0x25;
 const C_FOCUS_PANE: u8 = 0x26;
 const C_PING: u8 = 0x27;
 const C_PONG: u8 = 0x28;
+const C_TERM_PIXEL_GEO: u8 = 0x29;
 
 const S_IDENTIFY_ACK: u8 = 0x10;
 const S_GRID_SNAPSHOT: u8 = 0x11;
@@ -925,6 +937,18 @@ pub fn encode_client(msg: &ClientMsg) -> Vec<u8> {
         }
         ClientMsg::Pong => {
             payload.push(C_PONG);
+        }
+        ClientMsg::TermPixelGeometry {
+            cell_w,
+            cell_h,
+            win_w,
+            win_h,
+        } => {
+            payload.push(C_TERM_PIXEL_GEO);
+            payload.extend_from_slice(&cell_w.to_le_bytes());
+            payload.extend_from_slice(&cell_h.to_le_bytes());
+            payload.extend_from_slice(&win_w.to_le_bytes());
+            payload.extend_from_slice(&win_h.to_le_bytes());
         }
     }
     frame(payload)
@@ -1713,6 +1737,18 @@ fn decode_client_body(tag: u8, data: &[u8]) -> io::Result<ClientMsg> {
         }
         C_PING => Ok(ClientMsg::Ping),
         C_PONG => Ok(ClientMsg::Pong),
+        C_TERM_PIXEL_GEO => {
+            let cell_w = read_u16(&mut r)?;
+            let cell_h = read_u16(&mut r)?;
+            let win_w = read_u16(&mut r)?;
+            let win_h = read_u16(&mut r)?;
+            Ok(ClientMsg::TermPixelGeometry {
+                cell_w,
+                cell_h,
+                win_w,
+                win_h,
+            })
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown client msg type: {tag}"),
@@ -2906,6 +2942,28 @@ mod tests {
         }
         assert_eq!(PROTO_KEEPALIVE, 2);
         assert!(PROTO_MAX >= PROTO_KEEPALIVE);
+        assert!(PROTO_MAX >= PROTO_PIXEL_GEO);
+    }
+
+    #[test]
+    fn term_pixel_geometry_roundtrip() {
+        let msg = ClientMsg::TermPixelGeometry {
+            cell_w: 9,
+            cell_h: 18,
+            win_w: 1440,
+            win_h: 900,
+        };
+        match decode_client(&mut &encode_client(&msg)[..]).unwrap() {
+            ClientMsg::TermPixelGeometry {
+                cell_w,
+                cell_h,
+                win_w,
+                win_h,
+            } => {
+                assert_eq!((cell_w, cell_h, win_w, win_h), (9, 18, 1440, 900));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
