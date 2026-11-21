@@ -94,6 +94,9 @@ pub fn get_size(fd: std::os::fd::RawFd) -> (u16, u16) {
 /// Write helpers for escape sequences to stdout.
 pub mod escapes;
 
+/// TIOCGWINSZ helpers (character + pixel dimensions).
+pub mod winsize;
+
 /// Parse an OSC 10/11 color reply from a real TTY.
 ///
 /// Accepts `OSC 10 ; rgb:RRRR/GGGG/BBBB ST` (and OSC 11), plus `#RRGGBB`.

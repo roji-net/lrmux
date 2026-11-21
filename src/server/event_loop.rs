@@ -351,6 +351,14 @@ pub fn run(
     // Capture once at startup. Probes (ListSessions) and failed first
     // handshakes must not consume / lose `new-server -- cmd` options.
     let boot = take_bootstrap();
+    // Seed PTY pixel dims before any pane spawn (kitten icat / TIOCGWINSZ).
+    if let Some(geo) = boot.pixels {
+        super::pane::set_server_pixel_geo(geo);
+        crate::log::info(&format!(
+            "bootstrap pixel geo cell={}x{}",
+            geo.cell_w, geo.cell_h
+        ));
+    }
 
     let (mut grid_rows, mut grid_cols, mut sessions, mut clients) = if manager {
         // Manager role: pure directory/broker, no sessions, no waiting
@@ -1145,16 +1153,19 @@ pub fn run(
                                                 win_h,
                                             };
                                             clients[client_idx].pixel_geo = Some(geo);
+                                            super::pane::set_server_pixel_geo(geo);
                                             crate::log::info(&format!(
                                                 "client fd {} pixel geo cell={cell_w}x{cell_h} win={win_w}x{win_h}",
                                                 clients[client_idx].fd
                                             ));
                                             // Resolve XTWINOPS held while geometry was racing
-                                            // attach (`new-server -- kitten icat …`).
+                                            // attach (`new-server -- kitten icat …`), and push
+                                            // pixel dims into every pane PTY (TIOCSWINSZ).
                                             for session in &mut sessions {
                                                 for window in &mut session.windows {
                                                     for pane in &mut window.panes {
                                                         let _ = pane.resolve_waiting_xtwinops(geo);
+                                                        super::pane::apply_pixel_geo_to_pty(pane);
                                                     }
                                                 }
                                             }
@@ -2738,6 +2749,8 @@ struct Bootstrap {
     command: Option<String>,
     session_name: Option<String>,
     cwd: Option<String>,
+    /// `cell_w,cell_h` from the forking client's `TIOCGWINSZ`.
+    pixels: Option<super::pane::PixelGeometry>,
 }
 
 /// Read and clear `LRMUX_INIT_*` so a later pane spawn does not see them.
@@ -2751,16 +2764,29 @@ fn take_bootstrap() -> Bootstrap {
     let cwd = std::env::var("LRMUX_INIT_CWD")
         .ok()
         .filter(|s| !s.is_empty());
+    let pixels = std::env::var("LRMUX_INIT_PIXELS").ok().and_then(|s| {
+        let mut it = s.split(',');
+        let cell_w: u16 = it.next()?.parse().ok()?;
+        let cell_h: u16 = it.next()?.parse().ok()?;
+        (cell_w > 0 && cell_h > 0).then_some(super::pane::PixelGeometry {
+            cell_w,
+            cell_h,
+            win_w: 0,
+            win_h: 0,
+        })
+    });
     // Safety: server is single-threaded at startup.
     unsafe {
         std::env::remove_var("LRMUX_INIT_COMMAND");
         std::env::remove_var("LRMUX_INIT_SESSION");
         std::env::remove_var("LRMUX_INIT_CWD");
+        std::env::remove_var("LRMUX_INIT_PIXELS");
     }
     Bootstrap {
         command,
         session_name,
         cwd,
+        pixels,
     }
 }
 

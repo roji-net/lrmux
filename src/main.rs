@@ -435,14 +435,13 @@ fn parse_args() -> CliAction {
         }
         Some("kill-server") => {
             let parsed = cmd::parse_flags(subcmd_args);
-            let name = parsed
-                .get("s")
-                .or_else(|| parsed.get("server"))
-                .map(|s| s.to_string())
-                .or_else(|| parsed.positional.first().cloned())
-                .unwrap_or_else(|| {
-                    resolve_cli_server(None, None).unwrap_or_else(|_| ipc::auto_server_name())
-                });
+            // Accept -s/--server and -t/--target (docs/comments use both).
+            // Ignoring -t used to fall through to cwd auto_server_name and
+            // KillServer the wrong process (e.g. `kill-server -t pixprobe`
+            // while cwd is ~/dev/lrmux → killed server `lrmux`).
+            let name = kill_server_name_from(&parsed).unwrap_or_else(|| {
+                resolve_cli_server(None, None).unwrap_or_else(|_| ipc::auto_server_name())
+            });
             note_tcp_server(&name);
             CliAction::KillServer(name)
         }
@@ -1980,6 +1979,18 @@ fn query_server_version(server: &str) -> io::Result<(String, String)> {
     }
 }
 
+/// Resolve the server name for `kill-server` from parsed flags.
+/// Prefers `-s`/`--server`, then `-t`/`--target`, then a positional arg.
+fn kill_server_name_from(parsed: &cmd::ParsedCmd) -> Option<String> {
+    parsed
+        .get("s")
+        .or_else(|| parsed.get("server"))
+        .or_else(|| parsed.get("t"))
+        .or_else(|| parsed.get("target"))
+        .map(|s| s.to_string())
+        .or_else(|| parsed.positional.first().cloned())
+}
+
 /// Kill a named server by sending a KillServer message.
 /// Falls back to removing the socket file if the server can't be reached.
 fn kill_server(name: &str) -> io::Result<()> {
@@ -2354,6 +2365,29 @@ fn fork_server(
             Some(cwd) => std::env::set_var("LRMUX_INIT_CWD", cwd),
             None => std::env::remove_var("LRMUX_INIT_CWD"),
         }
+        // Pass outer cell pixel size so the first pane's PTY reports
+        // non-zero ws_xpixel/ws_ypixel (kitten icat requires this).
+        // Prefer a live ioctl; otherwise keep a caller-supplied
+        // LRMUX_INIT_PIXELS (headless tests / agents without a TTY).
+        match crate::term::winsize::outer().and_then(|ws| ws.cell_size()) {
+            Some((cw, ch)) => {
+                std::env::set_var("LRMUX_INIT_PIXELS", format!("{cw},{ch}"));
+            }
+            None => {
+                let keep = std::env::var("LRMUX_INIT_PIXELS").ok().is_some_and(|s| {
+                    let mut it = s.split(',');
+                    matches!(
+                        (it.next(), it.next()),
+                        (Some(a), Some(b))
+                            if a.parse::<u16>().ok().is_some_and(|n| n > 0)
+                                && b.parse::<u16>().ok().is_some_and(|n| n > 0)
+                    )
+                });
+                if !keep {
+                    std::env::remove_var("LRMUX_INIT_PIXELS");
+                }
+            }
+        }
     }
 
     let pid = unsafe { libc::fork() };
@@ -2382,6 +2416,7 @@ fn fork_server(
         std::env::remove_var("LRMUX_INIT_COMMAND");
         std::env::remove_var("LRMUX_INIT_SESSION");
         std::env::remove_var("LRMUX_INIT_CWD");
+        std::env::remove_var("LRMUX_INIT_PIXELS");
     }
     Ok(())
 }
@@ -2403,4 +2438,23 @@ fn wait_for_server(sock: &Path) -> io::Result<()> {
         io::ErrorKind::TimedOut,
         "server did not start in time",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_server_name_accepts_t_alias() {
+        let parsed = cmd::parse_flags(&["-t".into(), "pixprobe".into()]);
+        assert_eq!(kill_server_name_from(&parsed).as_deref(), Some("pixprobe"));
+        let parsed = cmd::parse_flags(&["--target".into(), "icat-test".into()]);
+        assert_eq!(kill_server_name_from(&parsed).as_deref(), Some("icat-test"));
+        let parsed = cmd::parse_flags(&["-s".into(), "explicit".into()]);
+        assert_eq!(kill_server_name_from(&parsed).as_deref(), Some("explicit"));
+        // -s wins over -t when both are present
+        let parsed =
+            cmd::parse_flags(&["-s".into(), "from-s".into(), "-t".into(), "from-t".into()]);
+        assert_eq!(kill_server_name_from(&parsed).as_deref(), Some("from-s"));
+    }
 }

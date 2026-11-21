@@ -14,10 +14,40 @@ pub struct Pty {
     pub child_pid: Pid,
 }
 
-/// Window size (rows, cols).
+/// Window size (rows, cols, and optional pixel dims for TIOCGWINSZ).
+/// Apps like `kitten icat` refuse to run when `xpixel`/`ypixel` are 0.
 pub struct PtySize {
     pub rows: u16,
     pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+impl PtySize {
+    pub fn cells(rows: u16, cols: u16) -> Self {
+        Self {
+            rows,
+            cols,
+            xpixel: 0,
+            ypixel: 0,
+        }
+    }
+
+    /// Cell grid plus pixel area (`cols*cell_w` × `rows*cell_h`).
+    pub fn with_cell_pixels(rows: u16, cols: u16, cell_w: u16, cell_h: u16) -> Self {
+        let xpixel = (cols as u32)
+            .saturating_mul(cell_w as u32)
+            .min(u32::from(u16::MAX)) as u16;
+        let ypixel = (rows as u32)
+            .saturating_mul(cell_h as u32)
+            .min(u32::from(u16::MAX)) as u16;
+        Self {
+            rows,
+            cols,
+            xpixel,
+            ypixel,
+        }
+    }
 }
 
 impl Pty {
@@ -38,8 +68,8 @@ impl Pty {
         let winsize = Winsize {
             ws_row: size.rows,
             ws_col: size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: size.xpixel,
+            ws_ypixel: size.ypixel,
         };
 
         // Set LRMUX / LRMUX_SERVER so the child knows it is inside lrmux and
@@ -116,8 +146,8 @@ impl Pty {
         let ws = Winsize {
             ws_row: size.rows,
             ws_col: size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: size.xpixel,
+            ws_ypixel: size.ypixel,
         };
         // TIOCSWINSZ ioctl
         unsafe {
@@ -324,4 +354,60 @@ fn process_name(pid: i32) -> Option<String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn process_name(_pid: i32) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_reports_nonzero_pixel_winsize_to_child() {
+        // kitten icat aborts when TIOCGWINSZ returns xpixel=ypixel=0.
+        let script = std::env::temp_dir().join("lrmux_pty_winsize_probe.py");
+        std::fs::write(
+            &script,
+            "import fcntl, array, termios\n\
+             b = array.array('H', [0, 0, 0, 0])\n\
+             fcntl.ioctl(1, termios.TIOCGWINSZ, b, True)\n\
+             print(f'{b[0]} {b[1]} {b[2]} {b[3]}')\n",
+        )
+        .unwrap();
+        let argv = [
+            CString::new("python3").unwrap(),
+            CString::new(script.to_str().unwrap()).unwrap(),
+        ];
+        let pty = Pty::spawn(&argv, PtySize::with_cell_pixels(24, 80, 10, 20), None, &[]);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        let fd = pty.master_fd();
+        for _ in 0..50 {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, 200) } > 0 {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n > 0 {
+                    out.extend_from_slice(&buf[..n as usize]);
+                }
+            }
+            if !pty.child_alive() {
+                while {
+                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n > 0 {
+                        out.extend_from_slice(&buf[..n as usize]);
+                    }
+                    n > 0
+                } {}
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&script);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("24 80 800 480"),
+            "child TIOCGWINSZ missing pixels: {s:?}"
+        );
+    }
 }

@@ -501,10 +501,14 @@ local server (errors if ambiguous); use --tcp for a remote manager.",
         name: "kill-server",
         aliases: &[],
         summary: "Stop a server",
-        usage: "    lrmux kill-server -s <name|host:port>",
+        usage: "    lrmux kill-server [-s|-t] <name|host:port>",
         body: "\
 -s, --server <name|host:port>   Local server, or a TCP address to send KillServer to.\n\
---tcp <host:port>               Same, as a global connect address.",
+-t, --target <name|host:port>   Alias for -s (same as other subcommands).\n\
+--tcp <host:port>               Same, as a global connect address.\n\
+\n\
+With no -s/-t, kills the CWD-named server (auto_server_name). Prefer an\n\
+explicit name when more than one local server may be running.",
     },
     CommandSpec {
         name: "discover",

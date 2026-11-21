@@ -13,7 +13,8 @@ use std::path::PathBuf;
 /// Global pane ID counter (tmux uses %N format).
 static PANE_ID: AtomicU32 = AtomicU32::new(0);
 
-/// Outer-TTY pixel geometry (from a client's CSI 14t/16t probe).
+/// Outer-TTY pixel geometry (from a client's CSI 14t/16t probe,
+/// `TIOCGWINSZ`, or `LRMUX_INIT_PIXELS` at server fork).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PixelGeometry {
     pub cell_w: u16,
@@ -25,6 +26,38 @@ pub struct PixelGeometry {
 impl PixelGeometry {
     pub fn is_usable(&self) -> bool {
         self.cell_w > 0 && self.cell_h > 0
+    }
+}
+
+/// Server-wide cell pixel size used for every new/resized pane PTY.
+/// `kitten icat` (and friends) read `TIOCGWINSZ` and abort when
+/// `ws_xpixel`/`ws_ypixel` are 0 — so this must be set before spawn when
+/// possible (`LRMUX_INIT_PIXELS`), and refreshed from attached clients.
+static SERVER_PIXEL_GEO: std::sync::Mutex<Option<PixelGeometry>> = std::sync::Mutex::new(None);
+
+pub fn set_server_pixel_geo(geo: PixelGeometry) {
+    if geo.is_usable() {
+        *SERVER_PIXEL_GEO.lock().unwrap() = Some(geo);
+    }
+}
+
+pub fn server_pixel_geo() -> Option<PixelGeometry> {
+    *SERVER_PIXEL_GEO.lock().unwrap()
+}
+
+fn pty_size_for(rows: u16, cols: u16) -> PtySize {
+    match server_pixel_geo() {
+        Some(g) if g.is_usable() => PtySize::with_cell_pixels(rows, cols, g.cell_w, g.cell_h),
+        _ => PtySize::cells(rows, cols),
+    }
+}
+
+/// Push current server pixel geometry into an existing pane's PTY
+/// (SIGWINCH) without changing the cell grid.
+pub fn apply_pixel_geo_to_pty(pane: &Pane) {
+    let size = pty_size_for(pane.rows, pane.cols);
+    if size.xpixel > 0 && size.ypixel > 0 {
+        pane.pty.resize(size);
     }
 }
 
@@ -191,7 +224,7 @@ impl Pane {
         // stable across renames, unlike the session name.
         extra_env.push(("LRMUX_SESSION".into(), format!("${session_id}")));
         extra_env.extend(env.iter().cloned());
-        let pty = Pty::spawn(argv, PtySize { rows, cols }, cwd, &extra_env);
+        let pty = Pty::spawn(argv, pty_size_for(rows, cols), cwd, &extra_env);
 
         let mut trace = open_pane_trace(id);
         if let Some(ref mut f) = trace {
@@ -891,7 +924,7 @@ impl Pane {
 
     /// Resize the pane (PTY + grid).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.pty.resize(PtySize { rows, cols });
+        self.pty.resize(pty_size_for(rows, cols));
         self.grid.resize(rows as usize, cols as usize);
         self.rows = rows;
         self.cols = cols;

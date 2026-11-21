@@ -3669,19 +3669,27 @@ pub(crate) fn report_outer_term_palette(
     proto::send(stream, &msg)
 }
 
-/// Probe CSI 14t (window px) + CSI 16t (cell px) on the outer TTY.
-/// Returns geometry when at least the cell size is known.
+/// Probe outer cell/window pixels. Prefer `TIOCGWINSZ` (what `kitten icat`
+/// uses); fall back to CSI 14t/16t when the ioctl reports 0×0 pixels.
 fn probe_outer_pixel_geometry(extra_input: &mut Vec<u8>) -> Option<PixelGeo> {
-    // Both queries in one write; wait once for replies.
+    if let Some(ws) = crate::term::winsize::outer()
+        && let Some((cell_w, cell_h)) = ws.cell_size()
+    {
+        return Some(PixelGeo {
+            cell_w,
+            cell_h,
+            win_w: ws.xpixel,
+            win_h: ws.ypixel,
+        });
+    }
+    // CSI fallback for terminals that omit pixels from the ioctl.
     let query = b"\x1b[14t\x1b[16t";
     let mut buf = Vec::new();
-    // Prefer stdio (already raw in interactive attach).
     if write_and_read_xtwinops(libc::STDIN_FILENO, libc::STDOUT_FILENO, query, &mut buf)
         && let Some(geo) = parse_xtwinops_replies(&buf, extra_input)
     {
         return Some(geo);
     }
-    // /dev/tty fallback (same as OSC probe).
     let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
     if fd >= 0 {
         struct TtyFd(i32);
