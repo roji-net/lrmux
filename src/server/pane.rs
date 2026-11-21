@@ -158,6 +158,10 @@ pub struct Pane {
     pub images: crate::graphics::ImageStore,
     /// Incomplete APC/DCS prefix held across PTY reads.
     gfx_pending: Vec<u8>,
+    /// Assembles chunked Kitty transmits (`m=1`…`m=0`) across PTY reads.
+    gfx_parser: crate::graphics::kitty::KittyParser,
+    /// Next image id when the child omits `i=` (kitten stream mode).
+    next_image_id: u32,
     /// Graphics events produced since the last drain.
     pending_graphics: Vec<crate::graphics::GraphicsEvent>,
 }
@@ -255,6 +259,8 @@ impl Pane {
             deferred_replies: Vec::new(),
             images: crate::graphics::ImageStore::default(),
             gfx_pending: Vec::new(),
+            gfx_parser: crate::graphics::kitty::KittyParser::new(),
+            next_image_id: 1,
             pending_graphics: Vec::new(),
         }
     }
@@ -387,8 +393,10 @@ impl Pane {
                 // Extract Kitty APC / DCS tmux wrappers before VT parse —
                 // vte silently drops APC string bodies.
                 self.gfx_pending.extend_from_slice(&buf[..n]);
-                let (gfx_events, cleaned, leftover) =
-                    crate::graphics::kitty::extract_graphics(&self.gfx_pending);
+                let (gfx_events, cleaned, leftover) = crate::graphics::kitty::extract_graphics(
+                    &mut self.gfx_parser,
+                    &self.gfx_pending,
+                );
                 self.gfx_pending = leftover;
                 self.apply_graphics_events(gfx_events);
                 let parsed = vt::parse_bytes(&mut self.vt_parser, &mut self.grid, &cleaned);
@@ -938,7 +946,7 @@ impl Pane {
         for ev in events {
             match ev {
                 GraphicsEvent::Transmit {
-                    image_id,
+                    mut image_id,
                     width,
                     height,
                     format,
@@ -948,25 +956,67 @@ impl Pane {
                     place_rows,
                     need_placeholders,
                 } => {
+                    // kitten stream mode often omits `i=`; unicode placeholders
+                    // encode the id in fg RGB, so 0 would collide / look blank.
+                    if image_id == 0 && !data.is_empty() {
+                        image_id = self.next_image_id;
+                        self.next_image_id = self.next_image_id.saturating_add(1).max(1);
+                    }
                     let cols = place_cols.or_else(|| {
-                        // Cursor placement without c/r: fill remaining pane.
-                        Some(self.cols.saturating_sub(self.grid.cursor_col as u16) as u32)
+                        // Prefer pixel→cell math when we know the outer cell size.
+                        if width > 0
+                            && let Some(g) = server_pixel_geo()
+                        {
+                            let cw = (g.cell_w as u32).max(1);
+                            return Some(width.div_ceil(cw).max(1));
+                        }
+                        Some(
+                            (self.cols as u32)
+                                .saturating_sub(self.grid.cursor_col as u32)
+                                .max(1),
+                        )
                     });
                     let rows = place_rows.or_else(|| {
-                        Some(self.rows.saturating_sub(self.grid.cursor_row as u16) as u32)
+                        if height > 0
+                            && let Some(g) = server_pixel_geo()
+                        {
+                            let ch = (g.cell_h as u32).max(1);
+                            return Some(height.div_ceil(ch).max(1));
+                        }
+                        Some(
+                            (self.rows as u32)
+                                .saturating_sub(self.grid.cursor_row as u32)
+                                .max(1),
+                        )
                     });
-                    self.images.insert(
-                        image_id,
-                        StoredImage {
-                            width,
-                            height,
-                            format,
-                            zlib,
-                            data: data.clone(),
-                            place_cols: cols,
-                            place_rows: rows,
-                        },
-                    );
+                    if !data.is_empty() || width > 0 {
+                        self.images.insert(
+                            image_id,
+                            StoredImage {
+                                width,
+                                height,
+                                format,
+                                zlib,
+                                data: data.clone(),
+                                place_cols: cols,
+                                place_rows: rows,
+                            },
+                        );
+                    } else if let (Some(c), Some(r)) = (cols, rows) {
+                        // Placement-only: update geometry on existing blob.
+                        self.images.insert(
+                            image_id,
+                            StoredImage {
+                                width: 0,
+                                height: 0,
+                                format: 32,
+                                zlib: false,
+                                data: Vec::new(),
+                                place_cols: Some(c),
+                                place_rows: Some(r),
+                            },
+                        );
+                    }
                     if need_placeholders && let (Some(c), Some(r)) = (cols, rows) {
                         placeholder::write_placeholders(&mut self.grid, image_id, c, r);
                     }

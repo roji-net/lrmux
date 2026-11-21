@@ -350,17 +350,30 @@ pub fn write_placeholders(grid: &mut Grid, image_id: u32, cols: u32, rows: u32) 
 }
 
 /// Build the APC sequences a client should emit to place `image_id` as a
-/// virtual placement covering `cols`×`rows` (payload already base64).
+/// virtual placement covering `cols`×`rows`.
+///
+/// `format` is Kitty's `f=` (32=RGBA, 24=RGB, 100=PNG, …) — must match `data`
+/// (`kitten icat --transfer-mode=stream` sends PNG as f=100).
+#[allow(clippy::too_many_arguments)]
 pub fn emit_transmit_and_place(
     image_id: u32,
     width: u32,
     height: u32,
+    format: u8,
     zlib: bool,
     data: &[u8],
     cols: u32,
     rows: u32,
 ) -> Vec<u8> {
-    kitty_chunks(image_id, width, height, zlib, data, Some((cols, rows)))
+    kitty_chunks(
+        image_id,
+        width,
+        height,
+        format,
+        zlib,
+        data,
+        Some((cols, rows)),
+    )
 }
 
 /// Transmit-only (`a=t`) then virtual place (`a=p,U=1`).
@@ -368,6 +381,7 @@ fn kitty_chunks(
     image_id: u32,
     width: u32,
     height: u32,
+    format: u8,
     zlib: bool,
     data: &[u8],
     place: Option<(u32, u32)>,
@@ -384,8 +398,11 @@ fn kitty_chunks(
         let more = if i + 1 < chunks.len() { 1 } else { 0 };
         if i == 0 {
             // Transmit only — placement follows separately when `place` is set.
-            let head =
-                format!("\x1b_Ga=t,f=32{o},s={width},v={height},t=d,i={image_id},q=2,m={more};");
+            // Preserve the source `f=` (PNG/RGB/RGBA); hardcoding 32 blanked
+            // kitten stream output.
+            let head = format!(
+                "\x1b_Ga=t,f={format}{o},s={width},v={height},t=d,i={image_id},q=2,m={more};"
+            );
             out.extend_from_slice(head.as_bytes());
         } else {
             out.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
@@ -459,5 +476,15 @@ mod tests {
         let s = base64_encode(&[0xff, 0x00, 0x00, 0xff]);
         assert_eq!(s.len() % 4, 0);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn emit_preserves_png_format() {
+        // kitten stream mode uses f=100; hardcoding f=32 blanked the image.
+        let seq = emit_transmit_and_place(3, 10, 20, 100, false, &[1, 2, 3, 4], 2, 2);
+        let s = String::from_utf8_lossy(&seq);
+        assert!(s.contains("a=t,f=100"), "{s}");
+        assert!(!s.contains("f=32"), "{s}");
+        assert!(s.contains("a=p,U=1,i=3,c=2,r=2"), "{s}");
     }
 }

@@ -1731,6 +1731,7 @@ pub fn run(
                                 image_id,
                                 width,
                                 height,
+                                format,
                                 zlib,
                                 &data,
                                 place_cols.max(1),

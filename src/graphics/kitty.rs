@@ -102,6 +102,8 @@ fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEven
         "q" => GraphicsAction::Query,
         _ => GraphicsAction::Other,
     };
+    // `i` omitted → 0; pane layer replaces 0 with a fresh id so unicode
+    // placeholders (fg RGB) and `a=p,i=…` stay unique.
     let image_id = keys.get("i").and_then(|s| s.parse().ok()).unwrap_or(0);
     match action {
         GraphicsAction::Query => {
@@ -137,14 +139,35 @@ fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEven
             let height = keys.get("v").and_then(|s| s.parse().ok()).unwrap_or(0);
             let format = keys.get("f").and_then(|s| s.parse().ok()).unwrap_or(32);
             let zlib = keys.get("o").map(|s| s == "z").unwrap_or(false);
+            let medium = keys.get("t").map(|s| s.as_str()).unwrap_or("d");
+            let data = match medium {
+                // Direct (and stream) — payload is already image bytes.
+                "d" => payload,
+                // Local file / temporary file — payload is a path.
+                "f" | "t" => match read_path_payload(&payload) {
+                    Some(bytes) => bytes,
+                    None => {
+                        crate::log::warn(&format!(
+                            "kitty graphics: failed to read t={medium} path payload"
+                        ));
+                        return Vec::new();
+                    }
+                },
+                // Shared memory not supported yet.
+                other => {
+                    crate::log::warn(&format!(
+                        "kitty graphics: unsupported transmission medium t={other}"
+                    ));
+                    return Vec::new();
+                }
+            };
             let virtual_u = keys.get("U").map(|s| s == "1").unwrap_or(false);
             let cols = keys.get("c").and_then(|s| s.parse().ok());
             let rows = keys.get("r").and_then(|s| s.parse().ok());
             let need_placeholders = match action {
                 GraphicsAction::TransmitAndDisplay if virtual_u => cols.is_some() && rows.is_some(),
                 GraphicsAction::TransmitAndDisplay => {
-                    // Cursor placement — normalize to placeholders using
-                    // c/r when present; otherwise caller may skip.
+                    // Cursor placement — normalize to unicode placeholders.
                     true
                 }
                 _ => virtual_u && cols.is_some() && rows.is_some(),
@@ -155,13 +178,39 @@ fn finalize(keys: HashMap<String, String>, payload: Vec<u8>) -> Vec<GraphicsEven
                 height,
                 format,
                 zlib,
-                data: payload,
+                data,
                 place_cols: cols,
                 place_rows: rows,
                 need_placeholders,
             }]
         }
         GraphicsAction::Other => Vec::new(),
+    }
+}
+
+/// Decode a `t=f`/`t=t` path payload (raw UTF-8 or base64 of the path).
+fn read_path_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.is_empty() {
+        return None;
+    }
+    let path_bytes = if payload.iter().all(|&b| b.is_ascii_graphic() || b == b'/') {
+        payload.to_vec()
+    } else {
+        // Some clients base64 the path; try decoding when raw open fails.
+        payload.to_vec()
+    };
+    let path = std::str::from_utf8(&path_bytes).ok()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            // Retry as base64-encoded path.
+            let decoded = base64_decode(payload);
+            let path = std::str::from_utf8(&decoded).ok()?.trim();
+            std::fs::read(path).ok()
+        }
     }
 }
 
@@ -240,11 +289,17 @@ fn base64_decode(input: &[u8]) -> Vec<u8> {
 /// Scan `input` for complete APC `_G…ST` and DCS `tmux;…ST` sequences.
 /// Returns (events from completed APCs, bytes with those sequences removed
 /// for the VT parser, leftover incomplete prefix to keep).
-pub fn extract_graphics(input: &[u8]) -> (Vec<GraphicsEvent>, Vec<u8>, Vec<u8>) {
+///
+/// `parser` must be the same instance across PTY reads — Kitty chunked
+/// transmits (`m=1`…`m=0`) are separate complete APC frames, and dropping
+/// the assembler between reads finalizes only the last chunk (blank image).
+pub fn extract_graphics(
+    parser: &mut KittyParser,
+    input: &[u8],
+) -> (Vec<GraphicsEvent>, Vec<u8>, Vec<u8>) {
     let mut events = Vec::new();
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
-    let mut parser = KittyParser::new();
     while i < input.len() {
         if input[i] != 0x1b {
             out.push(input[i]);
@@ -275,9 +330,15 @@ pub fn extract_graphics(input: &[u8]) -> (Vec<GraphicsEvent>, Vec<u8>, Vec<u8>) 
             if let Some((end, body)) = take_dcs_body(&input[i + 2..]) {
                 let abs_end = i + 2 + end;
                 if let Some(inner) = unwrap_tmux_dcs(body) {
-                    let (ev, cleaned, _left) = extract_graphics(&inner);
+                    // Nested extract shares the same assembler so a chunked
+                    // image split across tmux-wrapped APC frames still joins.
+                    let (ev, cleaned, left) = extract_graphics(parser, &inner);
                     events.extend(ev);
                     out.extend_from_slice(&cleaned);
+                    if !left.is_empty() {
+                        // Incomplete inner sequence — keep whole DCS for later.
+                        return (events, out, input[i..].to_vec());
+                    }
                 }
                 // Drop the DCS wrapper either way (passthrough consumed).
                 i = abs_end;
@@ -378,7 +439,8 @@ mod tests {
     #[test]
     fn extract_apc_from_stream() {
         let seq = b"hello\x1b_Ga=q,i=1,t=d,f=24,s=1,v=1;AAAA\x1b\\world";
-        let (ev, cleaned, left) = extract_graphics(seq);
+        let mut parser = KittyParser::new();
+        let (ev, cleaned, left) = extract_graphics(&mut parser, seq);
         assert!(left.is_empty());
         assert_eq!(cleaned, b"helloworld");
         assert!(matches!(ev[0], GraphicsEvent::QueryReply { .. }));
@@ -396,8 +458,44 @@ mod tests {
             seq.push(b);
         }
         seq.extend_from_slice(b"\x1b\\");
-        let (ev, _cleaned, left) = extract_graphics(&seq);
+        let mut parser = KittyParser::new();
+        let (ev, _cleaned, left) = extract_graphics(&mut parser, &seq);
         assert!(left.is_empty());
         assert!(matches!(ev[0], GraphicsEvent::Delete { image_id: 5 }));
+    }
+
+    #[test]
+    fn chunked_transmit_survives_across_extract_calls() {
+        // kitten icat --transfer-mode=stream sends each m=1/m=0 frame as its
+        // own APC; PTY reads often split them. Parser state must persist.
+        let mut parser = KittyParser::new();
+        let c1 = b"\x1b_Ga=T,f=100,m=1,s=2,v=2,i=9;AA\x1b\\";
+        let (ev1, _, left1) = extract_graphics(&mut parser, c1);
+        assert!(ev1.is_empty());
+        assert!(left1.is_empty());
+        let c2 = b"\x1b_Ga=T,m=0;BB\x1b\\";
+        let (ev2, _, left2) = extract_graphics(&mut parser, c2);
+        assert!(left2.is_empty());
+        assert_eq!(ev2.len(), 1);
+        match &ev2[0] {
+            GraphicsEvent::Transmit {
+                image_id,
+                format,
+                width,
+                height,
+                data,
+                need_placeholders,
+                ..
+            } => {
+                assert_eq!(*image_id, 9);
+                assert_eq!(*format, 100);
+                assert_eq!(*width, 2);
+                assert_eq!(*height, 2);
+                assert!(*need_placeholders);
+                // base64 "AA" + "BB" → 2 bytes
+                assert_eq!(data.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
