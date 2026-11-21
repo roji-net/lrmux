@@ -446,6 +446,10 @@ pub fn run(
     let mut ended = false;
     // In-process reconnect after transport loss / keepalive miss.
     let mut reconnect: Option<ReconnectState> = None;
+    // Consecutive disconnects while the session lived < 3s — stops the
+    // outbuf-kick → reconnect → kick death spiral (terminal-browser).
+    let mut disconnect_streak: u32 = 0;
+    let mut connected_since = Some(std::time::Instant::now());
     let mut keepalive = {
         let net = &crate::config::global().network;
         crate::keepalive::Keepalive::maybe(
@@ -511,6 +515,14 @@ pub fn run(
             }
         }
 
+        // Stable session — clear the kick streak so a later blip starts fresh.
+        if let Some(t) = connected_since
+            && t.elapsed() > std::time::Duration::from_secs(5)
+            && disconnect_streak > 0
+        {
+            disconnect_streak = 0;
+        }
+
         // ── Reconnecting: dim overlay + backoff retries ─────────────
         if let Some(ref mut rc) = reconnect {
             render_reconnect_overlay(&grid, &status_text, term_rows, term_cols, rc, socket_path)?;
@@ -568,6 +580,7 @@ pub fn run(
                             )
                         };
                         reconnect = None;
+                        connected_since = Some(std::time::Instant::now());
                         copy_mode = None;
                         confirm_state = ConfirmState::None;
                         prefix_state = PrefixState::Normal;
@@ -1797,13 +1810,19 @@ pub fn run(
                 if ended {
                     break;
                 }
-                begin_reconnect(
+                if !begin_reconnect_tracked(
                     &mut reconnect,
                     &mut copy_mode,
                     &mut confirm_state,
                     &mut prefix_state,
                     disconnect_reason(socket_path, "connection closed (EOF)"),
-                );
+                    &mut disconnect_streak,
+                    &mut connected_since,
+                ) {
+                    exit_reason = Some(reconnect_give_up_reason(socket_path));
+                    ended = true;
+                    break;
+                }
                 continue;
             } else {
                 let err = io::Error::last_os_error();
@@ -1811,13 +1830,19 @@ pub fn run(
                     if ended {
                         break;
                     }
-                    begin_reconnect(
+                    if !begin_reconnect_tracked(
                         &mut reconnect,
                         &mut copy_mode,
                         &mut confirm_state,
                         &mut prefix_state,
                         format!("read error from server: {err}"),
-                    );
+                        &mut disconnect_streak,
+                        &mut connected_since,
+                    ) {
+                        exit_reason = Some(reconnect_give_up_reason(socket_path));
+                        ended = true;
+                        break;
+                    }
                     continue;
                 }
             }
@@ -1834,13 +1859,19 @@ pub fn run(
             break;
         }
         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            begin_reconnect(
+            if !begin_reconnect_tracked(
                 &mut reconnect,
                 &mut copy_mode,
                 &mut confirm_state,
                 &mut prefix_state,
                 disconnect_reason(socket_path, "connection hung up"),
-            );
+                &mut disconnect_streak,
+                &mut connected_since,
+            ) {
+                exit_reason = Some(reconnect_give_up_reason(socket_path));
+                ended = true;
+                break;
+            }
             continue;
         }
 
@@ -1851,25 +1882,36 @@ pub fn run(
                 Some(crate::keepalive::Action::SendPing) => {
                     if send_cmd(&mut stream, &ClientMsg::Ping).is_ok() {
                         ka.note_ping_sent();
+                    } else if !begin_reconnect_tracked(
+                        &mut reconnect,
+                        &mut copy_mode,
+                        &mut confirm_state,
+                        &mut prefix_state,
+                        "keepalive ping failed to send".to_string(),
+                        &mut disconnect_streak,
+                        &mut connected_since,
+                    ) {
+                        exit_reason = Some(reconnect_give_up_reason(socket_path));
+                        ended = true;
+                        break;
                     } else {
-                        begin_reconnect(
-                            &mut reconnect,
-                            &mut copy_mode,
-                            &mut confirm_state,
-                            &mut prefix_state,
-                            "keepalive ping failed to send".to_string(),
-                        );
                         continue;
                     }
                 }
                 Some(crate::keepalive::Action::TimedOut) => {
-                    begin_reconnect(
+                    if !begin_reconnect_tracked(
                         &mut reconnect,
                         &mut copy_mode,
                         &mut confirm_state,
                         &mut prefix_state,
                         "keepalive timeout".to_string(),
-                    );
+                        &mut disconnect_streak,
+                        &mut connected_since,
+                    ) {
+                        exit_reason = Some(reconnect_give_up_reason(socket_path));
+                        ended = true;
+                        break;
+                    }
                     continue;
                 }
                 None => {}
@@ -1981,17 +2023,67 @@ fn reconnect_hhmmss(unix_secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
-fn begin_reconnect(
+fn reconnect_give_up_reason(socket_path: &std::path::Path) -> String {
+    let log = server_log_path(socket_path);
+    format!(
+        "gave up reconnecting after repeated instant disconnects \
+         (server likely dropping this client — often a graphics outbuf flood). \
+         Check {log}"
+    )
+}
+
+/// Start / continue the reconnect overlay. Tracks brief-session disconnect
+/// streaks so a server that immediately kicks us (outbuf flood) cannot spin
+/// at attempt=0 forever. Returns false when the streak is exhausted — caller
+/// should exit instead of looping.
+fn begin_reconnect_tracked(
     reconnect: &mut Option<ReconnectState>,
     copy_mode: &mut Option<copy_mode::CopyMode>,
     confirm_state: &mut ConfirmState,
     prefix_state: &mut PrefixState,
     reason: String,
-) {
+    disconnect_streak: &mut u32,
+    connected_since: &mut Option<std::time::Instant>,
+) -> bool {
     *copy_mode = None;
     *confirm_state = ConfirmState::None;
     *prefix_state = PrefixState::Normal;
-    *reconnect = Some(ReconnectState::new(reason));
+
+    let brief = connected_since
+        .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
+        .unwrap_or(true);
+    *connected_since = None;
+    if brief {
+        *disconnect_streak = disconnect_streak.saturating_add(1);
+    } else {
+        *disconnect_streak = 1;
+    }
+
+    // Give up after repeated instant kicks — user can re-attach manually.
+    if *disconnect_streak >= 12 {
+        return false;
+    }
+
+    let attempt = disconnect_streak.saturating_sub(1);
+    let delay = crate::keepalive::reconnect_backoff(attempt);
+    let mut rc = match reconnect.take() {
+        Some(mut existing) => {
+            existing.push_error(reason.clone());
+            existing.reason = reason;
+            existing.attempt = attempt.max(existing.attempt);
+            existing
+        }
+        None => {
+            let mut rc = ReconnectState::new(reason.clone());
+            rc.push_error(reason);
+            rc.attempt = attempt;
+            rc
+        }
+    };
+    // Never retry instantly on a streak — that was the busy-loop.
+    rc.next_at = std::time::Instant::now() + delay;
+    *reconnect = Some(rc);
+    true
 }
 
 fn disconnect_reason(socket_path: &std::path::Path, detail: &str) -> String {

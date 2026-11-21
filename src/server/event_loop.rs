@@ -75,7 +75,10 @@ struct ClientConn {
 }
 
 /// Maximum bytes buffered for a slow client before disconnecting it.
-const CLIENT_OUTBUF_CAP: usize = 8 * 1024 * 1024;
+/// Per-client outbound buffer cap. Terminal-browser frames are often a full
+/// window of RGBA (~10–20 MiB); 8 MiB made a single GraphicsTransmit kill the
+/// client and trip a reconnect death spiral.
+const CLIENT_OUTBUF_CAP: usize = 64 * 1024 * 1024;
 /// Outbuf level at which incremental updates to a normal client are
 /// suspended (well below the hard cap — the client freezes instead of
 /// being disconnected).
@@ -236,6 +239,23 @@ fn client_send(client: &mut ClientConn, bytes: &[u8]) -> bool {
             client.fd
         ));
         return false;
+    }
+    client.outbuf.extend_from_slice(bytes);
+    flush_client_outbuf(client)
+}
+
+/// Like [`client_send`], but if the message does not fit, **drop it** and keep
+/// the client. Used for Kitty graphics — losing a frame is better than
+/// disconnecting into a reconnect storm (terminal-browser).
+fn client_send_droppable(client: &mut ClientConn, bytes: &[u8]) -> bool {
+    if client.outbuf.len().saturating_add(bytes.len()) > CLIENT_OUTBUF_CAP {
+        crate::log::warn(&format!(
+            "client fd {} outbuf full — dropping {} byte graphics/frame message",
+            client.fd,
+            bytes.len()
+        ));
+        // Still try to drain whatever is queued so we catch up.
+        return flush_client_outbuf(client);
     }
     client.outbuf.extend_from_slice(bytes);
     flush_client_outbuf(client)
@@ -3076,10 +3096,11 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
     }
     for &pi in &order {
         let pane = &window.panes[pi];
-        // Retransmit Kitty images before the cell snapshot so placeholders
-        // resolve on attach / Refresh / reconnect.
+        // Retransmit only images referenced by current placeholders — a full
+        // store dump of TB frames can be tens of MiB and used to abort attach.
         if client.proto >= proto::PROTO_GRAPHICS {
-            for &id in pane.images.ids_in_order() {
+            let ids = pane.referenced_image_ids();
+            for id in ids {
                 let Some(img) = pane.images.get(id) else {
                     continue;
                 };
@@ -3097,7 +3118,7 @@ fn send_snapshot_to_client(client: &mut ClientConn, sessions: &[Session]) -> io:
                     place_rows: img.place_rows.unwrap_or(0),
                     data: img.data.clone(),
                 });
-                if !client_send(client, &gmsg) {
+                if !client_send_droppable(client, &gmsg) {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "client gone",
@@ -4230,7 +4251,7 @@ fn send_graphics_to_window_viewers(
                 && clients[i].active_window == window_idx
                 && !clients[i].is_control
                 && clients[i].proto >= proto::PROTO_GRAPHICS
-                && !client_send(&mut clients[i], &msg)
+                && !client_send_droppable(&mut clients[i], &msg)
             {
                 clients.remove(i);
                 continue;
@@ -4241,7 +4262,7 @@ fn send_graphics_to_window_viewers(
     Ok(())
 }
 
-/// Retransmit all stored images in a pane (attach / Refresh / reconnect).
+/// Retransmit images referenced by the pane grid (attach / Refresh / reconnect).
 fn retransmit_pane_graphics(
     clients: &mut [ClientConn],
     client_idx: usize,
@@ -4250,7 +4271,7 @@ fn retransmit_pane_graphics(
     if client_idx >= clients.len() || clients[client_idx].proto < proto::PROTO_GRAPHICS {
         return;
     }
-    for &id in pane.images.ids_in_order() {
+    for id in pane.referenced_image_ids() {
         let Some(img) = pane.images.get(id) else {
             continue;
         };
@@ -4268,7 +4289,7 @@ fn retransmit_pane_graphics(
             place_rows: img.place_rows.unwrap_or(0),
             data: img.data.clone(),
         });
-        let _ = client_send(&mut clients[client_idx], &msg);
+        let _ = client_send_droppable(&mut clients[client_idx], &msg);
     }
 }
 

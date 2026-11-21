@@ -270,6 +270,28 @@ impl Pane {
         std::mem::take(&mut self.pending_graphics)
     }
 
+    /// Image ids referenced by Kitty placeholders currently on the grid
+    /// (fg RGB encodes the id). Used to bound attach/retransmit.
+    pub fn referenced_image_ids(&self) -> Vec<u32> {
+        use crate::grid::Color;
+        use std::collections::BTreeSet;
+        let mut ids = BTreeSet::new();
+        for row in 0..self.grid.rows() {
+            let Some(cells) = self.grid.row(row) else {
+                continue;
+            };
+            for cell in cells {
+                if !cell.is_kitty_placeholder() {
+                    continue;
+                }
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    ids.insert(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+                }
+            }
+        }
+        ids.into_iter().collect()
+    }
+
     /// Palette learned from proxied OSC 10/11 replies (for HTML capture).
     pub fn terminal_palette(&self) -> super::capture::TerminalPalette {
         super::capture::TerminalPalette {

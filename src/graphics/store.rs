@@ -2,8 +2,11 @@
 
 use std::collections::HashMap;
 
-/// Soft cap on total stored image bytes per pane (~32 MiB).
-const MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Soft cap on total stored image bytes per pane. TB can push multi‑MiB
+/// RGBA frames; keep only a couple so attach/retransmit stays bounded.
+const MAX_BYTES: usize = 48 * 1024 * 1024;
+/// Hard cap on distinct image ids retained (newest wins).
+const MAX_IMAGES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct StoredImage {
@@ -39,7 +42,9 @@ impl ImageStore {
             return;
         }
         self.remove(id);
-        while self.total_bytes + img.data.len() > MAX_BYTES && !self.order.is_empty() {
+        while (self.total_bytes + img.data.len() > MAX_BYTES || self.order.len() >= MAX_IMAGES)
+            && !self.order.is_empty()
+        {
             let old = self.order.remove(0);
             self.remove(old);
         }
