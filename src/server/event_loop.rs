@@ -248,6 +248,15 @@ fn client_send(client: &mut ClientConn, bytes: &[u8]) -> bool {
 /// the client. Used for Kitty graphics — losing a frame is better than
 /// disconnecting into a reconnect storm (terminal-browser).
 fn client_send_droppable(client: &mut ClientConn, bytes: &[u8]) -> bool {
+    // Realtime path: if a previous multi‑MiB frame is still draining, skip
+    // this one. Queuing TB frames only adds multi-second latency.
+    const BUSY: usize = 512 * 1024;
+    if client.outbuf.len() > BUSY {
+        let _ = flush_client_outbuf(client);
+        if client.outbuf.len() > BUSY {
+            return true;
+        }
+    }
     if client.outbuf.len().saturating_add(bytes.len()) > CLIENT_OUTBUF_CAP {
         crate::log::warn(&format!(
             "client fd {} outbuf full — dropping {} byte graphics/frame message",
@@ -4208,7 +4217,9 @@ fn send_graphics_to_window_viewers(
     if events.is_empty() {
         return Ok(());
     }
-    for ev in events {
+    // Belt-and-suspenders with pane::take_graphics_events coalescing.
+    let events = coalesce_transmit_events(events);
+    for ev in &events {
         let msg = match ev {
             crate::graphics::GraphicsEvent::Transmit {
                 image_id,
@@ -4260,6 +4271,28 @@ fn send_graphics_to_window_viewers(
         }
     }
     Ok(())
+}
+
+/// Drop superseded blob transmits (same image id) so we only ship the latest.
+fn coalesce_transmit_events(
+    events: &[crate::graphics::GraphicsEvent],
+) -> Vec<crate::graphics::GraphicsEvent> {
+    use crate::graphics::GraphicsEvent;
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for ev in events.iter().rev() {
+        match ev {
+            GraphicsEvent::Transmit { image_id, data, .. } if !data.is_empty() => {
+                if seen.insert(*image_id) {
+                    out.push(ev.clone());
+                }
+            }
+            _ => out.push(ev.clone()),
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// Retransmit images referenced by the pane grid (attach / Refresh / reconnect).

@@ -266,8 +266,10 @@ impl Pane {
     }
 
     /// Drain graphics events produced by recent PTY output.
+    /// Coalesces blob transmits so only the latest frame per `image_id`
+    /// is shipped (terminal-browser paints many full-window frames/sec).
     pub fn take_graphics_events(&mut self) -> Vec<crate::graphics::GraphicsEvent> {
-        std::mem::take(&mut self.pending_graphics)
+        coalesce_graphics_events(std::mem::take(&mut self.pending_graphics))
     }
 
     /// Image ids referenced by Kitty placeholders currently on the grid
@@ -1042,7 +1044,8 @@ impl Pane {
                     if need_placeholders && let (Some(c), Some(r)) = (cols, rows) {
                         placeholder::write_placeholders(&mut self.grid, image_id, c, r);
                     }
-                    self.pending_graphics.push(GraphicsEvent::Transmit {
+                    let has_blob = !data.is_empty();
+                    let ev = GraphicsEvent::Transmit {
                         image_id,
                         width,
                         height,
@@ -1052,7 +1055,27 @@ impl Pane {
                         place_cols: cols,
                         place_rows: rows,
                         need_placeholders,
-                    });
+                    };
+                    // Replace any earlier pending blob for this id — no point
+                    // shipping a frame that will be overwritten this tick.
+                    if has_blob {
+                        if let Some(pos) = self.pending_graphics.iter().position(|e| {
+                            matches!(
+                                e,
+                                GraphicsEvent::Transmit {
+                                    image_id: id,
+                                    data: d,
+                                    ..
+                                } if *id == image_id && !d.is_empty()
+                            )
+                        }) {
+                            self.pending_graphics[pos] = ev;
+                        } else {
+                            self.pending_graphics.push(ev);
+                        }
+                    } else {
+                        self.pending_graphics.push(ev);
+                    }
                 }
                 GraphicsEvent::Delete { image_id } => {
                     self.images.remove(image_id);
@@ -1588,6 +1611,61 @@ mod tests {
         assert_eq!(env[2], ("TERM_PROGRAM".into(), "tmux".into()));
         assert_eq!(env[3].0, "TERM_PROGRAM_VERSION");
     }
+
+    #[test]
+    fn coalesce_keeps_latest_blob_per_image_id() {
+        use crate::graphics::GraphicsEvent;
+        let events = vec![
+            GraphicsEvent::Transmit {
+                image_id: 1,
+                width: 1,
+                height: 1,
+                format: 32,
+                zlib: false,
+                data: vec![1],
+                place_cols: Some(1),
+                place_rows: Some(1),
+                need_placeholders: true,
+            },
+            GraphicsEvent::Transmit {
+                image_id: 1,
+                width: 1,
+                height: 1,
+                format: 32,
+                zlib: false,
+                data: vec![2, 2],
+                place_cols: Some(1),
+                place_rows: Some(1),
+                need_placeholders: true,
+            },
+            GraphicsEvent::Delete { image_id: 9 },
+            GraphicsEvent::Transmit {
+                image_id: 2,
+                width: 1,
+                height: 1,
+                format: 32,
+                zlib: false,
+                data: vec![3],
+                place_cols: None,
+                place_rows: None,
+                need_placeholders: false,
+            },
+        ];
+        let out = super::coalesce_graphics_events(events);
+        assert_eq!(out.len(), 3);
+        match &out[0] {
+            GraphicsEvent::Transmit { image_id, data, .. } => {
+                assert_eq!(*image_id, 1);
+                assert_eq!(data.as_slice(), &[2, 2]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(out[1], GraphicsEvent::Delete { image_id: 9 }));
+        assert!(matches!(
+            &out[2],
+            GraphicsEvent::Transmit { image_id: 2, .. }
+        ));
+    }
 }
 
 /// Extra env exported to pane children in tmux-compat mode
@@ -1669,6 +1747,29 @@ fn tmux_env_pairs(
             crate::client::tmux_shim::TMUX_VERSION.into(),
         ),
     ]
+}
+
+/// Keep the latest blob `Transmit` per image id; preserve deletes and
+/// placement-only events in relative order.
+fn coalesce_graphics_events(
+    events: Vec<crate::graphics::GraphicsEvent>,
+) -> Vec<crate::graphics::GraphicsEvent> {
+    use crate::graphics::GraphicsEvent;
+    use std::collections::HashSet;
+    let mut seen_blobs = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for ev in events.into_iter().rev() {
+        match &ev {
+            GraphicsEvent::Transmit { image_id, data, .. } if !data.is_empty() => {
+                if seen_blobs.insert(*image_id) {
+                    out.push(ev);
+                }
+            }
+            _ => out.push(ev),
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// Open this pane's byte-trace file (`LRMUX_TRACE`), or None when
